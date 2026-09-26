@@ -227,14 +227,43 @@ class FootprintSummary:
                            for item in self.phases.values()]}
 
 
-def process_rows(text, app_binary, helper_binary):
-    """Match full isolated executable paths, never another Yu installation."""
-    found = {'app': [], 'helpers': []}
-    for line in text.splitlines():
-        fields = line.strip().split(None, 1)
-        if len(fields) != 2 or not fields[0].isdigit():
-            continue
-        for key, path in (('app', str(app_binary)), ('helpers', str(helper_binary))):
-            if fields[1] == path or fields[1].startswith(path + ' '):
-                found[key].append(int(fields[0]))
-    return found
+def process_inventory(value):
+    """Validate kernel identities; command-line spelling is never ownership.
+
+    Unreadable unrelated user/system processes are counted separately by the
+    native probe. An unreadable member of the isolated group makes it fail.
+    """
+    if not isinstance(value, dict) or type(value.get('schema_version')) is not int or value['schema_version'] != 1:
+        raise ValueError('Unsupported process inventory schema')
+    unreadable = value.get('unreadable_unrelated')
+    if type(unreadable) is not int or unreadable < 0:
+        raise ValueError('Missing unreadable-process scope')
+    items = value.get('processes')
+    if not isinstance(items, list) or len(items) > 65536:
+        raise ValueError('Invalid bounded process inventory')
+    rows, identities = {'app': [], 'helpers': []}, {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get('kind'), str) or item['kind'] not in rows:
+            raise ValueError('Invalid process identity kind')
+        for field, minimum in (('pid', 1), ('ppid', 0), ('pgid', 1),
+                               ('start_seconds', 1), ('start_microseconds', 0)):
+            value = item.get(field)
+            if type(value) is not int or value < minimum:
+                raise ValueError('Invalid process identity: ' + field)
+        if max(item['pid'], item['ppid'], item['pgid']) > 2147483647 or item['start_microseconds'] >= 1000000:
+            raise ValueError('Process identity exceeds native bounds')
+        pid = item['pid']
+        if pid in identities:
+            raise ValueError('Duplicate process identity')
+        identities[pid] = dict(item)
+        rows[item['kind']].append(pid)
+    for pids in rows.values():
+        pids.sort()
+    return rows, identities, unreadable
+
+
+def same_process_identity(first, second):
+    if first is None or second is None:
+        return False
+    return all(first[key] == second[key] for key in
+               ('kind', 'pid', 'start_seconds', 'start_microseconds'))

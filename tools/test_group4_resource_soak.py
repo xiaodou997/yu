@@ -263,11 +263,29 @@ class SummaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 model.FootprintSummary().add('s', 'p', 0, {'pid': 1, 'physical_footprint_bytes': value})
 
-    def test_only_exact_isolated_executables_are_matched(self):
-        app = '/private/soak output/Yu.app/Contents/MacOS/Yu'
-        helper = '/private/soak output/Yu.app/Contents/Helpers/yu-document-renderer'
-        text = f'10 {app} file.md\n11 {helper}\n12 {app}-other\n13 /Applications/Yu.app/Contents/MacOS/Yu\n14 ps {app}\n'
-        self.assertEqual(model.process_rows(text, app, helper), {'app': [10], 'helpers': [11]})
+    def test_process_inventory_separates_roles_and_keeps_birth_identity(self):
+        helper = dict(kind='helpers', pid=11, ppid=10, pgid=10, start_seconds=100, start_microseconds=7)
+        app = dict(helper, kind='app', pid=10, ppid=1)
+        rows, identities, unreadable = model.process_inventory({
+            'schema_version': 1, 'unreadable_unrelated': 2, 'processes': [helper, app]})
+        self.assertEqual(rows, {'app': [10], 'helpers': [11]})
+        self.assertEqual(identities[11], helper)
+        self.assertEqual(unreadable, 2)
+        self.assertTrue(model.same_process_identity(helper, dict(helper, ppid=1)))
+        self.assertFalse(model.same_process_identity(helper, dict(helper, start_microseconds=8)))
+        self.assertFalse(model.same_process_identity(helper, None))
+
+    def test_malformed_process_inventory_is_not_an_empty_success(self):
+        helper = dict(kind='helpers', pid=11, ppid=10, pgid=10, start_seconds=100, start_microseconds=7)
+        valid = dict(schema_version=1, unreadable_unrelated=0, processes=[helper])
+        bad = [None, {}, dict(valid, schema_version=True), dict(valid, processes=None),
+               dict(valid, unreadable_unrelated=-1), dict(valid, processes=[helper, helper])]
+        for field, value in [('pid', True), ('pgid', 0), ('ppid', -1), ('start_seconds', 0),
+                             ('start_microseconds', 1000000), ('kind', 'other')]:
+            bad.append(dict(valid, processes=[dict(helper, **{field: value})]))
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                model.process_inventory(value)
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -323,7 +341,7 @@ class RunnerContractTests(unittest.TestCase):
             log.write_bytes(line(record(revision=90, undo_entries=9))
                             + line(record(revision=0, undo_entries=0)))
             soak.tail = model.AuditTail(log)
-            soak.live = lambda: None
+            soak.live = lambda: {'helpers': []}
             soak.expect = lambda expected: self.assertEqual(expected, source)
             doc = runner.Document(0, out / 'doc.md', source)
             try:
@@ -342,7 +360,7 @@ class RunnerContractTests(unittest.TestCase):
             log.write_bytes(line(record(revision=90, undo_entries=9))
                             + line(record(revision=2, undo_entries=0, redo_entries=1)))
             soak.tail = model.AuditTail(log)
-            soak.live = lambda: None
+            soak.live = lambda: {'helpers': []}
             soak.expect = lambda expected: self.assertEqual(expected, source)
             doc = runner.Document(0, out / 'doc.md', source, revision=1)
             try:
@@ -350,6 +368,65 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertEqual(doc.revision, 2)
             finally:
                 soak.cleanup()
+
+    def test_resource_frame_cannot_pass_without_a_positive_helper_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            soak = runner.NativeSoak(runner.parse_args([str(out)]), out, {})
+            source = model.fixture_source(0, 1, 'valid')
+            log = out / 'app.log'
+            log.write_bytes(line(record(source_bytes=len(source.encode()), undo_entries=0,
+                                        embedded_gpu_textures=2, embedded_gpu_rgba_bytes=1024)))
+            soak.tail = model.AuditTail(log)
+            soak.live = lambda: {'helpers': []}
+            soak.expect = lambda text: self.assertEqual(text, source)
+            try:
+                with self.assertRaisesRegex(AssertionError, 'kernel-observed helper'):
+                    soak.await_frame(runner.Document(0, out / 'doc.md', source), 'valid')
+            finally:
+                soak.cleanup()
+
+    def sampled_helper(self, after, *, returncode=0, succeeds=True):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            soak = runner.NativeSoak(runner.parse_args([str(out)]), out, {})
+            app = dict(kind='app', pid=10, ppid=1, pgid=10, start_seconds=100, start_microseconds=1)
+            helper = dict(app, kind='helpers', pid=11, ppid=10, start_microseconds=2)
+            soak.process = type('Process', (), {'pid': 10})()
+            observations = iter([{10: app, 11: helper}, {10: app, **({11: dict(helper, **after)} if after is not None else {})}])
+            def live():
+                soak.process_identities = next(observations)
+                return {'app': [10], 'helpers': [pid for pid in soak.process_identities if pid != 10]}
+            soak.live = live
+            response = type('Response', (), {'returncode': returncode,
+                'stdout': json.dumps({'pid': 11, 'physical_footprint_bytes': 77})})()
+            try:
+                with mock.patch.object(runner.subprocess, 'check_output', return_value=json.dumps({
+                        'pid': 10, 'physical_footprint_bytes': 100})), \
+                     mock.patch.object(runner.subprocess, 'run', return_value=response):
+                    if succeeds:
+                        soak.sample('test')
+                        events = [json.loads(line) for line in (out / 'events.jsonl').read_text().splitlines()]
+                        return events[-1]['helpers'][0]
+                    with self.assertRaisesRegex(AssertionError, 'live identified helper'):
+                        soak.sample('test')
+            finally:
+                soak.process = None
+                soak.cleanup()
+
+    def test_helper_memory_is_bound_to_kernel_birth_identity(self):
+        sample = self.sampled_helper({})
+        self.assertEqual(sample['physical_footprint_bytes'], 77)
+        self.assertEqual(sample['identity']['start_microseconds'], 2)
+
+    def test_exit_or_pid_reuse_does_not_publish_unrelated_memory_or_zero(self):
+        for after in (None, {'start_microseconds': 3}):
+            sample = self.sampled_helper(after)
+            self.assertEqual(sample['status'], 'exited_or_replaced_during_sample')
+            self.assertNotIn('physical_footprint_bytes', sample)
+
+    def test_failed_sample_of_the_same_live_helper_is_not_ignored(self):
+        self.sampled_helper({}, returncode=1, succeeds=False)
 
     def test_atomic_json_leaves_no_partial_result(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -25,7 +25,8 @@ import uuid
 
 from group4_resource_soak import (AuditTail, COLD_SOURCE, FootprintSummary, Options,
                                  digest, exact_bytes, fixture_source, matches_frame,
-                                 process_rows, require, settled, text_identity)
+                                 process_inventory, same_process_identity,
+                                 require, settled, text_identity, unique_object, reject_constant)
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -84,6 +85,8 @@ class NativeSoak:
         self.helper = self.app / 'Contents/Helpers/yu-document-renderer'
         self.driver = out / 'native-event-driver'
         self.probe = out / 'process-footprint'
+        self.inventory = out / 'process-inventory'
+        self.process_identities = {}
         self.process = None
         self.log = None
         self.tail = None
@@ -106,14 +109,24 @@ class NativeSoak:
         atomic_json(self.out / 'result.json', self.result)
 
     def processes(self):
-        text = subprocess.check_output(['ps', '-ww', '-axo', 'pid=,command='], text=True, timeout=10)
-        return process_rows(text, self.binary, self.helper)
+        owner = self.process.pid if self.process is not None else 0
+        text = subprocess.check_output([str(self.inventory), str(self.binary), str(self.helper), str(owner)],
+                                       text=True, timeout=10)
+        value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        rows, self.process_identities, unreadable = process_inventory(value)
+        scope = self.result.setdefault('process_inventory', {
+            'method': 'libproc kernel executable path + BSD process birth identity',
+            'unreadable_unrelated_max': 0})
+        scope['unreadable_unrelated_max'] = max(scope['unreadable_unrelated_max'], unreadable)
+        return rows
 
     def live(self):
         require(self.process is not None and self.process.poll() is None, 'The original application process exited')
         rows = self.processes()
         require(rows['app'] == [self.process.pid], 'Expected exactly the same isolated application PID')
         require(len(rows['helpers']) <= self.args.documents, 'Helper count exceeded the number of work documents')
+        require(all(item['pgid'] == self.process.pid for item in self.process_identities.values()),
+                'A matching isolated executable escaped its owned process group')
         return rows
 
     def run(self, *arguments):
@@ -219,8 +232,12 @@ class NativeSoak:
                         self.expect(doc.source)
                         doc.revision, doc.audit = record['revision'], record
                         doc.audit_seconds = time.monotonic() - self.started
+                        live = self.live()
+                        if stage in ('valid', 'cold'):
+                            require(live['helpers'], 'Rendered resources without any kernel-observed helper')
                         self.event('settled_frame', document=doc.index, stage=stage,
-                                   source=text_identity(doc.source), counters=record)
+                                   source=text_identity(doc.source), counters=record,
+                                   live_helpers=live['helpers'])
                         return
             time.sleep(.1)
         self.event('frame_timeout', document=doc.index, stage=stage, last_candidate=candidate)
@@ -245,15 +262,26 @@ class NativeSoak:
 
     def sample(self, phase):
         rows = self.live()
+        before = dict(self.process_identities)
         app = json.loads(subprocess.check_output([str(self.probe), str(self.process.pid)], text=True, timeout=10))
+        responses = [(pid, subprocess.run([str(self.probe), str(pid)], capture_output=True, text=True, timeout=10))
+                     for pid in rows['helpers']]
+        self.live()
+        require(same_process_identity(before[self.process.pid], self.process_identities.get(self.process.pid)),
+                'Application identity changed while sampling')
+        require(app.get('pid') == self.process.pid, 'Application footprint PID differs')
         helpers = []
-        for pid in rows['helpers']:
-            response = subprocess.run([str(self.probe), str(pid)], capture_output=True, text=True, timeout=10)
-            if response.returncode:
-                require(pid not in self.processes()['helpers'], 'Failed to sample a live helper')
-                helpers.append({'pid': pid, 'status': 'exited_during_sample'})
-            else:
-                helpers.append(json.loads(response.stdout))
+        for pid, response in responses:
+            identity = before[pid]
+            if not same_process_identity(identity, self.process_identities.get(pid)):
+                helpers.append({'pid': pid, 'identity': identity, 'status': 'exited_or_replaced_during_sample'})
+                continue
+            require(response.returncode == 0, 'Failed to sample a live identified helper')
+            sample = json.loads(response.stdout)
+            require(sample.get('pid') == pid, 'Helper footprint PID differs')
+            require(type(sample.get('physical_footprint_bytes')) is int and sample['physical_footprint_bytes'] >= 0,
+                    'Invalid helper physical footprint')
+            helpers.append(dict(sample, identity=identity))
         now = time.monotonic() - self.started
         self.summary.add(self.session, phase, now, app)
         audits = [{'document': d.index, 'window': d.window, 'source': text_identity(d.source),
@@ -356,6 +384,9 @@ def prepare(soak, production, build):
     out = soak.out
     subprocess.run(['swiftc', str(ROOT / 'tools/native-event-driver.swift'), '-o', str(soak.driver)], check=True, timeout=180)
     subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', str(ROOT / 'tools/process-footprint.c'), '-o', str(soak.probe)], check=True, timeout=60)
+    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', str(ROOT / 'tools/process-inventory.c'), '-o', str(soak.inventory)], check=True, timeout=60)
+    soak.result['process_inventory_binary_sha256'] = digest(soak.inventory)
+    soak.result['process_inventory_source_sha256'] = digest(ROOT / 'tools/process-inventory.c')
     preflight = subprocess.run([str(soak.driver), '--preflight'], capture_output=True, text=True, timeout=20)
     (out / 'preflight.json').write_text(preflight.stdout)
     (out / 'preflight.stderr.log').write_text(preflight.stderr)
