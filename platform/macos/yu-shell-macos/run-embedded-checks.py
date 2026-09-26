@@ -21,6 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
 parser.add_argument('--resource-audit', action='store_true', help='Read-only per-frame CPU cache/history/GPU residency counters')
+parser.add_argument('--stress-idle-seconds', type=int, default=0, help='Observe post-stress plain-document idle memory, 0..120 seconds')
 parser.add_argument('--list-gestures', action='store_true', help='Actual reverse mouse range and parent/child Option-click multicursors')
 parser.add_argument('--smoke-document', action='store_true', help='Fixed combined document TOC/disclosure/find/save interaction without OCR')
 parser.add_argument('--stress-seconds', type=int, default=0, help='Bounded real-window resource churn, 30..1800 seconds; not a leak proof')
@@ -146,6 +147,7 @@ log = (out/'app.log').open('w')
 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
 result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required':True,
           'resource_audit':args.resource_audit,
+          'stress_idle_seconds':args.stress_idle_seconds,
           'isolated_bundle':identifier,
           'recent_diagrams':args.recent_diagrams,
           'promotion_suite':args.promotion_suite,
@@ -1200,7 +1202,7 @@ try:
         source = audit.smoke_document(ROOT)
     if args.stress_seconds:
         audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
-        source = audit.resource_stress(ROOT, process.pid, helpers, args.stress_seconds)
+        source = audit.resource_stress(ROOT, process.pid, helpers, args.stress_seconds, args.stress_idle_seconds)
 
     if args.list_gestures:
         audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)

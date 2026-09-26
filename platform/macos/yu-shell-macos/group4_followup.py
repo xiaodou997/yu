@@ -14,6 +14,9 @@ import time
 def option_error(options):
     """Reject conflicting follow-up modes before any file or desktop effects."""
     seconds = options.get('stress_seconds', 0)
+    idle = options.get('stress_idle_seconds', 0)
+    if not 0 <= idle <= 120 or (idle and not seconds):
+        return '--stress-idle-seconds requires --stress-seconds and must be between 0 and 120'
     if seconds and not 30 <= seconds <= 1800:
         return '--stress-seconds must be between 30 and 1800'
     groups = [('table_interactions', 'table_resize'), ('smoke_document',), ('stress_seconds',), ('list_gestures',)]
@@ -23,6 +26,8 @@ def option_error(options):
     if len(active) > 1:
         return 'Choose one follow-up suite (table-interactions and table-resize may combine)'
     allowed = {'output', 'dark', 'reopen', 'resource_audit', *active[0]}
+    if seconds:
+        allowed.add('stress_idle_seconds')
     if any(value for key, value in options.items() if key not in allowed):
         return 'Follow-up suites combine only with --dark and --reopen'
     return None
@@ -275,7 +280,7 @@ class Checks:
         self.expect(source); self.save(source)
         return source
 
-    def resource_stress(self, root, app_pid, helpers, duration):
+    def resource_stress(self, root, app_pid, helpers, duration, idle_seconds=0):
         probe = self.out/'process-footprint'
         subprocess.run(['clang','-Wall','-Wextra','-Werror',str(root/'tools/process-footprint.c'),'-o',str(probe)],check=True)
         def footprint(pid):
@@ -294,6 +299,8 @@ class Checks:
                     if record['revision'] > after_revision and record['source_bytes'] == len(plain.encode()):
                         assert record['embedded_gpu_textures'] == 0, record
                         assert record['embedded_gpu_rgba_bytes'] == 0, record
+                        assert record['embedded_failures'] == 0, record
+                        assert record['embedded_cache_entries'] <= 32, record
                         return record
                 time.sleep(.1)
             raise AssertionError('Current plain frame did not publish resource counters')
@@ -328,6 +335,24 @@ class Checks:
             stats['rounds'] = rounds
             (self.out/'stress-progress.json').write_text(json.dumps(stats,indent=2)+'\n')
         final = '# Stress restored\r\n\r\n$x^2$\r\n\r\nTAIL\r\n'
+        stats['churn_elapsed_seconds'] = time.monotonic()-started
+        if idle_seconds:
+            self.save(plain)
+            idle_started = time.monotonic()
+            idle_samples = []
+            stats['idle_samples'] = idle_samples
+            while time.monotonic()-idle_started < idle_seconds:
+                self.expect(plain)
+                live = helpers()
+                assert len(live) <= 1, live
+                idle_samples.append({'seconds':time.monotonic()-idle_started, 'app':footprint(app_pid), 'helpers':len(live)})
+                time.sleep(min(5, max(0, idle_seconds-(time.monotonic()-idle_started))))
+            stats['idle_elapsed_seconds'] = time.monotonic()-idle_started
+            stats['idle_end_app'] = footprint(app_pid)
+            stats['idle_end_helpers'] = helpers()
+            if idle_seconds >= 70:
+                assert not stats['idle_end_helpers'], 'Helper did not exit after its idle allowance'
+            self.record('post-stress plain idle observation preserves source/history; physical footprint recorded separately from logical texture bytes')
         self.install(final); self.save(final); self.capture('stress-restored')
         stats.update(elapsed_seconds=time.monotonic()-started,helper_pids=sorted(pids),min_app_bytes=min(s['app']['physical_footprint_bytes'] for s in samples),max_app_bytes=max(s['app']['physical_footprint_bytes'] for s in samples))
         self.record('resource stress: {} completed valid/error/plain cycles in {:.1f}s; exact source/history, one helper while rendering and no new process for plain text; measured memory, no leak-proof claim'.format(rounds,stats['elapsed_seconds']))
