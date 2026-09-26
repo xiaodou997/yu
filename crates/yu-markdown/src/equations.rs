@@ -73,13 +73,27 @@ impl EquationIndex {
         let Some(tree) = document.tree() else {
             return index;
         };
+        let mut spans: Vec<_> = SyntaxNode::new(tree, 0)
+            .descendants_in(
+                TextRange::new(yu_core::ByteOffset::ZERO, document.source_len()).expect("document"),
+            )
+            .filter_map(|node| span_of(document, node))
+            .collect();
+        // HTML formulas have source-owned identity but are not Markdown math
+        // nodes. The host schedules all formulas through this index, so its
+        // ownership set must include the same native HTML leaves as projection.
+        spans.extend(
+            document
+                .html_regions()
+                .regions
+                .iter()
+                .filter_map(|region| region.model.as_ref().ok())
+                .flat_map(|model| model.inline_math_spans()),
+        );
+        spans.sort_by_key(|span| (span.source.start(), span.source.end()));
+        spans.dedup();
         let mut next = 1;
-        for node in SyntaxNode::new(tree, 0).descendants_in(
-            TextRange::new(yu_core::ByteOffset::ZERO, document.source_len()).expect("document"),
-        ) {
-            let Some(span) = span_of(document, node) else {
-                continue;
-            };
+        for span in spans {
             let source = document.embedded_source(span).unwrap_or_default();
             let (controls, mut error) = match parse_controls(&source) {
                 Ok(controls) => (controls, None),
