@@ -495,6 +495,17 @@ pub struct Subgraph {
     pub icon: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GanttTickUnit {
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
 #[derive(Debug, Clone)]
 pub struct Graph {
     pub frontmatter_title: Option<String>,
@@ -529,6 +540,8 @@ pub struct Graph {
     pub gantt_display_mode: Option<String>,
     pub gantt_axis_format: Option<String>,
     pub gantt_tick_days: Option<u32>,
+    pub gantt_tick_interval: Option<(u32, GanttTickUnit)>,
+    pub gantt_ticks: Vec<f64>,
     pub gantt_tick_weekly: bool,
     pub gantt_weekday: u8,
     pub gantt_top_axis: bool,
@@ -692,6 +705,8 @@ impl Graph {
             gantt_display_mode: None,
             gantt_axis_format: None,
             gantt_tick_days: None,
+            gantt_tick_interval: None,
+            gantt_ticks: Vec::new(),
             gantt_tick_weekly: false,
             gantt_weekday: 0,
             gantt_top_axis: false,

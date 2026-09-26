@@ -56,6 +56,48 @@ fn app_client_uses_one_real_helper_and_rejects_stale_requests() {
 }
 
 #[test]
+fn gantt_calendar_changes_at_same_revision_reach_real_helper_and_recover() {
+    let mut client = NativeRendererClient::new(
+        std::env::var_os("YU_TEST_RENDERER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_yu-document-renderer").into()),
+        109,
+    );
+    let control = RenderControl::default();
+    control.set_revision(7);
+    let source = "gantt\ndateFormat HH:mm\naxisFormat %Y-%m-%d %H:%M\nA :a,08:30,1h";
+    let make = |day, source: &str| {
+        request(7, EmbeddedResourceKind::Mermaid, source)
+            .with_style(yu_assets::EmbeddedStyle::default().with_reference_day(Some(day)))
+    };
+    let a = client
+        .render(&make(20454, source), &control)
+        .expect("first local day");
+    let pid = client.process_id().expect("helper started");
+    let b = client
+        .render(&make(20455, source), &control)
+        .expect("next local day");
+    assert!(a.markup().expect("first SVG").contains("2026-01-01"));
+    assert!(b.markup().expect("next SVG").contains("2026-01-02"));
+    assert_ne!(a.markup(), b.markup());
+    let invalid = client.render(
+        &make(20455, "gantt\ndateFormat HH:mm\nA :a,24:00,1h"),
+        &control,
+    );
+    assert!(matches!(invalid, Err(RenderFailure::InvalidSource(_))));
+    let restored = client
+        .render(&make(20454, source), &control)
+        .expect("clock rollback and error recovery");
+    assert_eq!(restored.markup(), a.markup());
+    assert_eq!(client.process_id(), Some(pid));
+    control.close();
+    assert_eq!(
+        client.render(&make(20455, source), &control),
+        Err(RenderFailure::Cancelled)
+    );
+}
+
+#[test]
 fn central_lifecycle_errors_do_not_poison_the_real_helper_or_request_identity() {
     let mut client = NativeRendererClient::new(
         std::env::var_os("YU_TEST_RENDERER")

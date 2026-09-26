@@ -25,6 +25,10 @@ swiftc -module-cache-path /tmp/yu-scroll-swift-cache \
     -o /tmp/yu-frame-wake-checks
 /tmp/yu-frame-wake-checks >/dev/null
 
+# Calendar publication and the midnight timer can be checked without an app window.
+swiftc -swift-version 5 -warnings-as-errors Sources/Yu/RenderCalendarContext.swift Tests/RenderCalendarChecks.swift -o /tmp/yu-render-calendar-checks
+/tmp/yu-render-calendar-checks
+
 swiftc Sources/Yu/TypewriterGeometry.swift Tests/TypewriterGeometryChecks.swift -o /tmp/yu-typewriter-geometry-checks
 /tmp/yu-typewriter-geometry-checks
 

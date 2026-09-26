@@ -1,5 +1,5 @@
 use super::*;
-use crate::gantt_time::{civil_from_days, days_from_civil};
+use crate::gantt_time::civil_from_days;
 
 fn gantt_palette(theme: &Theme) -> Vec<String> {
     vec![
@@ -49,8 +49,12 @@ fn gantt_task_color(status: Option<crate::ir::GanttStatus>, base: &str, fallback
     let status = status.unwrap_or_default();
     // Completion wins over active when contradictory tags are supplied;
     // critical remains an independent outline and milestone remains a shape.
-    if status.done { return shift_color(&base, 30.0, 80.0, 0.7); }
-    if status.active { return shift_color(&base, 70.0, 52.0, 0.6); }
+    if status.done {
+        return shift_color(&base, 30.0, 80.0, 0.7);
+    }
+    if status.active {
+        return shift_color(&base, 70.0, 52.0, 0.6);
+    }
     if status.milestone {
         if let Some((_, saturation, lightness)) = parse_color_to_hsl(&base) {
             return hsl_color(45.0, saturation.max(65.0), lightness.clamp(50.0, 65.0));
@@ -104,25 +108,56 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
     let label_width = section_label_width + section_task_gap + task_label_width;
     let section_label_x = label_x;
     let task_label_x = label_x + section_label_width + section_task_gap;
-    let chart_x = padding + label_width + label_gap;
-    let top_axis_height = if graph.gantt_top_axis { row_height * 0.9 + theme.font_size } else { 0.0 };
+    let mut chart_x = padding + label_width + label_gap;
+    let top_axis_height = if graph.gantt_top_axis {
+        row_height * 0.9 + theme.font_size
+    } else {
+        0.0
+    };
     let chart_y = title_height + padding + top_axis_height;
     let top_axis_y = graph.gantt_top_axis.then_some(chart_y - row_height * 0.6);
-    let chart_width = theme.font_size * 26.0;
+    let mut chart_width = theme.font_size * 26.0;
 
-    assert_eq!(graph.gantt_tasks.len(), graph.gantt_schedule.len(), "Gantt schedule must be resolved before layout");
-    assert_eq!(graph.gantt_tasks.len(), graph.gantt_render_ends.len(), "Gantt visual endpoints must be resolved before layout");
-    let has_dates = graph.gantt_reference_day.is_some() || graph.gantt_tasks.iter().any(|task| task.start.is_some() || task.end.is_some());
+    assert_eq!(
+        graph.gantt_tasks.len(),
+        graph.gantt_schedule.len(),
+        "Gantt schedule must be resolved before layout"
+    );
+    assert_eq!(
+        graph.gantt_tasks.len(),
+        graph.gantt_render_ends.len(),
+        "Gantt visual endpoints must be resolved before layout"
+    );
+    let has_dates = graph.gantt_reference_day.is_some()
+        || graph
+            .gantt_tasks
+            .iter()
+            .any(|task| task.start.is_some() || task.end.is_some());
     let mut time_start = f64::MAX;
     let mut time_end = f64::MIN;
     let mut computed = Vec::with_capacity(graph.gantt_tasks.len());
-    for ((task, &(start, end)), &visible_end) in graph.gantt_tasks.iter().zip(&graph.gantt_schedule).zip(&graph.gantt_render_ends) {
+    for ((task, &(start, end)), &visible_end) in graph
+        .gantt_tasks
+        .iter()
+        .zip(&graph.gantt_schedule)
+        .zip(&graph.gantt_render_ends)
+    {
         time_start = time_start.min(start);
         time_end = time_end.max(end);
         // Milestones use the scheduled midpoint. Ordinary bars may trim a
         // trailing excluded-day span without changing dependency scheduling.
-        let display_end = if task.status.is_some_and(|flags| flags.milestone) { end } else { visible_end };
-        computed.push((task.label.clone(), start, display_end - start, task.status, task.section.clone()));
+        let display_end = if task.status.is_some_and(|flags| flags.milestone) {
+            end
+        } else {
+            visible_end
+        };
+        computed.push((
+            task.label.clone(),
+            start,
+            display_end - start,
+            task.status,
+            task.section.clone(),
+        ));
     }
     if !time_start.is_finite() || !time_end.is_finite() {
         time_start = 0.0;
@@ -132,82 +167,94 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
         time_end = time_start + 1.0;
     }
     let time_span = (time_end - time_start).max(f64::EPSILON);
+    let tick_labels: Vec<_> = graph
+        .gantt_ticks
+        .iter()
+        .map(|&t| {
+            if let Some(format) = graph.gantt_axis_format.as_deref() {
+                crate::gantt_time::axis::format_time(t, format)
+            } else if has_dates && time_span < 1.0 {
+                crate::gantt_time::axis::format_time(
+                    t,
+                    if time_span < 1.0 / 86_400.0 {
+                        "%H:%M:%S.%L"
+                    } else {
+                        "%H:%M:%S"
+                    },
+                )
+            } else if has_dates {
+                format_gantt_date(t.floor() as i32)
+            } else {
+                format!("{:.0}", t - time_start)
+            }
+        })
+        .collect();
+    let tick_half_widths: Vec<_> = tick_labels
+        .iter()
+        .map(|label| {
+            measure_label_with_font_size(
+                label,
+                theme.font_size * 0.8,
+                config,
+                false,
+                theme.font_family.as_str(),
+            )
+            .width
+                / 2.0
+        })
+        .collect();
+    // Date/time labels can be much wider than dates. Reserve actual measured
+    // space rather than dropping ticks or painting adjacent labels together.
+    // Excessively wide output still fails the helper's existing geometry cap.
+    for (times, widths) in graph
+        .gantt_ticks
+        .windows(2)
+        .zip(tick_half_widths.windows(2))
+    {
+        let fraction = (times[1] - times[0]) / time_span;
+        if fraction > 0.0 {
+            chart_width = chart_width
+                .max(((widths[0] + widths[1] + theme.font_size * 0.8) as f64 / fraction) as f32);
+        }
+    }
+    if let Some(first) = tick_half_widths.first() {
+        chart_x = chart_x.max(first + padding);
+    }
+
     let time_scale = f64::from(chart_width) / time_span;
     let today_marker = graph.gantt_reference_day.and_then(|day| {
         let day = f64::from(day);
-        if day < time_start || day > time_end { return None; }
-        graph.gantt_today_marker.clone().map(|style| (chart_x + ((day - time_start) * time_scale) as f32, style))
+        if day < time_start || day > time_end {
+            return None;
+        }
+        graph
+            .gantt_today_marker
+            .clone()
+            .map(|style| (chart_x + ((day - time_start) * time_scale) as f32, style))
     });
     let mut excluded_spans: Vec<(f32, f32)> = Vec::new();
     if graph.gantt_calendar.is_active() {
         for day in (time_start.floor() as i32)..(time_end.ceil() as i32) {
-            if !graph.gantt_calendar.is_excluded(day) { continue; }
+            if !graph.gantt_calendar.is_excluded(day) {
+                continue;
+            }
             let x = chart_x + ((f64::from(day).max(time_start) - time_start) * time_scale) as f32;
-            let end = chart_x + ((f64::from(day + 1).min(time_end) - time_start) * time_scale) as f32;
-            if let Some(last) = excluded_spans.last_mut() && (last.0 + last.1 - x).abs() < 0.01 { last.1 = end - last.0; }
-            else { excluded_spans.push((x, end - x)); }
+            let end =
+                chart_x + ((f64::from(day + 1).min(time_end) - time_start) * time_scale) as f32;
+            if let Some(last) = excluded_spans.last_mut()
+                && (last.0 + last.1 - x).abs() < 0.01
+            {
+                last.1 = end - last.0;
+            } else {
+                excluded_spans.push((x, end - x));
+            }
         }
     }
 
-
     let mut ticks: Vec<GanttTick> = Vec::new();
-    let tick_times: Vec<f64> = if let Some(days) = graph.gantt_tick_days {
-        let step = f64::from(days);
-        let mut first = time_start.ceil();
-        if graph.gantt_tick_weekly && has_dates {
-            // D3 week intervals count from the week containing the Unix epoch.
-            let anchor = -4.0 + f64::from(graph.gantt_weekday);
-            first = anchor + ((first - anchor) / step).ceil() * step;
-        }
-        let mut times = Vec::new();
-        let mut t = first;
-        while t <= time_end && times.len() <= 2048 {
-            if has_dates && !graph.gantt_tick_weekly {
-                // D3 day.every(n) restarts its day-of-month field each month.
-                let (year, month, day) = civil_from_days(t as i32);
-                let next_month = if month == 12 { days_from_civil(year + 1, 1, 1) }
-                    else { days_from_civil(year, month + 1, 1) };
-                let remainder = (day - 1) % days;
-                if remainder != 0 {
-                    t = (t + f64::from(days - remainder)).min(f64::from(next_month));
-                    continue;
-                }
-                times.push(t);
-                t = (t + step).min(f64::from(next_month));
-            } else {
-                times.push(t);
-                t += step;
-            }
-        }
-        times
-    } else if has_dates {
-        // Calendar ticks use whole days; short charts must not repeat dates.
-        let step = (time_span / 4.0).ceil().max(1.0);
-        (0..=4).map(|i| time_start + step * f64::from(i))
-            .take_while(|t| *t <= time_end).collect()
-    } else {
-        (0..=4).map(|i| time_start + time_span * f64::from(i) / 4.0).collect()
-    };
-    for t in tick_times {
+    // Tick density was checked before layout; never silently truncate an axis.
+    for (&t, label) in graph.gantt_ticks.iter().zip(tick_labels) {
         let x = chart_x + ((t - time_start) * time_scale) as f32;
-        let label = if has_dates {
-            if let Some(format) = graph.gantt_axis_format.as_deref() {
-                let (year, month, day) = civil_from_days(t.round() as i32);
-                let mut result = String::new();
-                let mut chars = format.chars();
-                while let Some(ch) = chars.next() {
-                    if ch != '%' { result.push(ch); continue; }
-                    match chars.next() {
-                        Some('Y') => result.push_str(&format!("{year:04}")),
-                        Some('m') => result.push_str(&format!("{month:02}")),
-                        Some('d') => result.push_str(&format!("{day:02}")),
-                        Some('%') => result.push('%'),
-                        _ => {}, // Strict parsing rejects unsupported tokens.
-                    }
-                }
-                result
-            } else { format_gantt_date(t.round() as i32) }
-        } else { format!("{:.0}", t - time_start) };
         ticks.push(GanttTick { x, label });
     }
 
@@ -260,7 +307,11 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
         }
 
         let milestone = status.is_some_and(|flags| flags.milestone);
-        let display_start = if milestone { start + duration * 0.5 } else { *start };
+        let display_start = if milestone {
+            start + duration * 0.5
+        } else {
+            *start
+        };
         let bar_x = chart_x + ((display_start - time_start) * time_scale) as f32;
         let bar_width = (duration * time_scale) as f32;
         let base_color = if let Some(sec) = section.as_ref() {
@@ -273,9 +324,12 @@ pub(super) fn compute_gantt_layout(graph: &Graph, theme: &Theme, config: &Layout
         };
         let color = gantt_task_color(*status, &base_color, &palette[0]);
         let critical = status.is_some_and(|flags| flags.critical);
-        let border_color = if critical { "#df4b52".to_owned() } else { theme.primary_border_color.clone() };
+        let border_color = if critical {
+            "#df4b52".to_owned()
+        } else {
+            theme.primary_border_color.clone()
+        };
         let border_width = if critical { 2.5 } else { 1.0 };
-
 
         let task_end = start + duration;
         let task_y = if compact {
@@ -393,7 +447,9 @@ mod tests {
             let mut graph = make_graph(None, vec![task("Task", "Work", "2026-01-01", "1d")]);
             graph.gantt_title = Some(vec!["中文 title"; count].join("\n"));
             let layout = compute_gantt_layout(&graph, &theme, &config);
-            let DiagramData::Gantt(gantt) = layout.diagram else { panic!("Gantt layout") };
+            let DiagramData::Gantt(gantt) = layout.diagram else {
+                panic!("Gantt layout")
+            };
             let title = gantt.title.as_ref().expect("title");
             assert_eq!(title.lines.len(), count);
             assert!(gantt.title_y - title.height * 0.5 >= 0.0);
@@ -415,9 +471,16 @@ mod tests {
         }
         graph.gantt_sections = sections;
         graph.gantt_tasks = tasks;
-        let schedule = crate::gantt_time::resolve(&graph.gantt_tasks, &graph.gantt_calendar, graph.gantt_reference_day, graph.gantt_inclusive_end_dates).expect("test schedule");
+        let schedule = crate::gantt_time::resolve(
+            &graph.gantt_tasks,
+            &graph.gantt_calendar,
+            graph.gantt_reference_day,
+            graph.gantt_inclusive_end_dates,
+        )
+        .expect("test schedule");
         graph.gantt_schedule = schedule.times;
         graph.gantt_render_ends = schedule.render_ends;
+        graph.gantt_ticks = crate::gantt_time::axis::ticks(&graph).expect("test ticks");
         graph
     }
 
@@ -445,7 +508,10 @@ mod tests {
             end: None,
             until: None,
             section: Some(section.to_string()),
-            status: Some(GanttStatus { milestone: true, ..GanttStatus::default() }),
+            status: Some(GanttStatus {
+                milestone: true,
+                ..GanttStatus::default()
+            }),
         }
     }
 
