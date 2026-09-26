@@ -267,6 +267,8 @@ final class MacosSurfaceHostCoordinator {
     private var layoutRefinement: DispatchWorkItem?
     private var frameWorkReadyObserver: NSObjectProtocol?
     private var calendarObservers: [(NotificationCenter, NSObjectProtocol)] = []
+    private let calendarWakeup = RenderCalendarWakeup()
+    private var calendarSuspended = false
     private var occlusionObserver: NSObjectProtocol?
     private var resourceCompletionObserver: NSObjectProtocol?
     private var scheduleToken: UInt64 = 0
@@ -311,13 +313,17 @@ final class MacosSurfaceHostCoordinator {
             (.default, .NSSystemTimeZoneDidChange),
             (.default, .NSSystemClockDidChange),
             (.default, NSApplication.didBecomeActiveNotification),
+            (.default, NSApplication.didResignActiveNotification),
             (NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification),
+            (NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification),
+            (NSWorkspace.shared.notificationCenter, NSWorkspace.sessionDidBecomeActiveNotification),
         ]
         for (center, name) in calendarEvents {
             let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                guard let self, self.isAttached, NSApplication.shared.isActive,
-                      self.surfaceView?.window?.occlusionState.contains(.visible) == true else { return }
-                self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
+                guard let self else { return }
+                if name == NSWorkspace.willSleepNotification { self.calendarSuspended = true }
+                if name == NSWorkspace.didWakeNotification || name == NSWorkspace.sessionDidBecomeActiveNotification { self.calendarSuspended = false }
+                self.calendarEnvironmentDidChange()
             }
             calendarObservers.append((center, observer))
         }
@@ -326,9 +332,11 @@ final class MacosSurfaceHostCoordinator {
         ) { [weak self] notification in
             guard let self, let window = notification.object as? NSWindow,
                   window === self.surfaceView?.window else { return }
+            self.calendarWakeup.cancel()
             self.layoutRefinement?.cancel()
             self.layoutRefinement = nil
             if self.isAttached, window.occlusionState.contains(.visible) {
+                self.bridge.invalidateRenderCalendar()
                 self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
             }
         }
@@ -361,6 +369,27 @@ final class MacosSurfaceHostCoordinator {
         }
         if let resourceCompletionObserver {
             NotificationCenter.default.removeObserver(resourceCompletionObserver)
+        }
+    }
+
+    private func calendarEnvironmentDidChange() {
+        // Invalidate even while hidden; the next visible frame must resample.
+        bridge.invalidateRenderCalendar()
+        calendarWakeup.cancel()
+        guard isAttached, !calendarSuspended, NSApplication.shared.isActive,
+              surfaceView?.window?.occlusionState.contains(.visible) == true else { return }
+        enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
+    }
+
+    private func scheduleCalendarBoundaryRefresh() {
+        guard isAttached, !calendarSuspended, NSApplication.shared.isActive,
+              surfaceView?.window?.occlusionState.contains(.visible) == true,
+              let boundary = bridge.nextRenderCalendarBoundary else {
+            calendarWakeup.cancel()
+            return
+        }
+        calendarWakeup.schedule(boundary: boundary) { [weak self] in
+            self?.calendarEnvironmentDidChange()
         }
     }
 
@@ -1203,6 +1232,7 @@ final class MacosSurfaceHostCoordinator {
     /// 判定「与屏幕上的帧等价」。资源刷新判断移入 Rust 后这个参数即可删除。
     @discardableResult
     func submitNow(force: Bool = false) throws -> NativeMacosRenderHostSurfaceSnapshot? {
+        defer { scheduleCalendarBoundaryRefresh() }
         let startedAt = DispatchTime.now().uptimeNanoseconds
         if let boundsTime = pendingBoundsEventTime {
             pendingBoundsEventTime = nil
@@ -1237,6 +1267,10 @@ final class MacosSurfaceHostCoordinator {
             pendingCaretReveal = nil
         }
 
+        // Calendar state is not part of the document revision or Swift geometry.
+        // Check it before the retained-frame fast path, and invalidate that path
+        // even if the subsequent native submission is busy or fails.
+        if try bridge.updateRenderCalendar() { lastSnapshot = nil }
         if !force, isAttached, lastSnapshot?.layoutPending != true, frameIsCurrent(geometry) {
             // Rust surface 是唯一渲染路径：attach 之后一直可见，
             // 内容由 retained frame 决定，不由 coverage 决定（不变量 I5）。
@@ -1368,6 +1402,7 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func detach() {
+        calendarWakeup.cancel()
         caretRevealGeneration &+= 1
         layoutRefinement?.cancel()
         layoutRefinement = nil

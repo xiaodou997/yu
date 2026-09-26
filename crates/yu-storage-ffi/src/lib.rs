@@ -10009,6 +10009,75 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn reference_day_preserves_full_editor_history_selections_and_saved_bytes() {
+        for (bom, ending) in [
+            ("", "\n"),
+            ("\u{feff}", "\n"),
+            ("", "\r\n"),
+            ("\u{feff}", "\r\n"),
+        ] {
+            let path = std::env::temp_dir().join(format!("yu-calendar-history-{}.md", temp_id()));
+            let source = format!(
+                "{bom}# 中文🙂{ending}{ending}```mermaid{ending}gantt{ending}dateFormat HH:mm{ending}Task :08:30,1h{ending}```{ending}"
+            );
+            fs::write(&path, source.as_bytes()).expect("calendar fixture");
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            let session = unsafe { &mut *raw };
+            session
+                .session
+                .execute(EditorCommand::insert_text("输入🙂"))
+                .expect("seed history");
+            let edited = session.session.snapshot().as_str().to_owned();
+            session
+                .session
+                .execute(EditorCommand::Undo)
+                .expect("keep redo branch");
+            let before = session.session.snapshot().as_str().to_owned();
+            let revision = session.session.snapshot().revision();
+            let selections = session.session.document().editor().selections().clone();
+            let history = session.session.document().editor().history_stats();
+            for day in [20454, 20455, 20455, 20453] {
+                assert_eq!(
+                    unsafe { yu_storage_session_macos_set_reference_day(raw, day) },
+                    YU_STORAGE_OK
+                );
+                let session = unsafe { &*raw };
+                assert_eq!(session.session.snapshot().as_str(), before);
+                assert_eq!(session.session.snapshot().revision(), revision);
+                assert_eq!(
+                    session.session.document().editor().selections(),
+                    &selections
+                );
+                assert_eq!(session.session.document().editor().history_stats(), history);
+                assert_eq!(fs::read(&path).expect("saved bytes"), source.as_bytes());
+            }
+            assert_eq!(
+                unsafe { yu_storage_session_macos_set_reference_day(raw, i32::MAX) },
+                YU_STORAGE_EDITOR_ERROR
+            );
+            let session = unsafe { &mut *raw };
+            session
+                .session
+                .execute(EditorCommand::Redo)
+                .expect("redo survives date changes");
+            assert_eq!(session.session.snapshot().as_str(), edited);
+            session
+                .session
+                .execute(EditorCommand::Undo)
+                .expect("undo typing");
+            assert_eq!(session.session.snapshot().as_str(), before);
+            unsafe { yu_storage_session_destroy(raw) };
+            fs::remove_file(path).expect("cleanup calendar fixture");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn reference_day_cancels_old_resources_without_editing_document() {
         let path = std::env::temp_dir().join(format!("yu-calendar-{}.md", temp_id()));
         let source = "# 日期\n\n```mermaid\ngantt\nTask :1d\n```\n";

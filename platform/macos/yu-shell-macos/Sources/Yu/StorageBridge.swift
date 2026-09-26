@@ -753,9 +753,9 @@ struct NativeCommandResult {
     }
 }
 final class StorageBridge {
-    private var renderCalendarInterval: DateInterval?
-    private var renderCalendarZone: String?
-    private var renderCalendarDay: Int32?
+    private var renderCalendar = RenderCalendarContext()
+    var nextRenderCalendarBoundary: Date? { renderCalendar.nextBoundary }
+    func invalidateRenderCalendar() { renderCalendar.invalidate() }
     private var handle: OpaquePointer
     private var openedPath: String
     private var cachedSource: String
@@ -1116,36 +1116,16 @@ final class StorageBridge {
 
 
     static func referenceDay(at date: Date, timeZone: TimeZone) -> Int32? {
-        var local = Calendar(identifier: .gregorian)
-        local.timeZone = timeZone
-        let components = local.dateComponents([.year, .month, .day], from: date)
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(secondsFromGMT: 0)!
-        guard let midnight = utc.date(from: components) else { return nil }
-        let days = floor(midnight.timeIntervalSince1970 / 86400)
-        guard days >= -719162, days <= 2932896 else { return nil }
-        return Int32(days)
+        RenderCalendarContext.referenceDay(at: date, timeZone: timeZone)
     }
 
     @discardableResult
     func updateRenderCalendar(at now: Date = Date(), timeZone zone: TimeZone = .current) throws -> Bool {
-        if renderCalendarZone == zone.identifier,
-           let interval = renderCalendarInterval,
-           now >= interval.start, now < interval.end { return false }
-        guard let day = Self.referenceDay(at: now, timeZone: zone) else {
-            throw BridgeError.operation(StorageStatus.editorError)
-        }
-        let changed = renderCalendarDay != day
-        if changed {
-            let status = yu_storage_session_macos_set_reference_day(handle, day)
+        let session = handle
+        return try renderCalendar.update(at: now, timeZone: zone) { day in
+            let status = yu_storage_session_macos_set_reference_day(session, day)
             guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
-            renderCalendarDay = day
         }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = zone
-        renderCalendarZone = zone.identifier
-        renderCalendarInterval = calendar.dateInterval(of: .day, for: now)
-        return changed
     }
 
     func macosRenderHostFrame(

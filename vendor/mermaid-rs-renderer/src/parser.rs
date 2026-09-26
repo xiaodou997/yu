@@ -2873,11 +2873,8 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             if format.is_empty() {
                 bail!("Empty Gantt axisFormat");
             }
-            let mut chars = format.trim().chars();
-            while let Some(ch) = chars.next() {
-                if ch == '%' && !matches!(chars.next(), Some('Y' | 'm' | 'd' | '%')) {
-                    bail!("Unsupported native Gantt axisFormat: {format}");
-                }
+            if !crate::gantt_time::axis::supports_format(format) {
+                bail!("Unsupported native Gantt axisFormat: {format}");
             }
             graph.gantt_axis_format = Some(format.trim().to_owned());
             continue;
@@ -2899,24 +2896,20 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         if keyword == "tickInterval" {
             let interval = data;
             let interval = interval.trim();
-            let (number, multiplier) = if let Some(n) = interval.strip_suffix("day") {
-                (n, 1u32)
-            } else if let Some(n) = interval.strip_suffix("week") {
-                (n, 7u32)
-            } else {
-                bail!("Unsupported native Gantt tickInterval: {interval}");
+            let (count, unit) = crate::gantt_time::axis::interval(interval).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported or invalid native Gantt tickInterval: {interval}")
+            })?;
+            graph.gantt_tick_interval = Some((count, unit));
+            graph.gantt_tick_days = match unit {
+                crate::ir::GanttTickUnit::Day => Some(count),
+                crate::ir::GanttTickUnit::Week => Some(
+                    count
+                        .checked_mul(7)
+                        .ok_or_else(|| anyhow::anyhow!("Gantt tickInterval overflow"))?,
+                ),
+                _ => None,
             };
-            if number.starts_with('0') || !number.bytes().all(|b| b.is_ascii_digit()) {
-                bail!("Invalid Gantt tickInterval: {interval}");
-            }
-            let days = number
-                .parse::<u32>()
-                .ok()
-                .and_then(|n| n.checked_mul(multiplier))
-                .filter(|n| *n > 0)
-                .ok_or_else(|| anyhow::anyhow!("Invalid Gantt tickInterval: {interval}"))?;
-            graph.gantt_tick_days = Some(days);
-            graph.gantt_tick_weekly = multiplier == 7;
+            graph.gantt_tick_weekly = unit == crate::ir::GanttTickUnit::Week;
             continue;
         }
         if lower == "axisformat" || lower == "tickinterval" {
@@ -3056,7 +3049,8 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             if label.is_empty() {
                 bail!("Empty Gantt task label: {line}");
             }
-            let (id, details, after, status) = parse_gantt_task_meta(meta, &date_format)?;
+            let (id, details, after, status) =
+                parse_gantt_task_meta(meta, &date_format, reference_day)?;
             let node_id = id
                 .clone()
                 .unwrap_or_else(|| format!("gantt_{}", graph.nodes.len()));
@@ -3073,7 +3067,7 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             };
             let ending = details.last().expect("validated metadata");
             let duration = looks_like_duration(ending).then(|| ending.clone());
-            let end = crate::gantt_time::parse_date(ending).map(|_| ending.clone());
+            let end = crate::gantt_time::parse_timestamp(ending).map(|_| ending.clone());
             let until = ending.strip_prefix("until ").map(str::to_owned);
             graph.gantt_tasks.push(crate::ir::GanttTask {
                 id: node_id.clone(),
@@ -3148,12 +3142,14 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
     )?;
     graph.gantt_schedule = schedule.times;
     graph.gantt_render_ends = schedule.render_ends;
+    graph.gantt_ticks = crate::gantt_time::axis::ticks(&graph)?;
     Ok(ParseOutput { graph, init_config })
 }
 
 fn parse_gantt_task_meta(
     meta: &str,
     date_format: &str,
+    reference_day: Option<i32>,
 ) -> Result<(
     Option<String>,
     Vec<String>,
@@ -3192,9 +3188,9 @@ fn parse_gantt_task_meta(
             after = Some(dependencies.trim().to_owned());
         } else {
             details.push(
-                crate::gantt_time::canonical_date(start, date_format).ok_or_else(|| {
-                    anyhow::anyhow!("Invalid Gantt start date for {date_format}: {start}")
-                })?,
+                crate::gantt_time::canonical_date(start, date_format, reference_day).ok_or_else(
+                    || anyhow::anyhow!("Invalid Gantt start date for {date_format}: {start}"),
+                )?,
             );
         }
     }
@@ -3207,9 +3203,9 @@ fn parse_gantt_task_meta(
         details.push(end.to_owned());
     } else {
         details.push(
-            crate::gantt_time::canonical_date(end, date_format).ok_or_else(|| {
-                anyhow::anyhow!("Invalid Gantt end date or duration for {date_format}: {end}")
-            })?,
+            crate::gantt_time::canonical_date(end, date_format, reference_day).ok_or_else(
+                || anyhow::anyhow!("Invalid Gantt end date or duration for {date_format}: {end}"),
+            )?,
         );
     }
     Ok((id, details, after, status))

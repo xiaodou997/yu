@@ -1128,6 +1128,7 @@ mod tests {
         let reference = mermaid_rs_renderer::parse_mermaid_strict(baseline).expect("baseline");
         for (format, start, end) in [
             ("DD-MM-YYYY", "01-02-2026", "05-02-2026"),
+            ("YY-MM-DD", "26-02-01", "26-02-05"),
             ("MM/DD/YYYY", "02/01/2026", "02/05/2026"),
             ("YYYYMMDD", "20260201", "20260205"),
             ("YYYY年MM月DD日", "2026年02月01日", "2026年02月05日"),
@@ -1159,7 +1160,7 @@ mod tests {
             "gantt\ndateFormat YYYY-MM-DD\nA :a,2026/01/02,1d",
             "gantt\ndateFormat YYYY-MM-DD\nA :a,2026-1-2,1d",
             "gantt\ndateFormat DD-MM-YYYY\nA :a,30-02-2026,1d",
-            "gantt\ndateFormat YY-MM-DD\nA :a,26-01-02,1d",
+            "gantt\ndateFormat YY-MM-DD\nA :a,26-13-02,1d",
             "gantt\ndateFormat YYYY-MM-DD HH:mm\nA :a,2026-01-02,1d",
             "gantt\ndateFormat YYYY-YYYY-MM-DD\nA :a,2026-2026-01-02,1d",
             "gantt\ndateFormat\nA :a,2026-01-02,1d",
