@@ -21,6 +21,8 @@ parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
 parser.add_argument('--math-suite', action='store_true', help='Exercise aligned, cases and multiline formula editing in the actual application')
 parser.add_argument('--diagram-suite', action='store_true', help='Exercise seven Mermaid families in the actual application')
+parser.add_argument('--recent-diagrams', action='store_true', help='Exercise the three central-connection and four Gantt-calendar fixtures with real caption edits')
+parser.add_argument('--promotion-suite', action='store_true', help='Copy real native merged cells and paste into math/footnote/grouped targets')
 parser.add_argument('--reopen', action='store_true', help='Quit and relaunch the isolated application; verify disk source, resources and editing')
 parser.add_argument('--cjk-math', action='store_true')
 parser.add_argument('--multiline-diagram', action='store_true')
@@ -45,7 +47,7 @@ parser.add_argument('--html-lines', action='store_true')
 parser.add_argument('--html-details', action='store_true')
 parser.add_argument('--html-lists', action='store_true')
 args = parser.parse_args()
-if args.math_suite and (args.html_blocks or args.diagram_suite):
+if args.math_suite and (args.html_blocks or args.diagram_suite or args.recent_diagrams):
     parser.error('--math-suite cannot be combined with --html-blocks or --diagram-suite')
 if (args.lifecycle or args.cancel_helper) and any((args.html_blocks,args.dollars,args.equations,args.failures)):
     parser.error('--lifecycle uses the standard math/diagram fixture')
@@ -129,6 +131,12 @@ command = [str(app/'Contents/MacOS/Yu'), str(fixture)] + (['--dark-mode'] if arg
 log = (out/'app.log').open('w')
 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
 result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required':True,
+          'isolated_bundle':identifier,
+          'recent_diagrams':args.recent_diagrams,
+          'promotion_suite':args.promotion_suite,
+          'test_app_sha256':sha(app/'Contents/MacOS/Yu'),
+          'test_helper_sha256':sha(app/'Contents/Helpers/yu-document-renderer'),
+          'test_runner_sha256':sha(Path(__file__)),
           'options':{'multiline_diagram':args.multiline_diagram,'cjk_math':args.cjk_math,'cancel_helper':args.cancel_helper,'lifecycle':args.lifecycle,'dark':args.dark,'themes':args.themes,'failures':args.failures,'dollars':args.dollars,'equations':args.equations,'highlight':args.highlight,'scripts':args.scripts,'footnotes':args.footnotes,'footnote_errors':args.footnote_errors,'toc':args.toc,'html':args.html,'html_blocks':args.html_blocks,'anchors':args.anchors,'alignment':args.alignment,'html_tables':args.html_tables,'merged_tables':args.merged_tables,'html_lines':args.html_lines,'html_details':args.html_details,'html_lists':args.html_lists,'reopen':args.reopen,'diagram_suite':args.diagram_suite,'math_suite':args.math_suite}}
 sequence = 0
 suspended_helpers = set()
@@ -140,6 +148,29 @@ def run(*arguments):
     (out/f'event-{sequence:03}.json').write_text(json.dumps({'arguments':arguments, 'code':response.returncode, 'stdout':response.stdout, 'stderr':response.stderr},ensure_ascii=False,indent=2))
     if response.returncode: raise RuntimeError(response.stderr)
     return json.loads(response.stdout) if response.stdout.strip().startswith('{') else None
+
+def stable_bounds(location, length):
+    # AX selection can enqueue scrolling/refinement. Do not click a rectangle
+    # read before that work settles, or an off-screen source range.
+    previous = None
+    stable = 0
+    deadline = time.monotonic()+5
+    time.sleep(.2)
+    while time.monotonic() < deadline:
+        bounds = run('bounds',location,length)['bounds']
+        state = run('snapshot')
+        window = next(w for w in state['windows'] if w.get('kCGWindowLayer') == 0 and w['kCGWindowBounds']['Width'] >= 400)
+        frame = window['kCGWindowBounds']
+        x, y = bounds['x']+bounds['width']/2, bounds['y']+bounds['height']/2
+        visible = frame['X'] <= x <= frame['X']+frame['Width'] and frame['Y']+40 <= y <= frame['Y']+frame['Height']-8
+        key = tuple(round(bounds[k],2) for k in ('x','y','width','height'))
+        key += tuple(round(state['AXPosition'][k],2) for k in ('x','y'))
+        stable = stable+1 if key == previous and visible else 0
+        if stable >= 2:
+            return bounds
+        previous = key
+        time.sleep(.1)
+    raise AssertionError('Native range bounds did not become stable and visible')
 
 def helpers():
     lines = subprocess.check_output(['ps','-axo','pid=,command='],text=True).splitlines()
@@ -543,16 +574,17 @@ try:
             reference = utf16(source[:source.index(marker)])
             definition = utf16(source[:source.index(marker+':')])
             for fraction in [.25, .75]:
-                run('select',utf16(source),0)
-                bounds = run('bounds',reference,utf16(marker))['bounds']
+                paragraph = source.rfind('\n',0,source.index(marker))+1
+                run('select',utf16(source[:paragraph]),0)
+                bounds = stable_bounds(reference,utf16(marker))
                 assert bounds['width'] > 0 and bounds['height'] > 0
                 run('click',bounds['x']+bounds['width']*fraction,
                     bounds['y']+bounds['height']/2,'cmd')
                 state = run('snapshot')
                 assert state['AXValue']==source
                 assert state['AXSelectedTextRange']['location']==definition, 'Footnote click missed definition'
-            run('select',utf16(source),0)
-            bounds = run('bounds',definition,utf16(marker+':'))['bounds']
+            run('select',definition+utf16(marker+': '),0)
+            bounds = stable_bounds(definition,utf16(marker+':'))
             run('click',bounds['x']+bounds['width']/2,bounds['y']+bounds['height']/2,'cmd')
             assert run('snapshot')['AXSelectedTextRange']['location']==reference, 'Footnote backlink missed first reference'
         run('select',utf16(source),0)
@@ -749,10 +781,9 @@ try:
         current = run('snapshot')['AXValue']
         run('select',0,len(current.encode('utf-16-le'))//2)
         run('paste-text',bad)
-        run('select',len(bad.encode('utf-16-le'))//2,0)
-        time.sleep(1)
+        run('select',0,0)
         marker = bad.index('[^missing]')
-        bounds = run('bounds',marker,len('[^missing]'))['bounds']
+        bounds = stable_bounds(marker,len('[^missing]'))
         run('right-click',bounds['x']+bounds['width']/2,bounds['y']+bounds['height']/2)
         run('capture',str(out/'footnote-error-menu'))
         run('key',125); run('key',36)
@@ -780,8 +811,8 @@ try:
         run('key',6,'cmd+shift'); assert run('snapshot')['AXValue']==corrected
         run('key',1,'cmd'); time.sleep(.3)
         assert fixture.read_bytes()==b'\xef\xbb\xbf'+corrected.encode()
-        run('select',len(corrected.encode('utf-16-le'))//2,0)
-        bounds = run('bounds',marker,len('[^missing]'))['bounds']
+        run('select',0,0)
+        bounds = stable_bounds(marker,len('[^missing]'))
         run('click',bounds['x']+bounds['width']/2,bounds['y']+bounds['height']/2,'cmd')
         assert run('snapshot')['AXSelectedTextRange']['location']==len(bad.encode('utf-16-le'))//2+2
         run('capture',str(out/'footnote-error-repaired'))
@@ -892,7 +923,7 @@ try:
         assert fixture.read_bytes()==b'\xef\xbb\xbf'+recovered.encode()
         result['checks'].append('document revision cancels an actual suspended helper response; plain replacement stays free of stale resources; next valid resources restart and save exactly')
 
-    if args.diagram_suite:
+    if args.diagram_suite or args.recent_diagrams:
         cases = [
             ('flowchart', 'flowchart LR\nA[Alpha] --> B[Beta]'),
             ('sequence', 'sequenceDiagram\nactor A as Alpha\nparticipant B as Beta\nA->>B: Request\nB-->>A: Reply\nA-|/B: Half head\nA//--B: Reverse stick\ncreate actor C as Worker\nA->>C: Create\ndestroy C\nC-->>A: Finish'),
@@ -902,6 +933,20 @@ try:
             ('gantt', 'gantt\ndateFormat YYYY-MM-DD\ntitle Alpha schedule\nsection Work\nAlpha :a, 2026-01-01, 2d\nBeta :after a, 3d'),
             ('pie', 'pie title Alpha share\n"One" : 40\n"Two" : 60'),
         ]
+        if args.recent_diagrams:
+            cases = []
+            for filename, family, labels in [
+                ('group4-sequence-central.md','central',['接收端中心连接','右向左','交接']),
+                ('group4-gantt-calendar.md','calendar',['工作中文🙂','提交中文🙂','午前','任务']),
+            ]:
+                fixture_text = (HERE/'Fixtures'/filename).read_text(encoding='utf-8')
+                diagrams = re.findall(r'```mermaid\n(.*?)\n```', fixture_text, flags=re.S)
+                assert len(diagrams) >= len(labels)
+                for index, (diagram, label) in enumerate(zip(diagrams, labels), 1):
+                    assert label in diagram
+                    # Prefix one visible caption to reuse the exact edit/history
+                    # assertions below without changing participant identities.
+                    cases.append((f'{family}-{index}',diagram.replace(label,'Alpha'+label,1)))
         for family, diagram in cases:
             text = '# '+family+'\r\n\r\n```mermaid\r\n'+diagram.replace('\n','\r\n')+'\r\n```\r\n\r\nAFTER DIAGRAM\r\n'
             current = run('snapshot')['AXValue']
@@ -956,6 +1001,84 @@ try:
             source = changed
             result['checks'].append(family+' formula edit, undo/redo and exact save pass; screenshots require review')
         run('key',1,'cmd'); time.sleep(.3)
+
+    if args.promotion_suite:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        fixtures = ROOT/'crates/yu-editor/tests/fixtures/group4-paste'
+        cases = [
+            ('math-target','merged-payload',True),
+            ('footnote-target','merged-payload',True),
+            ('row-groups-target','row-groups-merged-payload',True),
+            ('cross-groups','merged-payload',False),
+            ('row-groups-target','row-groups-conflict-payload',False),
+        ]
+        for case_index, (name,payload_name,accept) in enumerate(cases):
+            donor = (fixtures/(payload_name+'.md')).read_text(encoding='utf-8').strip()
+            target = (fixtures/(name+'.md')).read_text(encoding='utf-8')
+            text = ('DONOR\n\n'+donor+'\n\n'+target).replace('\n','\r\n')
+            current = run('snapshot')['AXValue']
+            run('select',0,utf16(current)); run('paste-text',text)
+            run('select',utf16(text),0); run('paste-text',' HISTORY-A')
+            before = text+' HISTORY-A'
+            run('select',0,0); run('select',utf16(before),0)
+            run('paste-text',' HISTORY-B'); run('key',6,'cmd')
+            assert run('snapshot')['AXValue'] == before
+            donor_labels = re.findall(r'>([^<>]+)</t[dh]>',donor)
+            assert donor_labels
+            def point(label):
+                at = before.index(label)
+                b = stable_bounds(utf16(before[:at]),utf16(label))
+                return (b['x']+b['width']/2,b['y']+b['height']/2)
+            run('select',0,0)
+            destination = point('目标中文🙂')
+            first = point(donor_labels[0]); last = point(donor_labels[-1])
+            if first != last:
+                run('drag',*first,*last,'alt+shift')
+            else:
+                run('click',*first,'alt+shift')
+            copied = run('copy-read')
+            payload = json.loads(copied['source_fragments'])
+            assert payload['version'] == 2 and payload['tableSource']
+            assert 'rowspan' in payload['tableSource'] and payload.get('columns') == 2
+            assert all(label in payload['tableSource'] for label in donor_labels)
+            run('copy-paste',*destination)
+            after = run('snapshot')['AXValue']
+            case_id = f'promotion-{case_index}-{name}'
+            if accept:
+                assert after != before and after.count('<table') == 2
+                assert after.startswith(('DONOR\n\n'+donor+'\n\n').replace('\n','\r\n'))
+                assert after.count(donor_labels[0]) == 2
+                if name == 'math-target':
+                    assert 'data-math-style' in after and '>x^2</span>' in after
+                if name == 'footnote-target':
+                    assert 'data-yu-footnote' in after and '[^note]: 保留脚注中文🙂。' in after
+                if name == 'row-groups-target':
+                    for mark in ["<thead id='head'>","<tbody id='body'>",'保留甲','保留乙','保留丙','保留丁',"<span data-math-style='inline'>x^2</span>","<span data-yu-footnote='reference'>[^note]</span>"]:
+                        assert mark in after,mark
+                run('key',6,'cmd'); assert run('snapshot')['AXValue'] == before
+                run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == after
+                run('select',0,0); time.sleep(.3)
+                run('capture',str(out/case_id))
+                run('key',1,'cmd'); time.sleep(.3)
+                assert fixture.read_bytes() == b'\xef\xbb\xbf'+after.encode()
+                source = after
+            else:
+                assert after == before, 'Rejected native rowspan changed document'
+                state = run('snapshot')
+                if state.get('focused_description') == '警告':
+                    run('controls')
+                    run('capture',str(out/(case_id+'-rejection-alert')))
+                    run('key',36)
+                    time.sleep(.2)
+                    assert run('snapshot')['AXValue'] == before
+                run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == before+' HISTORY-B'
+                run('key',6,'cmd'); assert run('snapshot')['AXValue'] == before
+                run('select',0,0); time.sleep(.3)
+                run('capture',str(out/case_id))
+                run('key',1,'cmd'); time.sleep(.3)
+                assert fixture.read_bytes() == b'\xef\xbb\xbf'+before.encode()
+                source = before
+            result['checks'].append(case_id+': real Option+Shift donor selection and version-2 native clipboard; '+('conversion/owner preservation, undo/redo and saved bytes' if accept else 'cross-group rejection preserves source and pre-existing redo branch'))
 
     saved_before_reopen = fixture.read_bytes()
     old_helpers = helpers()

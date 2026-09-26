@@ -308,7 +308,8 @@ case "paste-text", "paste-image", "paste-file", "paste-files", "copy-read", "cut
     for down in [true,false] { let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:down); event?.flags = down ? .maskCommand : []; post(event) }
     RunLoop.current.run(until:Date().addingTimeInterval(0.3))
     if !isPaste && board.changeCount == beforeCopy { fail("Copy/cut did not update the test clipboard") }
-    let copied: [String:Any] = ["text":board.string(forType:.string) ?? "", "types":board.types?.map { $0.rawValue } ?? []]
+    let copied: [String:Any] = ["text":board.string(forType:.string) ?? "", "types":board.types?.map { $0.rawValue } ?? [],
+        "source_fragments":board.string(forType:NSPasteboard.PasteboardType("app.yu.source-fragments.v1")) ?? ""]
     if action == "copy-paste" {
         guard args.count == 4, let x=Double(args[2]), let y=Double(args[3]) else { fail("copy-paste requires target screen x y") }
         for type:CGEventType in [.mouseMoved,.leftMouseDown,.leftMouseUp] { post(CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:CGPoint(x:x,y:y),mouseButton:.left)) }
