@@ -1,0 +1,951 @@
+{
+  "schema_version": 1,
+  "product_commit": "932f0154362ce7bbe00a969adb1f17239419032a",
+  "app_sha256": "548f6903480512136e3d0c34eb185ad47840670a6c7824be8a0d2d8c30bf8330",
+  "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+  "group4_signoff": false,
+  "memory_verdict": "not_determined",
+  "validation": {
+    "related_rust_passed": 136,
+    "retry_tests_included": 8,
+    "related_clippy": "passed",
+    "workspace_fmt": "passed",
+    "native_checks_passed": 19,
+    "python_tool_tests_passed": 60,
+    "final_rust_failed": 0,
+    "final_rust_ignored": 0
+  },
+  "runs": [
+    {
+      "name": "cold-fixed-light",
+      "result_sha256": "b5b1a654716f4f5c6b33fbc7e6cd0ab4266bab967ca6c52cc414922a9da27a33",
+      "options": {
+        "multiline_diagram": false,
+        "cjk_math": false,
+        "cancel_helper": false,
+        "lifecycle": false,
+        "dark": false,
+        "themes": false,
+        "failures": false,
+        "dollars": false,
+        "equations": false,
+        "highlight": false,
+        "scripts": false,
+        "footnotes": false,
+        "footnote_errors": false,
+        "toc": false,
+        "html": false,
+        "html_blocks": false,
+        "anchors": false,
+        "alignment": false,
+        "html_tables": false,
+        "merged_tables": false,
+        "html_lines": false,
+        "html_details": false,
+        "html_lists": false,
+        "reopen": true,
+        "diagram_suite": false,
+        "math_suite": false
+      },
+      "vmmap_sampling_during_run": false,
+      "passed": true,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "restored_preview": [
+        {
+          "attempt": 0,
+          "rect": {
+            "x": 1318,
+            "y": 431.4000015258789,
+            "width": 80,
+            "height": 50.79999542236328
+          },
+          "pixel_box": [
+            528,
+            280,
+            688,
+            383
+          ],
+          "image": "restored-preview-0-197369.png",
+          "contrasting_pixels": 182,
+          "appearance": {
+            "expected": "light",
+            "observed": "light",
+            "background_level": 255.0,
+            "matches": true
+          }
+        }
+      ],
+      "restored_preview_status": "visible",
+      "reopen": {
+        "previous_pid": 91044,
+        "new_pid": 91099,
+        "old_helpers": [
+          91060
+        ],
+        "new_helpers": [
+          91103
+        ],
+        "saved_sha256": "7ecf77ba94fe00526bbb22baee0bdaae81047b75d524aa58066ac61b0850703e"
+      },
+      "test_app_sha256": "54193492dcaacf7695dab3f24c85ffc41ca545fc244d9e5643320e95d4731fcf",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "7009e833c0d1799a4a921abc889b25cfac1a83f472cc015559c2bcf28d769353",
+      "followup_module_sha256": "4eb062ff1c6109d04d16d8511c69c193fd86d0da1c89cce233a2229d6d2c1db0"
+    },
+    {
+      "name": "cold-fixed-dark",
+      "result_sha256": "2e6181f510e96c8f26a77fa5731bd0468d3a49beacae3bfd98a4d54db266019a",
+      "options": {
+        "multiline_diagram": false,
+        "cjk_math": false,
+        "cancel_helper": false,
+        "lifecycle": false,
+        "dark": true,
+        "themes": false,
+        "failures": false,
+        "dollars": false,
+        "equations": false,
+        "highlight": false,
+        "scripts": false,
+        "footnotes": false,
+        "footnote_errors": false,
+        "toc": false,
+        "html": false,
+        "html_blocks": false,
+        "anchors": false,
+        "alignment": false,
+        "html_tables": false,
+        "merged_tables": false,
+        "html_lines": false,
+        "html_details": false,
+        "html_lists": false,
+        "reopen": true,
+        "diagram_suite": false,
+        "math_suite": false
+      },
+      "vmmap_sampling_during_run": false,
+      "passed": true,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "restored_preview": [
+        {
+          "attempt": 0,
+          "rect": {
+            "x": 1318,
+            "y": 431.4000015258789,
+            "width": 80,
+            "height": 50.79999542236328
+          },
+          "pixel_box": [
+            528,
+            280,
+            688,
+            383
+          ],
+          "image": "restored-preview-0-197390.png",
+          "contrasting_pixels": 119,
+          "appearance": {
+            "expected": "dark",
+            "observed": "dark",
+            "background_level": 32.666666666666664,
+            "matches": true
+          }
+        }
+      ],
+      "restored_preview_status": "visible",
+      "reopen": {
+        "previous_pid": 91177,
+        "new_pid": 91228,
+        "old_helpers": [
+          91191
+        ],
+        "new_helpers": [
+          91232
+        ],
+        "saved_sha256": "7ecf77ba94fe00526bbb22baee0bdaae81047b75d524aa58066ac61b0850703e"
+      },
+      "test_app_sha256": "1eff6892a81408e62cc0d4b6c63e31a7bd6b3ba1b9397cb5c0452524fc3df5f0",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "7009e833c0d1799a4a921abc889b25cfac1a83f472cc015559c2bcf28d769353",
+      "followup_module_sha256": "4eb062ff1c6109d04d16d8511c69c193fd86d0da1c89cce233a2229d6d2c1db0"
+    },
+    {
+      "name": "theme-transitions-dark",
+      "result_sha256": "3bfaf38eb923024b09d0032f5c5b3af62987b14d1caf00bd85a6af71df478682",
+      "options": {
+        "multiline_diagram": false,
+        "cjk_math": false,
+        "cancel_helper": false,
+        "lifecycle": false,
+        "dark": true,
+        "themes": true,
+        "failures": false,
+        "dollars": false,
+        "equations": false,
+        "highlight": false,
+        "scripts": false,
+        "footnotes": false,
+        "footnote_errors": false,
+        "toc": false,
+        "html": false,
+        "html_blocks": false,
+        "anchors": false,
+        "alignment": false,
+        "html_tables": false,
+        "merged_tables": false,
+        "html_lines": false,
+        "html_details": false,
+        "html_lists": false,
+        "reopen": true,
+        "diagram_suite": false,
+        "math_suite": false
+      },
+      "vmmap_sampling_during_run": false,
+      "passed": true,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "Night/Github/Yu native theme transitions preserve source and saved bytes; screenshots captured",
+        "zoom regenerates native resources without source edits and retains one helper",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "reopen": {
+        "previous_pid": 98919,
+        "new_pid": 99021,
+        "old_helpers": [
+          99015
+        ],
+        "new_helpers": [
+          99027
+        ],
+        "saved_sha256": "476d1338f7aedfa2963ba6584d0409273ba9dcaecaf85e8f24cefa2c6087784f"
+      },
+      "test_app_sha256": "a9dcb881db6e26654c69cf6b7c63848c9ed8ff79693250539539ed2e2c869a0d",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "efae565d2404af34470e6b1d25fc71715647ce1b1115524145fd5427f8724138"
+    },
+    {
+      "name": "soak-short-light",
+      "result_sha256": "2d88adc8b7345d0cd2efe5a49757ddf5fbc0d312d1f4523d49bdf0dd65269b31",
+      "options": {
+        "documents": 2,
+        "seconds": 30,
+        "idle_seconds": 70,
+        "sample_seconds": 5,
+        "dark": false
+      },
+      "vmmap_sampling_during_run": false,
+      "passed": true,
+      "checks": [
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll"
+      ],
+      "completed_passes": 3,
+      "churn_elapsed_seconds": 31.467475625000002,
+      "elapsed_seconds": 205.405786709,
+      "native_events": 327,
+      "footprint": {
+        "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+        "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+        "phases": [
+          {
+            "session": "retained",
+            "phase": "sentinel_baseline",
+            "pid": 91330,
+            "samples": 1,
+            "first_seconds": 7.456291333999999,
+            "last_seconds": 7.456291333999999,
+            "first_bytes": 61129736,
+            "last_bytes": 61129736,
+            "min_bytes": 61129736,
+            "max_bytes": 61129736,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "all_documents_open",
+            "pid": 91330,
+            "samples": 1,
+            "first_seconds": 10.066533959000001,
+            "last_seconds": 10.066533959000001,
+            "first_bytes": 137987128,
+            "last_bytes": 137987128,
+            "min_bytes": 137987128,
+            "max_bytes": 137987128,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "churn_valid",
+            "pid": 91330,
+            "samples": 6,
+            "first_seconds": 11.50213825,
+            "last_seconds": 37.719985,
+            "first_bytes": 146326584,
+            "last_bytes": 148341864,
+            "min_bytes": 146326584,
+            "max_bytes": 149046376,
+            "delta_bytes": 2015280
+          },
+          {
+            "session": "retained",
+            "phase": "churn_error",
+            "pid": 91330,
+            "samples": 6,
+            "first_seconds": 13.465408875,
+            "last_seconds": 39.686726584,
+            "first_bytes": 145261648,
+            "last_bytes": 147735656,
+            "min_bytes": 145261648,
+            "max_bytes": 148472936,
+            "delta_bytes": 2474008
+          },
+          {
+            "session": "retained",
+            "phase": "churn_plain",
+            "pid": 91330,
+            "samples": 6,
+            "first_seconds": 15.299839167,
+            "last_seconds": 41.533922,
+            "first_bytes": 145212496,
+            "last_bytes": 147768424,
+            "min_bytes": 145212496,
+            "max_bytes": 157533288,
+            "delta_bytes": 2555928
+          },
+          {
+            "session": "retained",
+            "phase": "retained_history_idle",
+            "pid": 91330,
+            "samples": 15,
+            "first_seconds": 41.630245167,
+            "last_seconds": 111.63459266699999,
+            "first_bytes": 147768424,
+            "last_bytes": 141755496,
+            "min_bytes": 141755496,
+            "max_bytes": 147768424,
+            "delta_bytes": -6012928
+          },
+          {
+            "session": "retained",
+            "phase": "closing_documents",
+            "pid": 91330,
+            "samples": 2,
+            "first_seconds": 116.342154542,
+            "last_seconds": 118.017780209,
+            "first_bytes": 106103912,
+            "last_bytes": 67126352,
+            "min_bytes": 67126352,
+            "max_bytes": 106103912,
+            "delta_bytes": -38977560
+          },
+          {
+            "session": "retained",
+            "phase": "closed_documents_idle",
+            "pid": 91330,
+            "samples": 15,
+            "first_seconds": 118.56949025,
+            "last_seconds": 188.5838405,
+            "first_bytes": 67126352,
+            "last_bytes": 67028048,
+            "min_bytes": 67028048,
+            "max_bytes": 67126352,
+            "delta_bytes": -98304
+          },
+          {
+            "session": "retained",
+            "phase": "same_process_resource_reopen",
+            "pid": 91330,
+            "samples": 2,
+            "first_seconds": 191.533223375,
+            "last_seconds": 196.15336175,
+            "first_bytes": 109741160,
+            "last_bytes": 109855848,
+            "min_bytes": 109741160,
+            "max_bytes": 109855848,
+            "delta_bytes": 114688
+          },
+          {
+            "session": "cold_reopen",
+            "phase": "cold_resource_reopen",
+            "pid": 92133,
+            "samples": 1,
+            "first_seconds": 202.032075792,
+            "last_seconds": 202.032075792,
+            "first_bytes": 62784520,
+            "last_bytes": 62784520,
+            "min_bytes": 62784520,
+            "max_bytes": 62784520,
+            "delta_bytes": 0
+          }
+        ]
+      },
+      "restored_preview": [
+        {
+          "attempt": 0,
+          "rect": {
+            "x": 1318,
+            "y": 431.4000015258789,
+            "width": 80,
+            "height": 50.79999542236328
+          },
+          "pixel_box": [
+            528,
+            280,
+            688,
+            383
+          ],
+          "image": "restored-preview-0-197445.png",
+          "contrasting_pixels": 182,
+          "appearance": {
+            "expected": "light",
+            "observed": "light",
+            "background_level": 255.0,
+            "matches": true
+          }
+        }
+      ],
+      "restored_preview_status": "visible",
+      "test_app_sha256": "9ebbf187a99e72a626d5bf61e3dba758dbf411c954fb677a608b0b10c3fc8192",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "e09101b838bb1d7d690df4a240325f47461a832d0afce0e834e893fa9dd3d1f3",
+      "accounting_module_sha256": "4211049bda75ff36a9b3ccb6e576578e083f2d7fbbf84952f60b454ee1c61713",
+      "pixel_oracle_module_sha256": "4eb062ff1c6109d04d16d8511c69c193fd86d0da1c89cce233a2229d6d2c1db0",
+      "native_driver_sha256": "abb345a56809c65cf1a77c1f46786fdbd8c2b7b03f133ecabf068b707c3bba88",
+      "application_pids": [
+        91330,
+        92133
+      ],
+      "same_process_phases_completed": true,
+      "remaining_isolated_processes": {
+        "app": [],
+        "helpers": []
+      },
+      "events.jsonl_sha256": "2eae65491333b2656fdaefa14112ab8980ad436b765952e2a3e0267fe046b494",
+      "app.log_sha256": "5783d30d32ec79c8af7ce743c52c9f2328a23ea55fbde643d50188ae3c879dc0"
+    },
+    {
+      "name": "soak-short-dark",
+      "result_sha256": "d9d4267ba5756f0202368d966e8f404f728dc51caa817df72cb9edb4a91751e5",
+      "options": {
+        "documents": 2,
+        "seconds": 30,
+        "idle_seconds": 70,
+        "sample_seconds": 5,
+        "dark": true
+      },
+      "vmmap_sampling_during_run": false,
+      "passed": true,
+      "checks": [
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll"
+      ],
+      "completed_passes": 3,
+      "churn_elapsed_seconds": 30.692644417,
+      "elapsed_seconds": 200.530121584,
+      "native_events": 327,
+      "footprint": {
+        "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+        "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+        "phases": [
+          {
+            "session": "retained",
+            "phase": "sentinel_baseline",
+            "pid": 99140,
+            "samples": 1,
+            "first_seconds": 4.062197792,
+            "last_seconds": 4.062197792,
+            "first_bytes": 61129712,
+            "last_bytes": 61129712,
+            "min_bytes": 61129712,
+            "max_bytes": 61129712,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "all_documents_open",
+            "pid": 99140,
+            "samples": 1,
+            "first_seconds": 6.565198292,
+            "last_seconds": 6.565198292,
+            "first_bytes": 138101840,
+            "last_bytes": 138101840,
+            "min_bytes": 138101840,
+            "max_bytes": 138101840,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "churn_valid",
+            "pid": 99140,
+            "samples": 6,
+            "first_seconds": 7.940781041999999,
+            "last_seconds": 33.574731,
+            "first_bytes": 145867856,
+            "last_bytes": 148341864,
+            "min_bytes": 145867856,
+            "max_bytes": 149013608,
+            "delta_bytes": 2474008
+          },
+          {
+            "session": "retained",
+            "phase": "churn_error",
+            "pid": 99140,
+            "samples": 6,
+            "first_seconds": 9.877240709,
+            "last_seconds": 35.517490584,
+            "first_bytes": 145359952,
+            "last_bytes": 147637352,
+            "min_bytes": 145359952,
+            "max_bytes": 148374632,
+            "delta_bytes": 2277400
+          },
+          {
+            "session": "retained",
+            "phase": "churn_plain",
+            "pid": 99140,
+            "samples": 6,
+            "first_seconds": 11.678300959,
+            "last_seconds": 37.257777584,
+            "first_bytes": 145310800,
+            "last_bytes": 147620968,
+            "min_bytes": 145310800,
+            "max_bytes": 148407400,
+            "delta_bytes": 2310168
+          },
+          {
+            "session": "retained",
+            "phase": "retained_history_idle",
+            "pid": 99140,
+            "samples": 15,
+            "first_seconds": 37.340434834,
+            "last_seconds": 107.353016,
+            "first_bytes": 147620968,
+            "last_bytes": 141575272,
+            "min_bytes": 141575272,
+            "max_bytes": 147620968,
+            "delta_bytes": -6045696
+          },
+          {
+            "session": "retained",
+            "phase": "closing_documents",
+            "pid": 99140,
+            "samples": 2,
+            "first_seconds": 111.954856834,
+            "last_seconds": 113.617367084,
+            "first_bytes": 105612392,
+            "last_bytes": 67109968,
+            "min_bytes": 67109968,
+            "max_bytes": 105612392,
+            "delta_bytes": -38502424
+          },
+          {
+            "session": "retained",
+            "phase": "closed_documents_idle",
+            "pid": 99140,
+            "samples": 15,
+            "first_seconds": 114.14616654199999,
+            "last_seconds": 184.171803084,
+            "first_bytes": 67109968,
+            "last_bytes": 66765904,
+            "min_bytes": 66765904,
+            "max_bytes": 67109968,
+            "delta_bytes": -344064
+          },
+          {
+            "session": "retained",
+            "phase": "same_process_resource_reopen",
+            "pid": 99140,
+            "samples": 2,
+            "first_seconds": 186.7528685,
+            "last_seconds": 191.288957167,
+            "first_bytes": 109479016,
+            "last_bytes": 108741736,
+            "min_bytes": 108741736,
+            "max_bytes": 109479016,
+            "delta_bytes": -737280
+          },
+          {
+            "session": "cold_reopen",
+            "phase": "cold_resource_reopen",
+            "pid": 99912,
+            "samples": 1,
+            "first_seconds": 197.15422808399998,
+            "last_seconds": 197.15422808399998,
+            "first_bytes": 60687320,
+            "last_bytes": 60687320,
+            "min_bytes": 60687320,
+            "max_bytes": 60687320,
+            "delta_bytes": 0
+          }
+        ]
+      },
+      "restored_preview": [
+        {
+          "attempt": 0,
+          "rect": {
+            "x": 1318,
+            "y": 431.4000015258789,
+            "width": 80,
+            "height": 50.79999542236328
+          },
+          "pixel_box": [
+            528,
+            280,
+            688,
+            383
+          ],
+          "image": "restored-preview-0-197906.png",
+          "contrasting_pixels": 119,
+          "appearance": {
+            "expected": "dark",
+            "observed": "dark",
+            "background_level": 32.666666666666664,
+            "matches": true
+          }
+        }
+      ],
+      "restored_preview_status": "visible",
+      "test_app_sha256": "201c21dd05b4cbb01fa9deae66fe0a48ec4b6a5e46ee0a716f6996231274a81e",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "e09101b838bb1d7d690df4a240325f47461a832d0afce0e834e893fa9dd3d1f3",
+      "accounting_module_sha256": "4211049bda75ff36a9b3ccb6e576578e083f2d7fbbf84952f60b454ee1c61713",
+      "pixel_oracle_module_sha256": "c19269136cff67bf2ba5a2396e6c0501e5dabf7589889910664b68bbb40e7582",
+      "native_driver_sha256": "abb345a56809c65cf1a77c1f46786fdbd8c2b7b03f133ecabf068b707c3bba88",
+      "application_pids": [
+        99140,
+        99912
+      ],
+      "same_process_phases_completed": true,
+      "remaining_isolated_processes": {
+        "app": [],
+        "helpers": []
+      },
+      "events.jsonl_sha256": "c108c9c4f5af7ee9f1d5350bba08f76fbf995806d2995948d684e0d434131b00",
+      "app.log_sha256": "1702e557cd3c667bdae4415a744366350a246510f36298804ad11b12da704d26"
+    },
+    {
+      "name": "soak-600-light",
+      "result_sha256": "731a816a6b38ebd925e5e4fa647d608a936b7ca119c8e320dc4fa58a5973a441",
+      "options": {
+        "documents": 4,
+        "seconds": 600,
+        "idle_seconds": 70,
+        "sample_seconds": 5,
+        "dark": false
+      },
+      "vmmap_sampling_during_run": true,
+      "passed": true,
+      "checks": [
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll"
+      ],
+      "completed_passes": 27,
+      "churn_elapsed_seconds": 615.79672425,
+      "elapsed_seconds": 804.7733923330001,
+      "native_events": 3483,
+      "footprint": {
+        "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+        "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+        "phases": [
+          {
+            "session": "retained",
+            "phase": "sentinel_baseline",
+            "pid": 92284,
+            "samples": 1,
+            "first_seconds": 4.319364333,
+            "last_seconds": 4.319364333,
+            "first_bytes": 63259656,
+            "last_bytes": 63259656,
+            "min_bytes": 63259656,
+            "max_bytes": 63259656,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "all_documents_open",
+            "pid": 92284,
+            "samples": 1,
+            "first_seconds": 9.494342667,
+            "last_seconds": 9.494342667,
+            "first_bytes": 213435544,
+            "last_bytes": 213435544,
+            "min_bytes": 213435544,
+            "max_bytes": 213435544,
+            "delta_bytes": 0
+          },
+          {
+            "session": "retained",
+            "phase": "churn_valid",
+            "pid": 92284,
+            "samples": 108,
+            "first_seconds": 10.966956583,
+            "last_seconds": 620.546812542,
+            "first_bytes": 221250712,
+            "last_bytes": 238372064,
+            "min_bytes": 221250712,
+            "max_bytes": 247284984,
+            "delta_bytes": 17121352
+          },
+          {
+            "session": "retained",
+            "phase": "churn_error",
+            "pid": 92284,
+            "samples": 108,
+            "first_seconds": 12.987571874999999,
+            "last_seconds": 623.315590042,
+            "first_bytes": 220677272,
+            "last_bytes": 237700320,
+            "min_bytes": 220677272,
+            "max_bytes": 249382136,
+            "delta_bytes": 17023048
+          },
+          {
+            "session": "retained",
+            "phase": "churn_plain",
+            "pid": 92284,
+            "samples": 108,
+            "first_seconds": 14.850758749999999,
+            "last_seconds": 625.290910458,
+            "first_bytes": 220710064,
+            "last_bytes": 237503736,
+            "min_bytes": 220710064,
+            "max_bytes": 245859576,
+            "delta_bytes": 16793672
+          },
+          {
+            "session": "retained",
+            "phase": "retained_history_idle",
+            "pid": 92284,
+            "samples": 15,
+            "first_seconds": 625.3807766250001,
+            "last_seconds": 695.3894837500001,
+            "first_bytes": 237503736,
+            "last_bytes": 257606880,
+            "min_bytes": 237503736,
+            "max_bytes": 257672416,
+            "delta_bytes": 20103144
+          },
+          {
+            "session": "retained",
+            "phase": "closing_documents",
+            "pid": 92284,
+            "samples": 4,
+            "first_seconds": 703.0266575,
+            "last_seconds": 708.204614125,
+            "first_bytes": 204768480,
+            "last_bytes": 80282752,
+            "min_bytes": 80282752,
+            "max_bytes": 204768480,
+            "delta_bytes": -124485728
+          },
+          {
+            "session": "retained",
+            "phase": "closed_documents_idle",
+            "pid": 92284,
+            "samples": 15,
+            "first_seconds": 708.76614525,
+            "last_seconds": 778.780245875,
+            "first_bytes": 80282752,
+            "last_bytes": 79873152,
+            "min_bytes": 79873152,
+            "max_bytes": 80282752,
+            "delta_bytes": -409600
+          },
+          {
+            "session": "retained",
+            "phase": "same_process_resource_reopen",
+            "pid": 92284,
+            "samples": 4,
+            "first_seconds": 781.4018929580001,
+            "last_seconds": 795.619731042,
+            "first_bytes": 122307736,
+            "last_bytes": 125027480,
+            "min_bytes": 121472152,
+            "max_bytes": 125027480,
+            "delta_bytes": 2719744
+          },
+          {
+            "session": "cold_reopen",
+            "phase": "cold_resource_reopen",
+            "pid": 98831,
+            "samples": 1,
+            "first_seconds": 801.4217496250001,
+            "last_seconds": 801.4217496250001,
+            "first_bytes": 60310536,
+            "last_bytes": 60310536,
+            "min_bytes": 60310536,
+            "max_bytes": 60310536,
+            "delta_bytes": 0
+          }
+        ]
+      },
+      "restored_preview": [
+        {
+          "attempt": 0,
+          "rect": {
+            "x": 1318,
+            "y": 431.4000015258789,
+            "width": 80,
+            "height": 50.79999542236328
+          },
+          "pixel_box": [
+            528,
+            280,
+            688,
+            383
+          ],
+          "image": "restored-preview-0-197811.png",
+          "contrasting_pixels": 182,
+          "appearance": {
+            "expected": "light",
+            "observed": "light",
+            "background_level": 255.0,
+            "matches": true
+          }
+        }
+      ],
+      "restored_preview_status": "visible",
+      "test_app_sha256": "d2027e7079fff0cf27976f5691938c531196820d2ff6dc79aa489515caf13fae",
+      "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "e09101b838bb1d7d690df4a240325f47461a832d0afce0e834e893fa9dd3d1f3",
+      "accounting_module_sha256": "4211049bda75ff36a9b3ccb6e576578e083f2d7fbbf84952f60b454ee1c61713",
+      "pixel_oracle_module_sha256": "c19269136cff67bf2ba5a2396e6c0501e5dabf7589889910664b68bbb40e7582",
+      "native_driver_sha256": "abb345a56809c65cf1a77c1f46786fdbd8c2b7b03f133ecabf068b707c3bba88",
+      "application_pids": [
+        92284,
+        98831
+      ],
+      "same_process_phases_completed": true,
+      "remaining_isolated_processes": {
+        "app": [],
+        "helpers": []
+      },
+      "events.jsonl_sha256": "329cc7decfb1e97bb4359c2590134c49d2f84b6bb78ddc4bd9e1abb4f7748ea6",
+      "app.log_sha256": "c2821ef678a5e5e023c0c125e183ea9aeddbd15b20002e5ffec8abfe429d53a7"
+    }
+  ],
+  "evidence_files": {
+    "cold-dark.png": {
+      "bytes": 141812,
+      "sha256": "aa0869d3e03994dd6c063a0ad3c94a607d1e87ae0f5a3bed684513eaed4b1f60"
+    },
+    "cold-light.png": {
+      "bytes": 118415,
+      "sha256": "05d0bc4efe8560a7481933029d2c25d60cd16b66e8c4bf9c69991b98d895218d"
+    },
+    "soak-600-light.png": {
+      "bytes": 119330,
+      "sha256": "cb9775c483dcd5f70a046794c20633855348ee92b9a672d09b84d598ce16fda8"
+    },
+    "soak-short-dark.png": {
+      "bytes": 143067,
+      "sha256": "77ffed58dddcb6ae30d906f05edb1fbadc47267baef2ae659749c86ddc98b6b3"
+    },
+    "theme-github.png": {
+      "bytes": 203279,
+      "sha256": "64ad343129778e35390f5bc98312440c634358e7e26067f0fe13642d008f14a6"
+    },
+    "theme-night.png": {
+      "bytes": 212677,
+      "sha256": "65a0fa5f5f27a632f92c993413a8d8d8796af98bad8b20274c87b651bd7681b8"
+    },
+    "theme-yu.png": {
+      "bytes": 201150,
+      "sha256": "442dac9ac722c399d3423f5ad33d97ed70528f3fb705aff628feadda5b8675d8"
+    },
+    "vmmap-churn.txt": {
+      "bytes": 8298,
+      "sha256": "1bd5036d578bfa1ef223f34b88a863e10d1847b260f3936f7698f344d2b635bc",
+      "source_raw_sha256": "486ab7321f905e173eb84baf16aed0a7164d25d2f68f9ae77a8d2917615a7845",
+      "normalization": "Trailing line whitespace and final blank lines removed; numeric and other report tokens unchanged",
+      "raw_archive": "vmmap-churn.txt.gz"
+    },
+    "vmmap-closed_documents_idle.txt": {
+      "bytes": 8298,
+      "sha256": "d6d053dd8540907bf31ac23553887ef69c6cc329bcfe20cfd9a81d2e73521453",
+      "source_raw_sha256": "12655af4d507aa2774073e0aa43f5272d43996822c9a7faf593a87113cd3a886",
+      "normalization": "Trailing line whitespace and final blank lines removed; numeric and other report tokens unchanged",
+      "raw_archive": "vmmap-closed_documents_idle.txt.gz"
+    },
+    "vmmap-retained_history_idle.txt": {
+      "bytes": 8558,
+      "sha256": "11f9e8f2c6212ba9b883300edf4fbeb8cfe7fc9cf01be15710e903d26debea91",
+      "source_raw_sha256": "4a2fb7249f9d74a4ecd078d038762a8a4a466cfac9d5f0d5b144feb67a3db19e",
+      "normalization": "Trailing line whitespace and final blank lines removed; numeric and other report tokens unchanged",
+      "raw_archive": "vmmap-retained_history_idle.txt.gz"
+    },
+    "vmmap-churn.txt.gz": {
+      "bytes": 2113,
+      "sha256": "26001502cf9e822c06185c0d052e7bc0abb9963b190767e927ec1c21c40cd3cb",
+      "decompressed_sha256": "486ab7321f905e173eb84baf16aed0a7164d25d2f68f9ae77a8d2917615a7845",
+      "format": "gzip; exact original tool output"
+    },
+    "vmmap-retained_history_idle.txt.gz": {
+      "bytes": 2184,
+      "sha256": "c006164131ab49a6923181cbefa8921a357062ec630f37c1b750c3245b0d3336",
+      "decompressed_sha256": "4a2fb7249f9d74a4ecd078d038762a8a4a466cfac9d5f0d5b144feb67a3db19e",
+      "format": "gzip; exact original tool output"
+    },
+    "vmmap-closed_documents_idle.txt.gz": {
+      "bytes": 2113,
+      "sha256": "e60452f61e3a510cf7426400420b459d6f25287ec6e5b41b2c3879eb00661de4",
+      "decompressed_sha256": "12655af4d507aa2774073e0aa43f5272d43996822c9a7faf593a87113cd3a886",
+      "format": "gzip; exact original tool output"
+    }
+  },
+  "local_record_hashes": {
+    "related-tests.log": "20f2bdbcc58cb5c1d9f6f4f243578281ee1c42fcd153ba54754093e519140272",
+    "format.log": "78933ff30a5f6493eeec67dd9cb62069c45c37bbdd5ec7a079a27ae1d834b09b",
+    "python-harness-system.log": "e2238dd286e9d093648f0864f87d3b1bafc0a875e02c2326b8ca39d89737131d",
+    "python-final.log": "985aab48c98bd1c6ec5de1468f9570efaad3333fc1e2c50043756705b6003db4",
+    "build-appearance.log": "9d4e66db219298c852c98c164a5fb30c82ea52af62d08f3d732c0f49d17d3065",
+    "build-appearance-manifest.json": "703b9ec678ee6daff63cc673fe6e13024bdd10641f9754a45cf7076bed09035c",
+    "native-appearance.log": "c056a77b288da339fdcbf7fc1b56b94d492c68f1f778412b63769a1f41a10a54",
+    "conflicting-appearance.log": "2cdf8620d076ad68e4ea1ec7b86eaf917307c373a90660b462a9863c6a07a233",
+    "conflicting-appearance.exit-code": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865",
+    "preflight.json": "9968e680120e6f662dc694c068178b5faa6fbb2145a97a61947fc4372a954f33",
+    "vmmap-retained_history_idle-context.json": "c34a0dcf451859c1bef88573672815a4c86a7e4466675d0a52708a55c77a1cfb",
+    "vmmap-closed_documents_idle-context.json": "fffc0fd58f638dc7a66b54e567093c00a69e0a568ebfe950ed84eaf83d57bc6b",
+    "rust-final.log": "62b25b2e6ef94a8184cd2158d8d5d157e9b40f4dd1b1e38b6d48790a94d6a426",
+    "clippy-final.log": "f4403412cb20dc7d8a0a94c08c9c8853e4bac9b3e8489158834f30512311ed97",
+    "python-closeout.log": "a92d1913cc2cb712d5798b1da25d55791a2e65830f2488d73388e696a2d73ab2",
+    "vmmap-churn.txt": "486ab7321f905e173eb84baf16aed0a7164d25d2f68f9ae77a8d2917615a7845",
+    "vmmap-retained_history_idle.txt": "4a2fb7249f9d74a4ecd078d038762a8a4a466cfac9d5f0d5b144feb67a3db19e",
+    "vmmap-closed_documents_idle.txt": "12655af4d507aa2774073e0aa43f5272d43996822c9a7faf593a87113cd3a886"
+  },
+  "excluded_initial_light_claim": {
+    "result_sha256": "de2a88dd0c78e1c3ee7f737337235f7ff94187c9156e7f0e09395d17ba0f4530",
+    "reason": "Old runner followed the dark system; visible formula was not light-theme acceptance.",
+    "image_sha256": "aa0869d3e03994dd6c063a0ad3c94a607d1e87ae0f5a3bed684513eaed4b1f60"
+  },
+  "visual_review": {
+    "method": "Direct review of actual saved window screenshots, no OCR",
+    "reviewed_evidence_files": [
+      "cold-dark.png",
+      "cold-light.png",
+      "soak-600-light.png",
+      "soak-short-dark.png",
+      "theme-github.png",
+      "theme-night.png",
+      "theme-yu.png"
+    ],
+    "scope": "Only these windows; not complete long-page or formula-syntax coverage"
+  },
+  "caveats": [
+    "The 600-second four-document run included three vmmap inspections; use a no-diagnostic matched control before attributing idle growth.",
+    "Retained-history idle footprint increased; finite completion is not a leak-free verdict.",
+    "No real midnight/sleep/timezone events or complete selection matrix were executed.",
+    "The original single-document 600-second entry point was not rerun in this batch.",
+    "Text report views normalize only trailing whitespace for repository checks; adjacent gzip archives retain exact raw output and are hash-verified."
+  ]
+}
