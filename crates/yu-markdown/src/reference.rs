@@ -227,6 +227,11 @@ fn scan_definition(source: &TextSnapshot, range: TextRange) -> Option<Definition
 /// （`comrak::strings::normalize_label`），那是一处已知的、比规范宽的取法。
 pub(crate) fn normalized_label(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
     let text = String::from_utf8(read_range(source, range)?).ok()?;
+    Some(normalized_label_text(&text))
+}
+
+/// Shared normalization for canonical labels and once-decoded HTML labels.
+pub(crate) fn normalized_label_text(text: &str) -> Vec<u8> {
     let mut collapsed = String::new();
     let mut pending_space = false;
     for character in text.chars() {
@@ -245,7 +250,7 @@ pub(crate) fn normalized_label(source: &TextSnapshot, range: TextRange) -> Optio
         }
         collapsed.push(character);
     }
-    Some(caseless::default_case_fold_str(&collapsed).into_bytes())
+    caseless::default_case_fold_str(&collapsed).into_bytes()
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {

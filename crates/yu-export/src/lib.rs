@@ -271,6 +271,41 @@ pub fn export_table_html(source: &str, range: std::ops::Range<usize>) -> Option<
                 .get(range.start..offset)
                 .is_some_and(|prefix| prefix.trim().is_empty())
     })?;
+    // A transient display number/href cannot preserve the relationship to a
+    // Markdown definition outside this table. Retain each original reference
+    // as an explicit source leaf; the editor reconciles it with its own index.
+    for node in table.descendants() {
+        let data = node.data();
+        if !matches!(data.value, comrak::nodes::NodeValue::FootnoteReference(_)) {
+            continue;
+        }
+        let start = data.sourcepos.start;
+        let end = data.sourcepos.end;
+        let from = line_starts
+            .get(start.line.checked_sub(1)?)?
+            .checked_add(start.column.checked_sub(1)?)?;
+        let to = line_starts
+            .get(end.line.checked_sub(1)?)?
+            .checked_add(end.column)?;
+        if from < range.start || to > range.end {
+            return None;
+        }
+        let marker = source.get(from..to)?;
+        if !marker.starts_with("[^")
+            || !marker.ends_with(']')
+            || marker.contains(['\r', '\n', '\0'])
+        {
+            return None;
+        }
+        let encoded = marker
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        drop(data);
+        node.data_mut().value = comrak::nodes::NodeValue::HtmlInline(format!(
+            "<span data-yu-footnote=\"reference\">{encoded}</span>"
+        ));
+    }
     let mut html = String::from("<table>");
     for row in table.children() {
         html.push_str("<tr>");

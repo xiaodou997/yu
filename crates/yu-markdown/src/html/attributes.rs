@@ -29,6 +29,8 @@ pub struct HtmlAttributes {
     pub open: bool,
     /// A source-backed TeX leaf, not a generic permission to hide data-* markup.
     pub inline_math: bool,
+    /// A canonical [^label] leaf whose definition remains in the document.
+    pub footnote_reference: bool,
     /// Inert image metadata retained for property editing and round trips.
     pub image_data: std::collections::BTreeMap<String, Option<String>>,
 }
@@ -71,6 +73,12 @@ impl HtmlTag {
                 .transpose()?;
             let invalid = || HtmlAttributeError::InvalidValue(attribute.name.clone());
             match attribute.name.as_str() {
+                "data-yu-footnote" if self.name == "span" => {
+                    if value.as_deref() != Some("reference") || self.self_closing {
+                        return Err(invalid());
+                    }
+                    result.footnote_reference = true;
+                }
                 "data-math-style" if self.name == "span" => {
                     if value.as_deref() != Some("inline") || self.self_closing {
                         return Err(invalid());
@@ -152,6 +160,11 @@ impl HtmlTag {
                 "open" if kind == Details => result.open = true,
                 _ => return Err(HtmlAttributeError::Unsupported(attribute.name.clone())),
             }
+        }
+        if result.inline_math && result.footnote_reference {
+            return Err(HtmlAttributeError::InvalidValue(
+                "conflicting source leaves".into(),
+            ));
         }
         Ok(result)
     }

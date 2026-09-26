@@ -304,25 +304,51 @@ fn math_promotion_preserves_content_history_and_complete_selections() {
                 assert_eq!(document.selections(), &before.selections);
                 assert_eq!(document.snapshot().as_str(), before.source);
             }
-            assert!(document.execute(command).expect("inline math promotion").changed());
+            assert!(
+                document
+                    .execute(command)
+                    .expect("inline math promotion")
+                    .changed()
+            );
             let after = Frame::capture(&document);
             assert_eq!(document.table_target_is_html(), Some(true));
-            assert!(after.source.contains("colspan='2' rowspan='2'>传入中文🙂</td>"));
-            let spans: Vec<_> = document.markdown().html_regions().regions.iter()
+            assert!(
+                after
+                    .source
+                    .contains("colspan='2' rowspan='2'>传入中文🙂</td>")
+            );
+            let spans: Vec<_> = document
+                .markdown()
+                .html_regions()
+                .regions
+                .iter()
                 .filter_map(|region| region.model.as_ref().ok())
                 .flat_map(|model| model.inline_math_spans())
                 .collect();
             assert_eq!(spans.len(), 1, "unselected math cell retains its identity");
-            assert_eq!(document.markdown().embedded_source(spans[0]).as_deref(), Some("x^2"));
+            assert_eq!(
+                document.markdown().embedded_source(spans[0]).as_deref(),
+                Some("x^2")
+            );
             let table_start = before.source.find("| H |").expect("table start");
             let table_end = before.source.find("| end |").expect("table end") + "| end |".len();
             assert!(after.source.starts_with(&before.source[..table_start]));
             assert!(after.source.ends_with(&before.source[table_end..]));
             history_depth(&document, 2, 0); // Only success discards the old redo branch.
-            assert!(document.undo().expect("one undo of conversion plus paste").changed());
+            assert!(
+                document
+                    .undo()
+                    .expect("one undo of conversion plus paste")
+                    .changed()
+            );
             before.assert_replayed(&document);
             history_depth(&document, 1, 1);
-            assert!(document.redo().expect("redo conversion plus paste").changed());
+            assert!(
+                document
+                    .redo()
+                    .expect("redo conversion plus paste")
+                    .changed()
+            );
             after.assert_replayed(&document);
             history_depth(&document, 2, 0);
             assert!(document.undo().expect("undo conversion again").changed());
@@ -350,8 +376,83 @@ fn unsupported_math_promotion_preserves_history_and_complete_selections() {
 }
 
 #[test]
-fn footnote_promotion_rejection_preserves_history_and_complete_selections() {
-    rejection_matrix(FOOTNOTE);
+fn footnote_promotion_preserves_history_and_complete_selections() {
+    for source in source_variants(FOOTNOTE) {
+        for kind in SelectionKind::ALL {
+            let (mut document, frames) = seeded_history(&source);
+            select_target(&mut document, kind);
+            let command = EditorCommand::PasteHtmlTableSource(PAYLOAD.into());
+            if matches!(kind, SelectionKind::Multiple) {
+                assert_rejected(&mut document, &command);
+                replay_history(&mut document, &frames);
+                continue;
+            }
+            let before = Frame::capture(&document);
+            let revision = document.revision();
+            let history = document.history_stats();
+            for _ in 0..3 {
+                assert!(document.command_available(&command));
+                assert_eq!(document.revision(), revision);
+                assert_eq!(document.history_stats(), history);
+                assert_eq!(document.selections(), &before.selections);
+                assert_eq!(document.snapshot().as_str(), before.source);
+            }
+            assert!(
+                document
+                    .execute(command)
+                    .expect("valid promotion/history fixture")
+                    .changed()
+            );
+            let after = Frame::capture(&document);
+            assert_eq!(document.table_target_is_html(), Some(true));
+            let index = document.markdown().footnotes();
+            assert!(index.diagnostics().is_empty());
+            assert_eq!(index.references().len(), 1);
+            let reference = &index.references()[0];
+            assert_eq!(reference.number, Some(1));
+            assert!(reference.content.is_some());
+            assert_eq!(
+                index.navigation_target(reference.source.start()),
+                Some(index.definitions()[0].source)
+            );
+            let table_start = before
+                .source
+                .find("| H |")
+                .expect("valid promotion/history fixture");
+            let table_end = before
+                .source
+                .find("| end |")
+                .expect("valid promotion/history fixture")
+                + "| end |".len();
+            assert!(after.source.starts_with(&before.source[..table_start]));
+            assert!(after.source.ends_with(&before.source[table_end..]));
+            history_depth(&document, 2, 0);
+            document.undo().expect("valid promotion/history fixture");
+            before.assert_replayed(&document);
+            history_depth(&document, 1, 1);
+            document.redo().expect("valid promotion/history fixture");
+            after.assert_replayed(&document);
+            document.undo().expect("valid promotion/history fixture");
+            before.assert_replayed(&document);
+            document.undo().expect("valid promotion/history fixture");
+            frames[0].assert_replayed(&document);
+            history_depth(&document, 0, 2);
+            document.redo().expect("valid promotion/history fixture");
+            document.redo().expect("valid promotion/history fixture");
+            after.assert_replayed(&document);
+        }
+    }
+}
+
+#[test]
+fn unresolved_or_ambiguous_footnote_promotion_preserves_history_and_complete_selections() {
+    rejection_matrix(&FOOTNOTE.replacen("[^note]", "[^missing]", 1));
+    rejection_matrix(&format!("{FOOTNOTE}\n[^NOTE]: duplicate\n"));
+    rejection_matrix(&FOOTNOTE.replacen(
+        "[^note]",
+        "<span data-yu-footnote='reference'><b>[^note]</b></span>",
+        1,
+    ));
 }
 
 #[test]

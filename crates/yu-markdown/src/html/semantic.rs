@@ -65,17 +65,26 @@ impl HtmlFragment {
                 // multiline/display forms must not be silently flattened.
                 // An empty body remains a formula so deleting its last letter
                 // does not lose identity while the user is editing it.
-                if attributes.inline_math {
+                if attributes.inline_math || attributes.footnote_reference {
                     let closing = closing.as_ref().ok_or(HtmlSemanticError::InvalidChildren)?;
-                    if node.children.iter().any(|&child| {
-                        !matches!(self.nodes[child].kind, HtmlNodeKind::Text)
-                    }) {
+                    if node
+                        .children
+                        .iter()
+                        .any(|&child| !matches!(self.nodes[child].kind, HtmlNodeKind::Text))
+                    {
                         return Err(HtmlSemanticError::InvalidChildren);
                     }
                     let body = source
-                        .get(opening.source.end().get() as usize..closing.source.start().get() as usize)
+                        .get(
+                            opening.source.end().get() as usize
+                                ..closing.source.start().get() as usize,
+                        )
                         .ok_or(HtmlSemanticError::InvalidChildren)?;
-                    if crate::image_markup::decode_image_text(body, true).contains(['\r', '\n', '\0']) {
+                    let decoded = crate::image_markup::decode_image_text(body, true);
+                    if decoded.contains(['\r', '\n', '\0'])
+                        || attributes.footnote_reference
+                            && yu_syntax::footnote_reference_label(&decoded).is_none()
+                    {
                         return Err(HtmlSemanticError::InvalidChildren);
                     }
                 }
