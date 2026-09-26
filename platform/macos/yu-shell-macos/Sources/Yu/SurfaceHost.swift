@@ -266,6 +266,8 @@ final class MacosSurfaceHostCoordinator {
     private var presentationRetry: DispatchWorkItem?
     private var layoutRefinement: DispatchWorkItem?
     private var frameWorkReadyObserver: NSObjectProtocol?
+    private var presentationDroppedObserver: NSObjectProtocol?
+    private var presentationRecoveryBudget = FramePresentationRecoveryBudget()
     private var calendarObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private let calendarWakeup = RenderCalendarWakeup()
     private var calendarSuspended = false
@@ -290,6 +292,19 @@ final class MacosSurfaceHostCoordinator {
         guard let self, self.isLiveScrolling, self.displayLinkWakeRequested else { return }
         self.displayLinkWakeRequested = false
         self.enqueueSubmit(immediate: true, force: false, resetRefreshBudget: false)
+    }
+    private lazy var presentationRecoveryPacer: DisplayLinkPacer = DisplayLinkPacer { [weak self] in
+        guard let self else { return }
+        self.presentationRecoveryPacer.stop()
+        guard self.presentationRecoveryBudget.consume(), self.isAttached,
+              !self.calendarSuspended, let host = self.surfaceView,
+              !host.isHiddenOrHasHiddenAncestor,
+              host.window?.isVisible == true,
+              host.window?.occlusionState.contains(.visible) == true,
+              self.currentPresentationTime() == nil else { return }
+        // A dropped terminal frame must yield to the display/run-loop cycle,
+        // not exhaust its recovery budget in one burst on the main queue.
+        self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: false)
     }
     private(set) var scrollMetrics = ScrollSchedulerMetrics()
     private var liveSubmitDurationsMilliseconds: [Double] = []
@@ -349,6 +364,27 @@ final class MacosSurfaceHostCoordinator {
             self.recordMetric("work_ready_notification")
             self.enqueueSubmit(immediate: !self.isLiveScrolling, force: false, resetRefreshBudget: false)
         }
+        presentationDroppedObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("YuRenderPresentationDropped"), object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self, let host = self.surfaceView,
+                  let layer = notification.object as? CALayer,
+                  self.isAttached, host.layer === layer,
+                  !self.calendarSuspended, !host.isHiddenOrHasHiddenAncestor,
+                  host.window?.isVisible == true,
+                  host.window?.occlusionState.contains(.visible) == true,
+                  self.currentPresentationTime() == nil else { return }
+            guard !self.presentationRecoveryBudget.pending else { return }
+            guard self.presentationRecoveryBudget.request(attached: true, visible: true, sameSurface: true) else {
+                self.recordMetric("presentation_recovery_exhausted")
+                Self.renderLog.error("Latest drawable was repeatedly discarded; recovery waits for a new content or window request")
+                return
+            }
+            self.recordMetric("presentation_recovery", fields: "attempt=\(self.presentationRecoveryBudget.attempts)")
+            // One display-paced wake only, using the existing view-bound pacer.
+            // No polling, source mutation, resource flush or artificial sleep.
+            self.presentationRecoveryPacer.start(view: host)
+        }
         resourceCompletionObserver = NotificationCenter.default.addObserver(
             forName: Notification.Name("YuRenderResourceCompleted"), object: nil, queue: .main
         ) { [weak self] _ in
@@ -366,6 +402,9 @@ final class MacosSurfaceHostCoordinator {
         }
         if let frameWorkReadyObserver {
             NotificationCenter.default.removeObserver(frameWorkReadyObserver)
+        }
+        if let presentationDroppedObserver {
+            NotificationCenter.default.removeObserver(presentationDroppedObserver)
         }
         if let resourceCompletionObserver {
             NotificationCenter.default.removeObserver(resourceCompletionObserver)
@@ -405,6 +444,8 @@ final class MacosSurfaceHostCoordinator {
         scheduleToken &+= 1
         submitRequestGeneration &+= 1
         self.surfaceView = surfaceView
+        presentationRecoveryPacer.stop()
+        presentationRecoveryBudget.reset()
         frameWakeGate.invalidate()
         pendingSubmitIntent = FrameSubmitIntent()
         self.scrollView = scrollView
@@ -578,6 +619,8 @@ final class MacosSurfaceHostCoordinator {
 
     private func enqueueSubmit(immediate: Bool, force: Bool, resetRefreshBudget: Bool) {
         if resetRefreshBudget {
+            presentationRecoveryPacer.stop()
+            presentationRecoveryBudget.reset()
             imageRefreshAttempts = 0
             layoutRefinement?.cancel()
             layoutRefinement = nil
@@ -1404,6 +1447,8 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func detach() {
+        presentationRecoveryPacer.stop()
+        presentationRecoveryBudget.reset()
         calendarWakeup.cancel()
         caretRevealGeneration &+= 1
         layoutRefinement?.cancel()
