@@ -1078,6 +1078,7 @@ private func checkEmptyHTMLListInput() throws {
 
 func runUndoSelfCheck(path: String) -> Never {
     do {
+        try checkHistoryShortcutRouting()
         try checkEmptyHTMLListInput()
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
