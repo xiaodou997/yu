@@ -111,7 +111,10 @@ impl PlacedWidget {
     pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
             source: shift_range(self.source, delta)?,
-            hit_source: self.hit_source.map(|range| shift_range(range, delta)).transpose()?,
+            hit_source: self
+                .hit_source
+                .map(|range| shift_range(range, delta))
+                .transpose()?,
             ..self
         })
     }
@@ -304,9 +307,9 @@ pub(crate) fn build_table_widget_placements(
     table: &TableLayout,
 ) -> Result<WidgetPlacements, LayoutError> {
     let decorations = view.decorations();
-    let html_table = decorations.line_styles().iter().any(|ornament| {
-        matches!(ornament, yu_markdown::BlockOrnament::Table(grid) if grid.is_html())
-    });
+    let html_table = decorations.line_styles().iter().any(
+        |ornament| matches!(ornament, yu_markdown::BlockOrnament::Table(grid) if grid.is_html()),
+    );
     let mut placements = WidgetPlacements::default();
     for (index, cell) in table.cells().iter().copied().enumerate() {
         let Some(layout) = table.cell_layouts().get(index) else {

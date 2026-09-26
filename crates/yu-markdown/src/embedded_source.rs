@@ -77,9 +77,12 @@ impl MarkdownDocument {
                 return None;
             }
             for mark in &marks {
-                if self.source().as_str().get(
-                    mark.start().get() as usize..mark.end().get() as usize,
-                )? != "$" {
+                if self
+                    .source()
+                    .as_str()
+                    .get(mark.start().get() as usize..mark.end().get() as usize)?
+                    != "$"
+                {
                     return None;
                 }
             }
@@ -106,7 +109,9 @@ impl MarkdownDocument {
         if original.is_empty() && generated.is_empty() {
             return Some(html.to_owned());
         }
-        let converted = model.native_table(model.partitions[0].content.owner?).ok()?;
+        let converted = model
+            .native_table(model.partitions[0].content.owner?)
+            .ok()?;
         if converted.columns != table.column_count()
             || converted.rows.len() != table.visible_row_count()
         {
@@ -143,7 +148,8 @@ impl MarkdownDocument {
                     if tex.contains(['\r', '\n', '\0']) {
                         return None;
                     }
-                    let encoded = tex.replace('&', "&amp;")
+                    let encoded = tex
+                        .replace('&', "&amp;")
                         .replace('<', "&lt;")
                         .replace('>', "&gt;");
                     replacements.push((after.content, encoded));
