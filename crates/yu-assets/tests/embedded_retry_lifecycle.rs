@@ -37,7 +37,10 @@ fn fail_job(
 }
 
 fn advance_to_retry(cache: &mut EmbeddedResourceCache, input: &EmbeddedRenderRequest) {
-    let due = cache.failure(input.key()).expect("retry metadata").next_retry_tick();
+    let due = cache
+        .failure(input.key())
+        .expect("retry metadata")
+        .next_retry_tick();
     let now = cache.retry_tick();
     assert!((now..=now + 64).contains(&due), "bounded fixture delay");
     for _ in now..due {
@@ -186,9 +189,16 @@ fn late_old_success_or_failure_cannot_reset_a_new_revisions_retry() {
         ));
         assert_eq!(cache.failure(fresh.key()), Some(&first));
         assert_eq!(cache.request(fresh.clone()), EmbeddedRequestResult::Pending);
-        assert!(cache.pending().is_none(), "stale completion released a new owner");
+        assert!(
+            cache.pending().is_none(),
+            "stale completion released a new owner"
+        );
         let EmbeddedRequestResult::Failed(second) = cache
-            .complete(fresh_job, fresh.revision(), Err(EmbeddedRenderError::Worker))
+            .complete(
+                fresh_job,
+                fresh.revision(),
+                Err(EmbeddedRenderError::Worker),
+            )
             .expect("current retry completion")
         else {
             panic!("expected current failure");
@@ -201,7 +211,10 @@ fn late_old_success_or_failure_cannot_reset_a_new_revisions_retry() {
 
 #[test]
 fn invalid_and_unsupported_sources_never_auto_retry() {
-    for error in [EmbeddedRenderError::InvalidSource, EmbeddedRenderError::Unsupported] {
+    for error in [
+        EmbeddedRenderError::InvalidSource,
+        EmbeddedRenderError::Unsupported,
+    ] {
         let mut cache = EmbeddedResourceCache::new();
         let input = request(1, 0, "x^2");
         let first = fail_job(&mut cache, &input, error);

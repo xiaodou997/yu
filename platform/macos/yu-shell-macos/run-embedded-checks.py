@@ -143,7 +143,7 @@ env = {k:v for k,v in os.environ.items() if not k.startswith('YU_')}
 env.update(YU_DOCUMENT_STATE_DIR=str(out/'state'), YU_PRESENTATION_STATE_DIR=str(out/'columns'), YU_NATIVE_INPUT_TRACE='1')
 if args.resource_audit:
     env['YU_RESOURCE_AUDIT'] = '1'
-command = [str(app/'Contents/MacOS/Yu'), str(fixture)] + (['--dark-mode'] if args.dark else [])
+command = [str(app/'Contents/MacOS/Yu'), str(fixture)] + group4_followup.appearance_arguments(args.dark, pin_theme=not args.themes)
 log = (out/'app.log').open('w')
 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
 result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required':True,
