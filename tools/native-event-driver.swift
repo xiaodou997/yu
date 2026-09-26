@@ -269,10 +269,14 @@ case "snapshot", "activate":
     if action == "activate", editor == nil { fail("No native document AXTextArea found") }
     if let editor {
         for key in ["AXRole","AXValue","AXSelectedText","AXSelectedTextRange","AXPosition","AXSize","AXFocused"] { result[key] = describe(attribute(editor,key)) }
+        result["AXSelectedTextRanges"] = (attribute(editor,"AXSelectedTextRanges") as? [AXValue] ?? []).map { describe($0) }
     } else { result["AXValue"] = NSNull() }
     if let focused = attribute(application,"AXFocusedUIElement") { let element = unsafeBitCast(focused,to:AXUIElement.self); result["focused_role"] = describe(attribute(element,"AXRole")); result["focused_description"] = describe(attribute(element,"AXDescription")); result["focused_value"] = describe(attribute(element,"AXValue")); result["focused_selected_range"] = describe(attribute(element,"AXSelectedTextRange")) }
     result["children"] = (editor.flatMap { attribute($0,"AXChildren") as? [AXUIElement] } ?? []).map { child in
-        Dictionary(uniqueKeysWithValues:["AXRole","AXDescription","AXValue","AXPosition","AXSize"].map { ($0,describe(attribute(child,$0))) })
+        Dictionary(uniqueKeysWithValues:["AXRole","AXIdentifier","AXDescription","AXValue","AXPosition","AXSize"].map { ($0,describe(attribute(child,$0))) })
+    }
+    result["splitters"] = (editor.flatMap { attribute($0,"AXSplitters") as? [AXUIElement] } ?? []).map { child in
+        Dictionary(uniqueKeysWithValues:["AXRole","AXIdentifier","AXValue","AXPosition","AXSize"].map { ($0,describe(attribute(child,$0))) })
     }
     result["windows"] = (CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []).filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid || ($0[kCGWindowOwnerName as String] as? String)?.contains("Input") == true }
     json(result)
@@ -308,11 +312,30 @@ case "paste-text", "paste-image", "paste-file", "paste-files", "copy-read", "cut
     for down in [true,false] { let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:down); event?.flags = down ? .maskCommand : []; post(event) }
     RunLoop.current.run(until:Date().addingTimeInterval(0.3))
     if !isPaste && board.changeCount == beforeCopy { fail("Copy/cut did not update the test clipboard") }
-    let copied: [String:Any] = ["text":board.string(forType:.string) ?? "", "types":board.types?.map { $0.rawValue } ?? [],
+    var copied: [String:Any] = ["text":board.string(forType:.string) ?? "", "types":board.types?.map { $0.rawValue } ?? [],
         "source_fragments":board.string(forType:NSPasteboard.PasteboardType("app.yu.source-fragments.v1")) ?? ""]
     if action == "copy-paste" {
-        guard args.count == 4, let x=Double(args[2]), let y=Double(args[3]) else { fail("copy-paste requires target screen x y") }
-        for type:CGEventType in [.mouseMoved,.leftMouseDown,.leftMouseUp] { post(CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:CGPoint(x:x,y:y),mouseButton:.left)) }
+        guard [4,6].contains(args.count), let x=Double(args[2]), let y=Double(args[3]), x.isFinite, y.isFinite else { fail("copy-paste requires target x y and optional rectangle endX endY") }
+        let start = CGPoint(x:x,y:y)
+        for type:CGEventType in [.mouseMoved,.leftMouseDown,.leftMouseUp] { post(CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:start,mouseButton:.left)) }
+        if args.count == 6 {
+            guard let endX=Double(args[4]), let endY=Double(args[5]), endX.isFinite, endY.isFinite else { fail("Invalid rectangle endpoint") }
+            func rectangleEvent(_ type: CGEventType, _ point: CGPoint) {
+                let event = CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:point,mouseButton:.left)
+                event?.flags = type == .leftMouseUp ? [] : [.maskAlternate,.maskShift]
+                event?.setIntegerValueField(.mouseEventClickState,value:1)
+                post(event)
+            }
+            rectangleEvent(.leftMouseDown,start)
+            for step in 1...16 {
+                let t = Double(step)/16
+                rectangleEvent(.leftMouseDragged,CGPoint(x:x+(endX-x)*t,y:y+(endY-y)*t))
+            }
+            rectangleEvent(.leftMouseUp,CGPoint(x:endX,y:endY))
+        }
+        if let editor {
+            copied["target_selected_ranges"] = (attribute(editor,"AXSelectedTextRanges") as? [AXValue] ?? []).map { describe($0) }
+        }
         for down in [true,false] { let event=CGEvent(keyboardEventSource:nil,virtualKey:9,keyDown:down); event?.flags = down ? .maskCommand : []; post(event) }
         RunLoop.current.run(until:Date().addingTimeInterval(0.3))
     }
