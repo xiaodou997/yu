@@ -20,6 +20,7 @@ ROOT = HERE.parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
+parser.add_argument('--cold-resource-reopen', action='store_true', help='Fixed formula cold-reopen pixel check without a churn interval')
 parser.add_argument('--resource-audit', action='store_true', help='Read-only per-frame CPU cache/history/GPU residency counters')
 parser.add_argument('--stress-idle-seconds', type=int, default=0, help='Observe post-stress plain-document idle memory, 0..120 seconds')
 parser.add_argument('--list-gestures', action='store_true', help='Actual reverse mouse range and parent/child Option-click multicursors')
@@ -147,6 +148,7 @@ log = (out/'app.log').open('w')
 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
 result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required':True,
           'resource_audit':args.resource_audit,
+          'cold_resource_reopen':args.cold_resource_reopen,
           'stress_idle_seconds':args.stress_idle_seconds,
           'isolated_bundle':identifier,
           'recent_diagrams':args.recent_diagrams,
@@ -158,7 +160,7 @@ result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required
           'test_runner_sha256':sha(Path(__file__)),
           'options':{'multiline_diagram':args.multiline_diagram,'cjk_math':args.cjk_math,'cancel_helper':args.cancel_helper,'lifecycle':args.lifecycle,'dark':args.dark,'themes':args.themes,'failures':args.failures,'dollars':args.dollars,'equations':args.equations,'highlight':args.highlight,'scripts':args.scripts,'footnotes':args.footnotes,'footnote_errors':args.footnote_errors,'toc':args.toc,'html':args.html,'html_blocks':args.html_blocks,'anchors':args.anchors,'alignment':args.alignment,'html_tables':args.html_tables,'merged_tables':args.merged_tables,'html_lines':args.html_lines,'html_details':args.html_details,'html_lists':args.html_lists,'reopen':args.reopen,'diagram_suite':args.diagram_suite,'math_suite':args.math_suite}}
 after_reopen_check = None
-if args.table_interactions or args.table_resize or args.smoke_document or args.stress_seconds or args.list_gestures:
+if args.table_interactions or args.table_resize or args.smoke_document or args.stress_seconds or args.list_gestures or args.cold_resource_reopen:
     result['followup_module_sha256'] = sha(Path(group4_followup.__file__))
     result['table_interactions'] = args.table_interactions
     result['table_resize'] = args.table_resize
@@ -1208,6 +1210,12 @@ try:
         audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
         source = audit.list_gestures()
 
+    if args.cold_resource_reopen:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source = '# Stress restored\r\n\r\n$x^2$\r\n\r\nTAIL\r\n'
+        audit.install(source)
+        audit.save(source)
+
     saved_before_reopen = fixture.read_bytes()
     old_helpers = helpers()
     run('key',12,'cmd'); process.wait(timeout=10)
@@ -1242,7 +1250,7 @@ try:
         if after_reopen_check:
             after_reopen_check()
         run('capture',str(out/'reopened-document'))
-        if args.resource_audit and args.stress_seconds:
+        if args.cold_resource_reopen or (args.resource_audit and args.stress_seconds):
             audit.restored_preview(expected)
         assert fixture.read_bytes()==saved_before_reopen
         end = len(expected.encode('utf-16-le'))//2

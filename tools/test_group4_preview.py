@@ -17,6 +17,17 @@ class PreviewPixelTests(unittest.TestCase):
         self.frame = dict(X=100, Y=200, Width=100, Height=100)
         self.rect = dict(x=110, y=220, width=30, height=20)
 
+    def test_cold_case_requires_reopen_before_side_effects(self):
+        self.assertIn('requires --reopen', FOLLOWUP.option_error({'cold_resource_reopen': True}))
+
+    def test_cold_case_can_use_audit_and_theme(self):
+        self.assertIsNone(FOLLOWUP.option_error(dict(cold_resource_reopen=True,
+            reopen=True, resource_audit=True, dark=True)))
+
+    def test_cold_case_cannot_silently_replace_stress(self):
+        self.assertIn('Choose one', FOLLOWUP.option_error(dict(cold_resource_reopen=True,
+            reopen=True, stress_seconds=30)))
+
     def test_blank_light_and_dark_do_not_pass(self):
         for value in (0, 32, 255):
             image = Image.new('RGB', (200, 200), (value,)*3)
