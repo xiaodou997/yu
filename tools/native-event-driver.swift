@@ -266,6 +266,13 @@ case "menu-open":
     RunLoop.current.run(until: Date().addingTimeInterval(0.2))
 case "snapshot", "activate":
     var result: [String:Any] = ["pid":pid,"input_source":sourceID(TISCopyCurrentKeyboardInputSource().takeRetainedValue())]
+    result["AXFrontmost"] = describe(attribute(application, "AXFrontmost"))
+    if let frontmost = NSWorkspace.shared.frontmostApplication {
+        result["frontmost_pid"] = frontmost.processIdentifier
+    } else { result["frontmost_pid"] = NSNull() }
+    if let focusedWindow = attribute(application, "AXFocusedWindow"), CFGetTypeID(focusedWindow) == AXUIElementGetTypeID() {
+        result["focused_window_identifier"] = describe(attribute(unsafeBitCast(focusedWindow, to: AXUIElement.self), "AXIdentifier"))
+    }
     if action == "activate", editor == nil { fail("No native document AXTextArea found") }
     if let editor {
         for key in ["AXRole","AXValue","AXSelectedText","AXSelectedTextRange","AXPosition","AXSize","AXFocused"] { result[key] = describe(attribute(editor,key)) }

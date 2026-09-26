@@ -147,14 +147,22 @@ class NativeSoak:
 
     def expect(self, expected, timeout=5):
         deadline = time.monotonic() + timeout
-        actual = None
+        actual, state = None, None
         while time.monotonic() < deadline:
-            actual = self.run('snapshot').get('AXValue')
+            state = self.run('snapshot')
+            actual = state.get('AXValue')
             if actual == expected:
                 return
             time.sleep(.1)
         (self.out / 'mismatch-expected.txt').write_bytes(expected.encode())
         (self.out / 'mismatch-actual.txt').write_bytes(str(actual).encode())
+        # Save focus/selection BEFORE diagnostic capture can activate the app.
+        # Failure remains failure: no repeated shortcut or source-repair input.
+        atomic_json(self.out / 'mismatch-snapshot.json', state)
+        try:
+            self.run('capture', str(self.out / 'mismatch-window'))
+        except Exception as error:
+            (self.out / 'mismatch-capture-error.txt').write_text(str(error) + '\n')
         raise AssertionError('Exact focused-document source mismatch; evidence retained')
 
     def window_ids(self):
