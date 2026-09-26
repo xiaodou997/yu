@@ -1,0 +1,19 @@
+test_missing_document_before_handle_creation_exits_normally (test_macos_bridge_resources.BridgeResourceChecks) ... ok
+test_missing_shader_after_handle_creation_exits_normally (test_macos_bridge_resources.BridgeResourceChecks) ... FAIL
+
+======================================================================
+FAIL: test_missing_shader_after_handle_creation_exits_normally (test_macos_bridge_resources.BridgeResourceChecks)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luoxiaodou/workspace/yu-workspace/tools/test_macos_bridge_resources.py", line 63, in test_missing_shader_after_handle_creation_exits_normally
+    self.run_failure(missing_source=False)
+  File "/Users/luoxiaodou/workspace/yu-workspace/tools/test_macos_bridge_resources.py", line 53, in run_failure
+    self.assertEqual(result.returncode, 1,
+AssertionError: -11 != 1 : Expected a caught initialization error, not a signal: -11
+sandbox_extension_issue_file_to_process failed for /var/folders/97/ysfl4pfj3t365_qc2rnsb98r0000gn/T/yu-bridge-resources-qbfiws1c/MissingResources.app: 1 (Operation not permitted)
+
+
+----------------------------------------------------------------------
+Ran 2 tests in 4.075s
+
+FAILED (failures=1)

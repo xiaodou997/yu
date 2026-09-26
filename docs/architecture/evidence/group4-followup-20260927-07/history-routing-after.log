@@ -1,0 +1,14 @@
+Yu history route key-equivalent-undo: passed
+Yu history route key-down-undo: passed
+Yu history route key-down-redo: passed
+Yu history route command-translated-character: passed
+Yu history route readonly-key-equivalent: passed
+Yu history route other-responder: passed
+Yu history route active-preedit: passed
+Yu history route modified-command-not-history: passed
+Yu history route one-event-one-history-step: passed
+Yu history route key-down-does-not-steal-field-history: passed
+Yu history route key-down-respects-readonly: passed
+Yu history route physical-key-is-not-history-identity: passed
+Yu empty HTML list: native preedit cancel/commit, undo/redo and exact save/reopen passed
+Yu Undo self-check: Rust history routes undo and redo through the native host

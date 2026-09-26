@@ -1,0 +1,118 @@
+{
+  "scope": "Standalone SwiftPM test executable without bundle resources, not normal bundled startup or an undo failure",
+  "source_report_sha256": "d84f14d9a0e45366fda8783229a036e3f0220d4e1856818f16fdec6a2b86d5c5",
+  "exception": {
+    "codes": "0x0000000000000000, 0x0000000000000000",
+    "rawCodes": [
+      0,
+      0
+    ],
+    "type": "EXC_CRASH",
+    "signal": "SIGABRT"
+  },
+  "termination": {
+    "flags": 0,
+    "code": 6,
+    "namespace": "SIGNAL",
+    "indicator": "Abort trap: 6",
+    "byProc": "Yu",
+    "byPid": 66120
+  },
+  "frames": [
+    {
+      "symbol": "__pthread_kill",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "pthread_kill",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "abort",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "malloc_vreport",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "malloc_report",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "_RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtCs4IPlMlPl2cV_10yu_storage21DocumentEditorSessionECse1o1dFRpRyU_14yu_storage_ffi",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "_RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueNtCse1o1dFRpRyU_14yu_storage_ffi16YuStorageSessionEBD_",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "yu_storage_session_destroy",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "StorageBridge.deinit",
+      "source": "StorageBridge.swift",
+      "line": 861
+    },
+    {
+      "symbol": "StorageBridge.__deallocating_deinit",
+      "source": "StorageBridge.swift",
+      "line": 860
+    },
+    {
+      "symbol": "_swift_release_dealloc",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "bool swift::RefCounts<swift::RefCountBitsT<(swift::RefCountInlinedness)1>>::doDecrementSlow<(swift::PerformDeinit)1>(swift::RefCountBitsT<(swift::RefCountInlinedness)1>, unsigned int)",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "StorageBridge.init(path:mode:)",
+      "source": "/<compiler-generated>",
+      "line": null
+    },
+    {
+      "symbol": "specialized check #1 (_:_:) in checkHistoryShortcutRouting()",
+      "source": null,
+      "line": null
+    },
+    {
+      "symbol": "checkHistoryShortcutRouting()",
+      "source": "HistoryShortcutChecks.swift",
+      "line": 32
+    },
+    {
+      "symbol": "runUndoSelfCheck(path:)",
+      "source": "SelfChecks.swift",
+      "line": 1081
+    },
+    {
+      "symbol": "main",
+      "source": "main.swift",
+      "line": 33
+    },
+    {
+      "symbol": "start",
+      "source": null,
+      "line": null
+    }
+  ]
+}

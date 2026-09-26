@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "code_commit": "69fd465ef185854f93e23fdf2ef939ba001e1cad",
+  "build_sha256": "a90c0d9853fc439f6f275d653dc9044388265e8b2e05d63e9d2013a3b1f71dff",
+  "group4_signoff": false,
+  "original_intermittent_undo_cause": "not_established",
+  "memory_verdict": "not_determined",
+  "native_history_scenarios": {
+    "initial": 8,
+    "initial_failed": 4,
+    "final": 12,
+    "final_failed": 0,
+    "scope": "native entry points, not WindowServer delivery"
+  },
+  "native_self_checks": 19,
+  "bridge_error_process_tests": 2,
+  "tool_and_native_process_tests": 73,
+  "real_window_cases": {
+    "final-ime-dark": {
+      "passed": true,
+      "result": "ime-dark-result.json",
+      "result_sha256": "fd085fa7c250335bb41d0655dc2bea616b195368bfe465fd560054f21e3e4285",
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "System Pinyin hardware-key composition commits 中文, one undo/redo restores exact source, Escape cancels a second composition, and saved BOM/CRLF bytes are exact",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "source_build_sha256": "a90c0d9853fc439f6f275d653dc9044388265e8b2e05d63e9d2013a3b1f71dff"
+    },
+    "final-dark-300": {
+      "passed": true,
+      "result": "dark-soak-result.json",
+      "result_sha256": "70ad1cdb37816e629a953bd339885e001d8c24aab68fd29dd04add7908c863a9",
+      "checks": [
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll"
+      ],
+      "source_build_sha256": "a90c0d9853fc439f6f275d653dc9044388265e8b2e05d63e9d2013a3b1f71dff"
+    },
+    "final-cold-light": {
+      "passed": true,
+      "result": "cold-light-result.json",
+      "result_sha256": "91ee4b7489f414917b603303d4952fed4aff57f315cf76420c8eaa141e253dff",
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "source_build_sha256": "a90c0d9853fc439f6f275d653dc9044388265e8b2e05d63e9d2013a3b1f71dff"
+    }
+  },
+  "files": {
+    "README.md": "a269ab000e87960352c10bcce2cff3d4db69cff5e382aae914253fbd39cfb8d8",
+    "baseline-dark-result.json": "7b9c337b0cf9986f31d37a69dafe65deafe4b89a60ff226655a785549395360d",
+    "bridge-resources-after.log": "eda19c8a882d05b5d5e82109ad6c12a8fe774a8de92b38d3607df29895da5e58",
+    "bridge-resources-before.log": "71bc77d24aff44c36636b91576b2753133e7a75d2c889aa2fce423539b1b9725",
+    "build-final-manifest.json": "92d2ce306b6c550f38e31461bdc74dcf90befc7e270f946dd20091a912baec8f",
+    "cold-light-result.json": "91ee4b7489f414917b603303d4952fed4aff57f315cf76420c8eaa141e253dff",
+    "cold-light.png": "05d0bc4efe8560a7481933029d2c25d60cd16b66e8c4bf9c69991b98d895218d",
+    "dark-soak-cold.png": "77ffed58dddcb6ae30d906f05edb1fbadc47267baef2ae659749c86ddc98b6b3",
+    "dark-soak-result.json": "70ad1cdb37816e629a953bd339885e001d8c24aab68fd29dd04add7908c863a9",
+    "final-source-lock.json": "9cc37089d92157de78266ca256502457508cda689ab52a58c730e8ada848d760",
+    "history-routing-after.log": "685a0e17e014df7daad5f2f41d3a37b95d50239ec74016ca222bf82a809d4422",
+    "history-routing-packaged-before.log": "41b53bf769ef41dbc3aac1fdabfdf6b3d5795f11a98df0bc05304def019eba2f",
+    "ime-dark-committed.png": "aac82beb9f9e0781fd76f1f16b96f0ed6e8c1f366c78f494c96d73f3bba81348",
+    "ime-dark-result.json": "fd085fa7c250335bb41d0655dc2bea616b195368bfe465fd560054f21e3e4285",
+    "initialization-crash-summary.json": "d56458887eedfdb1bb486c6a6a765851a92ade98a4b69d2ee9f6b20308cdac8a",
+    "native-final.log": "ad59211559cc7572bb206d9001e4adfe6d3e1646b747014dc93c851db0016981",
+    "tool-tests-final.log": "fe4dbf9496e11dc711b69610c8189ac72218a38fe198c6c5a089ed7132fdcb71"
+  }
+}

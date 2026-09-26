@@ -1,0 +1,32 @@
+Render calendar checks: 7 passed; midnight, sleep/rollback, zones, DST, retry, invalid date, timer cleanup. Not real-window acceptance.
+Typewriter scroll geometry: centered line, theme origin, document boundaries passed
+Native spelling: system suggestions, Unicode source offsets and excluded ranges passed
+Image resource checks passed: exact bytes, unique imports, Unicode paths, atomic batch rollback, original/external file protection
+accessibility                      OK
+calendar                           OK
+clipboard                          OK
+code-highlight                     OK
+document-interaction               OK
+document-workflow                  OK
+image-batch                        OK
+image-properties                   OK
+macos-table-resize-coordinator     OK
+macos-task-checkbox                OK
+multi-cursor                       OK
+outline-panel                      OK
+reading-preferences                OK
+search-panel                       OK
+selection                          OK
+shaped-projection-hit-test         OK
+shaped-vertical                    OK
+spelling-coordinator               OK
+undo                               OK
+
+test_missing_document_before_handle_creation_exits_normally (__main__.BridgeResourceChecks) ... ok
+test_missing_shader_after_handle_creation_exits_normally (__main__.BridgeResourceChecks) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.764s
+
+OK
+全部 19 个 self-check 通过

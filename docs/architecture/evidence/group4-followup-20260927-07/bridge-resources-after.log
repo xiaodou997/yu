@@ -1,0 +1,7 @@
+test_missing_document_before_handle_creation_exits_normally (test_macos_bridge_resources.BridgeResourceChecks) ... ok
+test_missing_shader_after_handle_creation_exits_normally (test_macos_bridge_resources.BridgeResourceChecks) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 3.149s
+
+OK

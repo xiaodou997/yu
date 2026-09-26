@@ -1,0 +1,9 @@
+Yu Undo self-check failed: Error Domain=YuHistoryShortcutChecks Code=1 "key-down-undo, key-down-redo, command-translated-character, readonly-key-equivalent" UserInfo={NSLocalizedDescription=key-down-undo, key-down-redo, command-translated-character, readonly-key-equivalent}
+Yu history route key-equivalent-undo: passed
+Yu history route key-down-undo: FAILED
+Yu history route key-down-redo: FAILED
+Yu history route command-translated-character: FAILED
+Yu history route readonly-key-equivalent: FAILED
+Yu history route other-responder: passed
+Yu history route active-preedit: passed
+Yu history route modified-command-not-history: passed
