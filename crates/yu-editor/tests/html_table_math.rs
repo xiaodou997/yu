@@ -11,6 +11,64 @@ const SIMPLE: &str = include_str!("fixtures/group4-paste/math-target.md");
 const MIXED: &str = include_str!("fixtures/group4-paste/math-mixed-target.md");
 const PAYLOAD: &str = include_str!("fixtures/group4-paste/merged-payload.md");
 
+// Production scheduling calls equation_source, not just embedded_source.
+// A decoration-only test can miss an equation-index registration failure.
+fn production_tex(document: &mut EditorDocument) -> Vec<String> {
+    let mut owned = Vec::new();
+    for index in 0..document.markdown().blocks().len() {
+        owned.extend(
+            document
+                .block_decorations(index)
+                .expect("production decorations")
+                .widgets()
+                .iter()
+                .filter_map(|widget| match widget {
+                    yu_markdown::BlockWidget::Embedded(span) if span.kind == EmbeddedKind::Math => {
+                        Some(*span)
+                    }
+                    _ => None,
+                }),
+        );
+    }
+    owned
+        .into_iter()
+        .map(|span| {
+            document
+                .markdown()
+                .equation_source(span)
+                .expect("formula must reach the production renderer, not source fallback")
+        })
+        .collect()
+}
+
+#[test]
+fn production_equation_index_retains_promoted_math_through_history_and_reopen() {
+    for source in variants(MIXED) {
+        let mut document = promote(&source);
+        let expected = vec!["h", "x^2", "a+b", "z"];
+        assert_eq!(production_tex(&mut document), expected);
+        let saved = document.snapshot().as_str().to_owned();
+        document.undo().expect("undo promotion");
+        assert_eq!(production_tex(&mut document), expected);
+        document.redo().expect("redo promotion");
+        assert_eq!(production_tex(&mut document), expected);
+        let mut reopened = EditorDocument::new(saved);
+        assert_eq!(production_tex(&mut reopened), expected);
+    }
+}
+
+#[test]
+fn html_formula_production_index_decodes_once_and_resolves_document_equation_labels() {
+    let source = "<table><tr><td><span data-math-style='inline'>a&lt;b &amp; c</span></td><td><span data-math-style='inline'>\\\\eqref{later}</span></td></tr></table>\n\n$$x=1\\\\label{later}$$\n";
+    let source = source.replace("\\\\", "\\");
+    let mut document = EditorDocument::new(&source);
+    let rendered = production_tex(&mut document);
+    assert_eq!(rendered[0], "a<b & c");
+    assert_eq!(rendered[1], "\\text{(}\\mathrm{1}\\text{)}");
+    assert!(rendered[2].ends_with("\\text{(}\\mathrm{1}\\text{)}"));
+    assert_eq!(document.snapshot().as_str(), source);
+}
+
 fn variants(source: &str) -> Vec<String> {
     ["\n", "\r\n"]
         .into_iter()
