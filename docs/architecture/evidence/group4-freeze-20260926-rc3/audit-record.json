@@ -1,0 +1,1017 @@
+{
+  "workspace_tests": {
+    "passed": 1541,
+    "failed": 0,
+    "ignored": 5
+  },
+  "selected_window_suites": [
+    {
+      "suite": "promotion-click-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/promotion-click-light/results.json",
+      "result_sha256": "d7e61ec8defefe1ca79d13375edb610281092fd933851a8275271dc669dbf065",
+      "passed": true,
+      "check_count": 11,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "promotion-0-math-target: native formula mouse hit, TeX body edit and exact undo/redo",
+        "promotion-0-math-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-1-footnote-target: converted HTML footnote Command-click reaches its document definition",
+        "promotion-1-footnote-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-2-row-groups-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-3-cross-groups: real Option+Shift donor selection and version-2 native clipboard; cross-group rejection preserves source and pre-existing redo branch",
+        "promotion-4-row-groups-target: real Option+Shift donor selection and version-2 native clipboard; cross-group rejection preserves source and pre-existing redo branch",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "e38af07a57514d037b7012271e3d47e62878db65d61d8db6d052abb7f197dbdb",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "99428651ec157846f6584e6515cc01f05d6fc64ce284401a4efae254ec63de60",
+      "reopen": {
+        "previous_pid": 76254,
+        "new_pid": 76641,
+        "old_helpers": [
+          76271
+        ],
+        "new_helpers": [
+          76645
+        ],
+        "saved_sha256": "0aa4b403cf49494f8c2807334c3d7cc01026305e12374e2850dd2f434b209feb"
+      },
+      "screenshot_count": 11
+    },
+    {
+      "suite": "promotion-click-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/promotion-click-dark/results.json",
+      "result_sha256": "f03e29eb5d2b42a51b33f15d25b5989540271b3025307d3dd344953aeea9fd63",
+      "passed": true,
+      "check_count": 11,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "promotion-0-math-target: native formula mouse hit, TeX body edit and exact undo/redo",
+        "promotion-0-math-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-1-footnote-target: converted HTML footnote Command-click reaches its document definition",
+        "promotion-1-footnote-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-2-row-groups-target: real Option+Shift donor selection and version-2 native clipboard; conversion/owner preservation, undo/redo and saved bytes",
+        "promotion-3-cross-groups: real Option+Shift donor selection and version-2 native clipboard; cross-group rejection preserves source and pre-existing redo branch",
+        "promotion-4-row-groups-target: real Option+Shift donor selection and version-2 native clipboard; cross-group rejection preserves source and pre-existing redo branch",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "12d4e410301bfbda947439ddfd73728cd50b8cf87442a0c2bf04daaec6ee54b7",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "99428651ec157846f6584e6515cc01f05d6fc64ce284401a4efae254ec63de60",
+      "reopen": {
+        "previous_pid": 76734,
+        "new_pid": 77109,
+        "old_helpers": [
+          76769
+        ],
+        "new_helpers": [
+          77113
+        ],
+        "saved_sha256": "0aa4b403cf49494f8c2807334c3d7cc01026305e12374e2850dd2f434b209feb"
+      },
+      "screenshot_count": 11
+    },
+    {
+      "suite": "math-extensions-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/math-extensions-light/results.json",
+      "result_sha256": "45f412cab0d62f1a28c424daee7ee63099344207b8892268a6585ce769d089e7",
+      "passed": true,
+      "check_count": 14,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "inline HTML body edit/undo/redo/save preserves tags, unknown attributes, and exact BOM/CRLF bytes; screenshots require review",
+        "real Command-click on both sides of adjacent footnotes and definition backlinks preserves source",
+        "footnote definition edit/undo/redo/save preserves exact BOM/CRLF source",
+        "inline formula selection/edit and undo/redo preserve exact source; editing and updated previews captured",
+        "highlight selection/edit/undo/redo preserves exact source; paragraph/table preview requires screenshot review",
+        "script editing and metadata preserve exact source; baseline/source reveal screenshots require review",
+        "missing footnote native diagnostic, exact invalid save, definition repair, undo/redo, exact corrected save and Command-click navigation pass",
+        "aligned formula edit, undo/redo and exact save pass; screenshots require review",
+        "cases formula edit, undo/redo and exact save pass; screenshots require review",
+        "multiline formula edit, undo/redo and exact save pass; screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "1d98a01c8c3b6f1653e6e1e13c608fcd0eb95b89c5e82d89679ba1b3fc3000f8",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 71623,
+        "new_pid": 72097,
+        "old_helpers": [
+          71640
+        ],
+        "new_helpers": [
+          72101
+        ],
+        "saved_sha256": "3264fbca1c7e622a7fb3022d77f6084961376bffb20d33c3a1fc90e88c9d75a8"
+      },
+      "screenshot_count": 22
+    },
+    {
+      "suite": "math-extensions-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/math-extensions-dark/results.json",
+      "result_sha256": "82aca216232dd9729b5e36985a4a64c49a86fa3f33580a72f315341602cc6da0",
+      "passed": true,
+      "check_count": 14,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "inline HTML body edit/undo/redo/save preserves tags, unknown attributes, and exact BOM/CRLF bytes; screenshots require review",
+        "real Command-click on both sides of adjacent footnotes and definition backlinks preserves source",
+        "footnote definition edit/undo/redo/save preserves exact BOM/CRLF source",
+        "inline formula selection/edit and undo/redo preserve exact source; editing and updated previews captured",
+        "highlight selection/edit/undo/redo preserves exact source; paragraph/table preview requires screenshot review",
+        "script editing and metadata preserve exact source; baseline/source reveal screenshots require review",
+        "missing footnote native diagnostic, exact invalid save, definition repair, undo/redo, exact corrected save and Command-click navigation pass",
+        "aligned formula edit, undo/redo and exact save pass; screenshots require review",
+        "cases formula edit, undo/redo and exact save pass; screenshots require review",
+        "multiline formula edit, undo/redo and exact save pass; screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "3a2f5ab76cb66928647c22bdcbe52324115b53fbf59e49366d7b9d2eba00ed72",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 72151,
+        "new_pid": 72597,
+        "old_helpers": [
+          72186
+        ],
+        "new_helpers": [
+          72601
+        ],
+        "saved_sha256": "3264fbca1c7e622a7fb3022d77f6084961376bffb20d33c3a1fc90e88c9d75a8"
+      },
+      "screenshot_count": 22
+    },
+    {
+      "suite": "diagrams-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/diagrams-light/results.json",
+      "result_sha256": "f3e8f2a405656d47329c061bc7e5fba46d8805755d7e9d75a08d2efca53b13d3",
+      "passed": true,
+      "check_count": 15,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "math failure displays actual editable source and native diagnostic; BOM/CRLF save remains exact",
+        "replacing unsupported source restores native preview and undo/redo preserves both source versions",
+        "mermaid failure displays actual editable source and native diagnostic; BOM/CRLF save remains exact",
+        "replacing unsupported source restores native preview and undo/redo preserves both source versions",
+        "flowchart diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "sequence diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "class diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "state diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "er diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "gantt diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "pie diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "b0c34259c2811488841c472a764c0fc35bee48e394fa167f00dfb6518c32e491",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 72655,
+        "new_pid": 73697,
+        "old_helpers": [
+          72687
+        ],
+        "new_helpers": [
+          73701
+        ],
+        "saved_sha256": "d986f2ef997b4d0327947a6c2c4af97b8d2e9dd0dc4682a244456dc30c8c50ac"
+      },
+      "screenshot_count": 28
+    },
+    {
+      "suite": "diagrams-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/results.json",
+      "result_sha256": "ab8c2ae7393f12dc07252f723567863275e8e05b1758e443b3483a2311bf5c9d",
+      "passed": true,
+      "check_count": 15,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "math failure displays actual editable source and native diagnostic; BOM/CRLF save remains exact",
+        "replacing unsupported source restores native preview and undo/redo preserves both source versions",
+        "mermaid failure displays actual editable source and native diagnostic; BOM/CRLF save remains exact",
+        "replacing unsupported source restores native preview and undo/redo preserves both source versions",
+        "flowchart diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "sequence diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "class diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "state diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "er diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "gantt diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "pie diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "243cf78cb727d9fc953d888d4feea2acfcbf6f5a77d5853d3a6fa71b4a89d425",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 73785,
+        "new_pid": 74180,
+        "old_helpers": [
+          73806
+        ],
+        "new_helpers": [
+          74186
+        ],
+        "saved_sha256": "d986f2ef997b4d0327947a6c2c4af97b8d2e9dd0dc4682a244456dc30c8c50ac"
+      },
+      "screenshot_count": 28
+    },
+    {
+      "suite": "recent-diagrams-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/results.json",
+      "result_sha256": "bc1bf1e70df8a41acaa034f517b565d4b08d3d069201aa3ae6d68c50a5a48774",
+      "passed": true,
+      "check_count": 11,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "central-1 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "central-2 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "central-3 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-1 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-2 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-3 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-4 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "4052b96f9dc0bbbc759b6242a0edecadebae56add86ddaf5c869bae7bf947d4f",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 74324,
+        "new_pid": 74558,
+        "old_helpers": [
+          74339
+        ],
+        "new_helpers": [
+          74562
+        ],
+        "saved_sha256": "ae728b3f2450bdeb6b2646d5d516dfe1083703e220d2c3c13247121af09e9cc7"
+      },
+      "screenshot_count": 16
+    },
+    {
+      "suite": "recent-diagrams-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/results.json",
+      "result_sha256": "2f1c807fd43fceb191befa08f4e406f0a55516135c7de204263d8126f9c718bf",
+      "passed": true,
+      "check_count": 11,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "central-1 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "central-2 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "central-3 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-1 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-2 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-3 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "calendar-4 diagram insert, label edit, undo/redo and exact save pass; actual diagram screenshots require review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "3fbc25865b50fb729d469f77ba68c05f62ede350afb1ef601ac9de3d93cd024c",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 74634,
+        "new_pid": 74913,
+        "old_helpers": [
+          74653
+        ],
+        "new_helpers": [
+          74917
+        ],
+        "saved_sha256": "ae728b3f2450bdeb6b2646d5d516dfe1083703e220d2c3c13247121af09e9cc7"
+      },
+      "screenshot_count": 16
+    },
+    {
+      "suite": "html-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/html-light/results.json",
+      "result_sha256": "eba636834756cd3fed1350ca2474f02634af88b084582bc081f8ad7ebee68b6a",
+      "passed": true,
+      "check_count": 9,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "HTML-only document preserves exact saved source without launching the helper; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "structural HTML paragraph edit/undo/redo/save preserves container tags, list start, nested structure and BOM/CRLF; screenshots require review",
+        "real Enter split/empty exit, Command-bracket indent/outdent, Backspace, exact caret, literal paste, consecutive undo/redo and BOM/CRLF save pass; not an IME test",
+        "merged table real Tab/Shift-Tab skips covered slots, escaped text insertion, exact BOM/CRLF save and undo/redo pass; screenshot requires review; no mouse drag claim",
+        "HTML table native Tab/Shift-Tab, literal paste, last-cell append, undo and exact BOM/CRLF save pass; screenshots require review",
+        "HTML cell native bitmap paste creates an image element and matching resource, preserves other bytes, supports Backspace/Delete/text replacement, exact save and undo/redo; image screenshot requires review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "5a21b528f58c344d57a599fbe116f8771d08f40b4ede8c538dba8bc703ce7353",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 74995,
+        "new_pid": 75206,
+        "old_helpers": [],
+        "new_helpers": [],
+        "saved_sha256": "57fd0d075420eef21e2bc37c56c2249ce421615e5267f5dfbdd963e42e752a40"
+      },
+      "screenshot_count": 12
+    },
+    {
+      "suite": "html-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/html-dark/results.json",
+      "result_sha256": "7bd76874e44b89923e06c9b712e01bbb6249d0e7fa40628f114cf64d618453a8",
+      "passed": true,
+      "check_count": 9,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "HTML-only document preserves exact saved source without launching the helper; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "structural HTML paragraph edit/undo/redo/save preserves container tags, list start, nested structure and BOM/CRLF; screenshots require review",
+        "real Enter split/empty exit, Command-bracket indent/outdent, Backspace, exact caret, literal paste, consecutive undo/redo and BOM/CRLF save pass; not an IME test",
+        "merged table real Tab/Shift-Tab skips covered slots, escaped text insertion, exact BOM/CRLF save and undo/redo pass; screenshot requires review; no mouse drag claim",
+        "HTML table native Tab/Shift-Tab, literal paste, last-cell append, undo and exact BOM/CRLF save pass; screenshots require review",
+        "HTML cell native bitmap paste creates an image element and matching resource, preserves other bytes, supports Backspace/Delete/text replacement, exact save and undo/redo; image screenshot requires review",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "ad5857a7e409ddf9da4e11dbbf333f5b4c562bcf2b6d1c7c92ef311026e0f4e9",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 75266,
+        "new_pid": 75495,
+        "old_helpers": [],
+        "new_helpers": [],
+        "saved_sha256": "57fd0d075420eef21e2bc37c56c2249ce421615e5267f5dfbdd963e42e752a40"
+      },
+      "screenshot_count": 12
+    },
+    {
+      "suite": "ime-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/ime-light/results.json",
+      "result_sha256": "6868091f04f18aa01516eb2f19ea2fd0b9026984e2d89092a2c1ea4d924b9747",
+      "passed": true,
+      "check_count": 5,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "System Pinyin hardware-key composition commits 中文, one undo/redo restores exact source, Escape cancels a second composition, and saved BOM/CRLF bytes are exact",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "b36961cc4947ff48bb17b63f2cca53fd4482f1f6973c90e08d336d0f25d92c28",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "aaea5874e6a636329f69f094228e2889841c78f723ee0b3340292c8338852d56",
+      "reopen": {
+        "previous_pid": 77304,
+        "new_pid": 77376,
+        "old_helpers": [
+          77319
+        ],
+        "new_helpers": [
+          77380
+        ],
+        "saved_sha256": "b4ab08a2028cd8cdd6597d590398cf5f63ca29f44c6e1d1d3897ff8eda0713b3"
+      },
+      "screenshot_count": 5
+    },
+    {
+      "suite": "ime-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/ime-dark/results.json",
+      "result_sha256": "4d1af78881f28cc44faf364b21d0ddcce5945ba5b7d13b7b87c14f36749fbd90",
+      "passed": true,
+      "check_count": 5,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "System Pinyin hardware-key composition commits 中文, one undo/redo restores exact source, Escape cancels a second composition, and saved BOM/CRLF bytes are exact",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "fa004de31a14c9e09dc0510a6cefc801d32c29988c9e35f017f903376575be0c",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "aaea5874e6a636329f69f094228e2889841c78f723ee0b3340292c8338852d56",
+      "reopen": {
+        "previous_pid": 77466,
+        "new_pid": 77555,
+        "old_helpers": [
+          77495
+        ],
+        "new_helpers": [
+          77559
+        ],
+        "saved_sha256": "b4ab08a2028cd8cdd6597d590398cf5f63ca29f44c6e1d1d3897ff8eda0713b3"
+      },
+      "screenshot_count": 5
+    },
+    {
+      "suite": "list-levels-light",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/list-levels-light/results.json",
+      "result_sha256": "f89f4e17a25c6c7646d3cc117190893c5c2ab69225b4aa8928e2e329ab9fed7a",
+      "passed": true,
+      "check_count": 12,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "list-parent-child.indent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-parent-child.indent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-child-next.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-child-next.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-root-cross.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-root-cross.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-div-cross.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-div-cross.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "b40177630a8a55236985fdb50ff53f5d6ae500884bbce10379e01b76d58893bf",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "563c8cdac896a9550b4dc06364819a444504d67e8c21b40ec1981f179986aecd",
+      "reopen": {
+        "previous_pid": 77877,
+        "new_pid": 78141,
+        "old_helpers": [
+          77896
+        ],
+        "new_helpers": [
+          78145
+        ],
+        "saved_sha256": "72d504380c5019c1697ed1d52e640dae2e9f463d58b9ac3d6a1ee8dc7434b8c2"
+      },
+      "screenshot_count": 10
+    },
+    {
+      "suite": "list-levels-dark",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/list-levels-dark/results.json",
+      "result_sha256": "f5cc4a637b8705ac80e884d1cffb665b56fdef42f4d809030655f4985535834c",
+      "passed": true,
+      "check_count": 12,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "list-parent-child.indent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-parent-child.indent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-child-next.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-child-next.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-root-cross.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-root-cross.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-div-cross.outdent-standalone-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "list-div-cross.outdent-cell-crlf: native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "5d88bfb35f9de67f0950caf46dce9a4198ad2bf52f80b33bd8bb1a18a32b07b8",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "563c8cdac896a9550b4dc06364819a444504d67e8c21b40ec1981f179986aecd",
+      "reopen": {
+        "previous_pid": 78224,
+        "new_pid": 78486,
+        "old_helpers": [
+          78239
+        ],
+        "new_helpers": [
+          78490
+        ],
+        "saved_sha256": "72d504380c5019c1697ed1d52e640dae2e9f463d58b9ac3d6a1ee8dc7434b8c2"
+      },
+      "screenshot_count": 10
+    },
+    {
+      "suite": "resource-lifecycle",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/resource-lifecycle/results.json",
+      "result_sha256": "9dc1ba6cabc96bd4160c51c112f23c51e4a8f8a4ff71d7c78f00ec3a6c9b66f5",
+      "passed": true,
+      "check_count": 5,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "real app helper exits idle while cached resources remain visible; edited formula starts a new helper and saves exact source; physical footprint samples recorded",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "282f4c32953b4561c4f94d9c1d0fd292e83c12186ffcd5092b1952bf3e1fafdd",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 75587,
+        "new_pid": 75925,
+        "old_helpers": [
+          75910
+        ],
+        "new_helpers": [
+          75932
+        ],
+        "saved_sha256": "2295e76110c262c4a65d48a77403a950c959e82525459a6d7193da1c90eb5bcb"
+      },
+      "screenshot_count": 4
+    },
+    {
+      "suite": "resource-cancel",
+      "result_path": "artifacts/group4-freeze-20260926-rc3/resource-cancel/results.json",
+      "result_sha256": "556c0f770853b5e12c392f03554d4e8a158f31e575c066ad76637a75ebad465b",
+      "passed": true,
+      "check_count": 5,
+      "checks": [
+        "ordinary document does not launch the native helper",
+        "math and Mermaid share a bundled helper and preserve exact saved source; screenshot captured",
+        "resource insertion undo/redo restores exact source without renderer edits",
+        "document revision cancels an actual suspended helper response; plain replacement stays free of stale resources; next valid resources restart and save exactly",
+        "full application quit/relaunch restores exact BOM/CRLF disk bytes, restarts resources on demand, permits new input/undo/redo/save and preserves original bytes after second quit; screenshot requires review"
+      ],
+      "test_app_sha256": "2e69768d4a9b7789f28f73fd5cbc6e11b3e4261f22b521e20bfe75823861dcec",
+      "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+      "test_runner_sha256": "15c213db126aa1b78efcc18835d7c19370f67bed1bdc6e636d8ae2a76393bc48",
+      "reopen": {
+        "previous_pid": 75982,
+        "new_pid": 76068,
+        "old_helpers": [
+          76047
+        ],
+        "new_helpers": [
+          76072
+        ],
+        "saved_sha256": "d58d647ef9142dc7c05225b7d883b157d6a2ffb90d76e3ecbfda4cc6bec6f221"
+      },
+      "screenshot_count": 5
+    }
+  ],
+  "window_suite_count": 16,
+  "window_check_count": 164,
+  "resource_summary": {
+    "samples": 50,
+    "idle_observed_seconds_after_setup": 55.547677459000006,
+    "metric": "proc_pid_rusage RUSAGE_INFO_V4 physical footprint",
+    "footprints": {
+      "app": {
+        "min_bytes": 77874208,
+        "max_bytes": 81052704
+      },
+      "helper": {
+        "min_bytes": 4866456,
+        "max_bytes": 4866456
+      }
+    },
+    "exited_helper_reaped": true,
+    "first_pid": 75615,
+    "restarted_pid": 75910,
+    "cancellation": {
+      "blocked_pid": 76001,
+      "suspended_state": "T",
+      "observed_seconds_including_input_events": 0.682910583,
+      "scenario": "real packaged helper suspended before response; newer document replaces pending formula"
+    }
+  },
+  "final_process_probe": {
+    "observed_utc": "2026-09-26T03:21:06.009714+00:00",
+    "remaining_isolated_apps_and_helpers": []
+  },
+  "overall_group4_status": "pending_remaining_acceptance",
+  "not_run": [
+    "real midnight transition without input",
+    "multi-day sleep/wake and system time-zone/clock change notifications",
+    "long-duration repeated resource/multiwindow stress",
+    "full 96-list + 76-table UI permutation matrix",
+    "merged-table column divider physical mouse resize on this candidate",
+    "whole combined group4-smoke interactive TOC/details pass"
+  ],
+  "visual_review": {
+    "screenshots_reviewed": 57,
+    "manifest": "artifacts/group4-freeze-20260926-rc3/visual-review/manifest.json",
+    "manifest_sha256": "aa637de9e95dfcd0de0fa58a93f15efaffb6d822638b0b812214f14ad48b3940",
+    "sheets": [
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/math-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-light/math-aligned-191019.png",
+            "sha256": "4728c515fb7f2e7b5efedd5724a5005551a43b3f6a38cead38e505c7c757135b",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-light/math-cases-191019.png",
+            "sha256": "f19af9e6832f570053abc0c6cf50715a8718ca0cce92ae89e6279b55897211d4",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-light/math-multiline-191019.png",
+            "sha256": "22316a5775d821e4f4f9142ac2d1fb77e50458677066326128809c1a81643261",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-light/inline-formula-updated-191019.png",
+            "sha256": "f0df58cd8098cf1a02739c69dc468f2efe78cbc0dc640172884f19dea5ccf71f",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-dark/math-aligned-191057.png",
+            "sha256": "19f5e9cb00018394184d83e811fd3da11a455e3d852f740b0ecd4629142bf032",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-dark/math-cases-191057.png",
+            "sha256": "96aacf044d298228f2649454449d573d24d2a3b286233b6f007b0cb1cd7511f3",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/math-2.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-dark/math-multiline-191057.png",
+            "sha256": "37488654a68d477845d929193b6647c3f03d6d12e53f8c187538b8b47ad676dc",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/math-extensions-dark/inline-formula-updated-191057.png",
+            "sha256": "a8e801b6ba46f48b3f13a04aafbdbbb09480c841b410cb5baff9d1157e2ba8e0",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/diagrams-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-flowchart-191095.png",
+            "sha256": "3b162d985e8dbc85b7ac48486e77ff4bb25a8d679d44bc19b532dea8f62621e7",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-sequence-191095.png",
+            "sha256": "a181a07ce789ec5ff6f80233a9eae75c8d739671acbbe3fde59f975af265cfca",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-class-191095.png",
+            "sha256": "66a56a45881535f81473767450df94e07cbdf2f1ab8ce17ed24ddf3f7bf32273",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-state-191095.png",
+            "sha256": "69c2c03eabb4c0f62b7375abf4feac5797733b126971180c79fcc3e9e3c5ee41",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-er-191095.png",
+            "sha256": "94bdf195258b4c248bc204def964c0e2151ad9ef5f5254ab1e0340b43e2ef40e",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-gantt-191095.png",
+            "sha256": "27a9861c8586cd2f254b506cd07f1f6ae68b0379f8c6c64ab127c4763bbe7c19",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/diagrams-2.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-light/diagram-pie-191095.png",
+            "sha256": "d2d4ccebe040b38e9cb20860180280f1d87126fcd0e2e262a4fe678d56b0919b",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-flowchart-191165.png",
+            "sha256": "ff7739a65c577361783b87294880903f38209b9f41f7a6cbab1fcd7d37039faf",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-sequence-191165.png",
+            "sha256": "81f5aa740faeeb895ccab48d09f6243ff468a8e77e8fe546a3c4fdc770e8700f",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-class-191165.png",
+            "sha256": "1877f1f0e38432cbdf7f2da01442aa0fcc5523fbed1315e9fe6e1c3b41a0d923",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-state-191165.png",
+            "sha256": "883573e92d46593a173197fb44081d4a7c1d49cb5fe137c1afbbef6e94f6a1b0",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-er-191165.png",
+            "sha256": "fd555ab2b4bf865ab1f056c9ff9397734c1dce224e95024e197142a904d714b8",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/diagrams-3.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-gantt-191165.png",
+            "sha256": "99a2060df70eaa7c230ce1aeee982e43c34cb4752260b46e31e65b226ab2b372",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/diagrams-dark/diagram-pie-191165.png",
+            "sha256": "9066499535296062664c515273669eef7ce8307449b1d96835ff809a5e42623d",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/recent-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-central-1-191219.png",
+            "sha256": "cb7e8c17203c96dfc364cb232a1e814013832823becc99f4ba03f7e171e12086",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-central-2-191219.png",
+            "sha256": "40f8dd4b50111ccff36332e0b7654f76eed9cf677960cde53bb2ef3022f943ea",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-central-3-191219.png",
+            "sha256": "289f7421d0a77e31a617da957994cc5091a45ea87a3890dba69bd1d55ddb952d",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-calendar-1-191219.png",
+            "sha256": "ae281a65a37a0c40f0b906fd0be9ae50c62b74cd0d7b96717dda93507bbd92fb",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-calendar-2-191219.png",
+            "sha256": "a869b7ace9e07cb2441f8e7a64e9eb2d1b1bfa25f8d8788bea13c27e27036a5a",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-calendar-3-191219.png",
+            "sha256": "def69beed1b3589129a3733b394a7a3d70c3a4d7e4888a4ef722e4904e23397d",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region.",
+        "limitations": "central-1 is taller than the captured viewport; top-of-document coverage is not inferred from this contact sheet."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/recent-2.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-light/diagram-calendar-4-191219.png",
+            "sha256": "3609a2a67c25db4bd4ba6e047b5d645648ee7e6545a97d9fae9a128e13c45723",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-central-1-191256.png",
+            "sha256": "b3ac95ac4c648539d85bda4d429ed3a2be4811fb4a424950a3189e6b92cb4c22",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-central-2-191256.png",
+            "sha256": "62a060bb2e46ec5300341b03b67c1e7a06839483e7f65af2040a47cb4f0ab4c3",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-central-3-191256.png",
+            "sha256": "5908ea4688d596213c424d580e001eee380b4798b8d4a04ad9e1f6ed47064cbe",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-calendar-1-191256.png",
+            "sha256": "ddf7b4ce9d44c49c6119710ab6c311cc8faae70d97d2ecc293ea14f6f2c35b61",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-calendar-2-191256.png",
+            "sha256": "8b294f6ad3696994048c82bb5582a636cec9d1234318b095488e9ab90c8a253f",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region.",
+        "limitations": "central-1 is taller than the captured viewport; top-of-document coverage is not inferred from this contact sheet."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/recent-3.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-calendar-3-191256.png",
+            "sha256": "c5252360e2f54a441b2060684ab56d11ef1167dda2b777254538b902b35b2dda",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/recent-diagrams-dark/diagram-calendar-4-191256.png",
+            "sha256": "a21881748ed71407e2bfdfd37ff92e621df0c4219345212191238578d2d6799e",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region.",
+        "limitations": "central-1 is taller than the captured viewport; top-of-document coverage is not inferred from this contact sheet."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/html-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-light/merged-table-edited-191294.png",
+            "sha256": "b47278a7c2f6d8f400bc27c581cae074911a4d43e9064b9d3157a6d1a4938ae6",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-light/html-table-image-191294.png",
+            "sha256": "28c40941b6de43189422b520dead3162d9535a72432bb1bafd28ceafd1b41c4d",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-light/list-indented-191294.png",
+            "sha256": "843458ec35d90c15e570ef37471eef3a70767a9cf24975535a19740d0edb816a",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-dark/merged-table-edited-191325.png",
+            "sha256": "74d587bde05d76756be9f08dfb717578759ef8a3f5417db582a8fbd5b1781714",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-dark/html-table-image-191325.png",
+            "sha256": "6403aa6398ec37a234ee58d16a2d214995fbc15d973e2d6b5a7d99ff6b826b95",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/html-dark/list-indented-191325.png",
+            "sha256": "e3492781e6541b057eba8247911df94012b497837fe18442826bff2ed00ea886",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region.",
+        "limitations": "Original black raster logo has low contrast on dark theme; no source-image recoloring is claimed."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/promotion-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-light/promotion-0-math-target-191399.png",
+            "sha256": "1213c3f9297405f8e8030e8aa3bb4466017790063494f01f0fe42f173b20a548",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-light/promotion-1-footnote-target-191399.png",
+            "sha256": "8cf65083725f3f7810abd243941dbf5fe856e00a42e2719d084cdc1f724a1900",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-light/promotion-2-row-groups-target-191399.png",
+            "sha256": "001fec76958f52b80e8e351742cb4ba3db61802562fc5b2cc5d69cace0566441",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-dark/promotion-0-math-target-191439.png",
+            "sha256": "d6f23fbd9510ddf09952d505a3a68f2dd48d68bdbcd82e9fc8be5d9c0fa99992",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-dark/promotion-1-footnote-target-191439.png",
+            "sha256": "e1887e03450e71cefcee09b4474b32f9c3b0feaf47ffae4bcc256fef337e3bd7",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/promotion-click-dark/promotion-2-row-groups-target-191439.png",
+            "sha256": "964bc0f04f141df04eec852619289295db66bb48457e76c54274939b738cbfdf",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/input-list-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/list-levels-light/list-parent-child.indent-cell-crlf-191569.png",
+            "sha256": "10b4e1767f2a531cd870bdd80b619cf7991f2e4403fae884faf5ab3b238e483b",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/list-levels-light/list-root-cross.outdent-standalone-crlf-191569.png",
+            "sha256": "0c61e281229a6def9cd05bac5900a5ed38f6ad880568fab4882ac86eb3fabb26",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/ime-light/ime-committed-191482.png",
+            "sha256": "cf1dca62d93044f083242f1ee8ce645f273c10e93671f581eb556274cbc577c6",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/list-levels-dark/list-parent-child.indent-cell-crlf-191607.png",
+            "sha256": "0fce379e736a9610f998396447809250cc86c6a476b797304fa32a36d8c3fe3b",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/list-levels-dark/list-root-cross.outdent-standalone-crlf-191607.png",
+            "sha256": "0d733fff74959e2f4733647e435c08a4b2b567b33d44cbf1d659a8a6dcaaa54d",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/ime-dark/ime-committed-191507.png",
+            "sha256": "a6dedf5832df81806594201813bab0e252ef4ad6019e88426d5682aed414d256",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      },
+      {
+        "sheet": "artifacts/group4-freeze-20260926-rc3/visual-review/resources-1.jpg",
+        "entries": [
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/resource-lifecycle/reopened-document-191363.png",
+            "sha256": "e6e56a12a3fe51e79bcfa25812941748657160bc330f0ce0c28a5d1c8e64037e",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/resource-cancel/after-helper-cancellation-191374.png",
+            "sha256": "f51c130b9fb358ae77c3afbc148c78e8a3f330eafc8327e6bc4292b546066fb5",
+            "scope": "captured visible window; entire document not inferred"
+          },
+          {
+            "source": "artifacts/group4-freeze-20260926-rc3/resource-cancel/after-cancellation-recovery-191374.png",
+            "sha256": "ce9e304d93f7de6cd1455d4135dbfc1a2c48dab9fc70f9d89f0041bd96baa1f2",
+            "scope": "captured visible window; entire document not inferred"
+          }
+        ],
+        "review_status": "reviewed_visible_window",
+        "review_method": "Assistant visual inspection of six-up contact sheet; sampled visible viewport, not every pixel or hidden document area",
+        "findings": "No raw-HTML formula fallback or obvious node/text overlap in the reviewed visible region."
+      }
+    ]
+  },
+  "freeze": {
+    "freeze_id": "group4-20260926-rc3",
+    "source_commit": "6afb7a3dac785d2674236cff1fab65f3546fee39",
+    "source_tree": "09b21c10c1409d04e9860bf2cfbd4a6fd26243d1",
+    "app_sha256": "ba4caa17724a5813a5c81d208311bd30a42683035773c8fec8187a3b52df539d",
+    "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+    "shader_sha256": "b5f1563b90031cdf588fd00166136fbdcda9dba94df5751324142f46c7b9bbb7",
+    "configuration": "release",
+    "architectures": [
+      "arm64"
+    ],
+    "minimum_os": "26.0",
+    "host_os": "27.0",
+    "sdk": "27.0",
+    "xcode": "Xcode 27.0\nBuild version 27A266a",
+    "freeze_tag": "group4-freeze-20260926-rc3",
+    "group4_complete": false,
+    "visual_acceptance": "reviewed_visible_samples_passed_remaining_matrix_pending",
+    "resource_audit": "bounded_lifecycle_cancellation_reaping_passed_long_stress_pending"
+  },
+  "evidence_files": {
+    "math-before-rc2.png": "81e5a5b054dba217b2cf0b25c5e85eb137c262dc85fc082787749b1defdaa40a",
+    "math-after-rc3.png": "f0776cc1221135274ee97c2ab6a093fbbe500d0bb28bc496b397f9543d70939f",
+    "math-after-rc3-dark.png": "d018345986eb1cd27faae21fc502ca3d641ed0ecb41d82f49e30d61059cefb16"
+  },
+  "logs": {
+    "build-release.log": "9b0489d5fa880078f5686223503a02465cb51d40523854f590a3dc9e1ab0c3a6",
+    "workspace-tests.log": "49fcdb5b6934bb6ef422ffa00a7e5c15c0e7dca3d23e1911a40dea45f71ab569",
+    "workspace-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "workspace-clippy.log": "c9785998c8b8addf3b90427d1b49ca966a6b05cb5c28066f97ad2936b3e58c93",
+    "native-self-checks.log": "c056a77b288da339fdcbf7fc1b56b94d492c68f1f778412b63769a1f41a10a54"
+  },
+  "recorded_utc": "2026-09-26T03:22:09.980015+00:00",
+  "excluded_duplicate_suite_runs": [
+    "promotion-light",
+    "promotion-dark"
+  ]
+}
