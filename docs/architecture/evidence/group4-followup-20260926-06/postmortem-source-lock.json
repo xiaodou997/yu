@@ -1,0 +1,12 @@
+{
+  "head": "fa5b8a5f31af17fb99929319f21b16c001731240",
+  "files": {
+    "tools/process-inventory.c": "bd603d5282ca19ea735802bd21ccceabfbcb0b69b923f761ebbd85f53669590e",
+    "tools/native-event-driver.swift": "cfe54a0d22167386cb988f1b33814a725b6e064615fcff5e896779dd0944998f",
+    "platform/macos/yu-shell-macos/run-resource-soak.py": "3d73c4fea6e8220c608aff2b74d6b32fdca6cf5a84c6a53843989abd1d6048cd",
+    "platform/macos/yu-shell-macos/group4_resource_soak.py": "cde22b2d1020c5809853ffbc0d209375c011031a27b35da70554ce52d975461f",
+    "platform/macos/yu-shell-macos/group4_followup.py": "c19269136cff67bf2ba5a2396e6c0501e5dabf7589889910664b68bbb40e7582"
+  },
+  "product_sha256": "548f6903480512136e3d0c34eb185ad47840670a6c7824be8a0d2d8c30bf8330",
+  "product_dirty": ""
+}

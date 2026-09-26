@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 528, in main
+    exercise(soak)
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 435, in exercise
+    soak.run('key', 6, 'cmd'); soak.expect(valid)
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 158, in expect
+    raise AssertionError('Exact focused-document source mismatch; evidence retained')
+AssertionError: Exact focused-document source mismatch; evidence retained

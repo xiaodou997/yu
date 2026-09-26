@@ -428,6 +428,35 @@ class RunnerContractTests(unittest.TestCase):
     def test_failed_sample_of_the_same_live_helper_is_not_ignored(self):
         self.sampled_helper({}, returncode=1, succeeds=False)
 
+    def test_source_mismatch_preserves_focus_before_capture_without_retrying_input(self):
+        for capture_fails in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                soak = runner.NativeSoak(runner.parse_args([str(out)]), out, {})
+                state = {'AXValue': 'before', 'AXFrontmost': False,
+                         'frontmost_pid': 123, 'focused_window_identifier': 'document.md',
+                         'AXSelectedTextRange': {'location': 3, 'length': 0}}
+                calls = []
+                def run(*args):
+                    calls.append(args[0])
+                    if args[0] == 'snapshot':
+                        return state
+                    self.assertEqual(args[0], 'capture')
+                    if capture_fails:
+                        raise RuntimeError('capture unavailable')
+                soak.run = run
+                try:
+                    with mock.patch.object(runner.time, 'monotonic', side_effect=[0, 0, 2]), \
+                         mock.patch.object(runner.time, 'sleep'), \
+                         self.assertRaisesRegex(AssertionError, 'source mismatch'):
+                        soak.expect('after', timeout=1)
+                    self.assertEqual(json.loads((out / 'mismatch-snapshot.json').read_text()), state)
+                    self.assertEqual((out / 'mismatch-actual.txt').read_text(), 'before')
+                    self.assertEqual(calls, ['snapshot', 'capture'])
+                    self.assertEqual((out / 'mismatch-capture-error.txt').exists(), capture_fails)
+                finally:
+                    soak.cleanup()
+
     def test_atomic_json_leaves_no_partial_result(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'result.json'

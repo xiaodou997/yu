@@ -1,0 +1,40 @@
+{
+  "memory_samples": 1061,
+  "max_helpers": 4,
+  "helper_samples": 4115,
+  "helper_min_bytes": 1360232,
+  "helper_max_bytes": 5276056,
+  "missing_samples": 0,
+  "observed_helper_pids": [
+    12443,
+    12499,
+    12572,
+    12635,
+    36630,
+    36647,
+    36662,
+    36893,
+    36939,
+    36988,
+    37036,
+    37084
+  ],
+  "history_verified": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "idle_finished": [
+    {
+      "phase": "retained_history_idle",
+      "elapsed_seconds": 70.13546958300003,
+      "history_cleared": false
+    },
+    {
+      "phase": "closed_documents_idle",
+      "elapsed_seconds": 70.12017925000009,
+      "history_cleared": false
+    }
+  ]
+}

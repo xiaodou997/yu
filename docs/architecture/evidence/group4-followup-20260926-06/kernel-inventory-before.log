@@ -1,0 +1,24 @@
+test_exited_fixture_is_absent_not_an_alive_zero_footprint_process (test_group4_process_inventory.KernelInventoryTests) ... ok
+test_invalid_targets_fail_without_an_empty_successful_inventory (test_group4_process_inventory.KernelInventoryTests) ... ok
+test_relative_helper_spelling_and_non_ascii_paths_are_real_processes (test_group4_process_inventory.KernelInventoryTests) ... ok
+test_runner_counts_helper_using_actual_product_launch_spelling (test_group4_process_inventory.KernelInventoryTests) ... FAIL
+test_same_basename_in_another_directory_does_not_match (test_group4_process_inventory.KernelInventoryTests) ... ok
+test_spoofed_argv0_is_not_an_executable_identity (test_group4_process_inventory.KernelInventoryTests) ... ok
+test_symlinked_target_and_launch_resolve_to_the_same_kernel_path (test_group4_process_inventory.KernelInventoryTests) ... ok
+
+======================================================================
+FAIL: test_runner_counts_helper_using_actual_product_launch_spelling (test_group4_process_inventory.KernelInventoryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/luoxiaodou/workspace/yu-workspace/tools/test_group4_process_inventory.py", line 96, in test_runner_counts_helper_using_actual_product_launch_spelling
+    self.assertEqual(values, {'app': [app.pid], 'helpers': [helper.pid]})
+AssertionError: {'app': [], 'helpers': []} != {'app': [5769], 'helpers': [5770]}
+- {'app': [], 'helpers': []}
++ {'app': [5769], 'helpers': [5770]}
+?          ++++               ++++
+
+
+----------------------------------------------------------------------
+Ran 7 tests in 3.751s
+
+FAILED (failures=1)

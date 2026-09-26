@@ -1,0 +1,16 @@
+{
+  "wall_time": 1790425384.7589388,
+  "process_lines": [
+    " 2097 /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/YuResourceSoak.app/Contents/MacOS/Yu /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/sentinel.md --light-mode -Yu.readingTheme 0",
+    " 2179 /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/YuResourceSoak.app/Contents/MacOS/../Helpers/yu-document-renderer",
+    " 2229 /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/YuResourceSoak.app/Contents/MacOS/../Helpers/yu-document-renderer",
+    " 2289 /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/YuResourceSoak.app/Contents/MacOS/../Helpers/yu-document-renderer",
+    " 2339 /Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260926-06/control-600-light/YuResourceSoak.app/Contents/MacOS/../Helpers/yu-document-renderer"
+  ],
+  "legacy_detected": {
+    "app": [
+      2097
+    ],
+    "helpers": []
+  }
+}
