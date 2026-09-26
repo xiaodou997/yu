@@ -761,7 +761,10 @@ impl EmbeddedResourceCache {
                 {
                     return EmbeddedRequestResult::Failed(failure);
                 }
-                self.failures.remove(request.key());
+                // A retry is still part of this revision's failure history.
+                // Keep its attempts/backoff until completion increments it or
+                // a successful publication clears it; deleting it here makes
+                // every failed retry look like the first attempt forever.
             } else {
                 self.failures.remove(request.key());
             }
