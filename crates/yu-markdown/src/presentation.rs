@@ -57,11 +57,16 @@ impl PresentationTree {
 
     /// Replace parser HTML leaves with source-backed flow leaves and list
     /// ancestry. This tree is paired with HtmlIndex's projected block sequence.
-    pub(crate) fn with_html_regions(&self, regions: &[crate::html::HtmlRegion]) -> Self {
+    pub(crate) fn with_html_regions(
+        &self,
+        regions: &[crate::html::HtmlRegion],
+        source: &TextSnapshot,
+    ) -> Self {
         use crate::html::{HtmlElementKind as H, HtmlFlowKind};
         use std::hash::{Hash, Hasher};
         let mut result = self.clone();
         let mut replaced = std::collections::HashSet::new();
+        result.footnotes = self.footnotes.with_html_regions(regions, source);
         for region in regions {
             let Ok(model) = &region.model else { continue };
             let Some(old) = result.leaves.iter().copied().find(|&id| {
@@ -233,6 +238,22 @@ impl PresentationTree {
         result
             .leaves
             .sort_by_key(|&id| result.nodes[id].source.start());
+        // An edit outside an HTML table can renumber its notes (and vice versa).
+        // Invalidate reference/definition leaves, not the whole document root.
+        for &id in &result.leaves {
+            let node = &mut result.nodes[id];
+            if result.footnotes.has_reference(node.source)
+                || result.footnotes.definitions().iter().any(|definition| {
+                    definition.source.start() < node.source.end()
+                        && node.source.start() < definition.source.end()
+                })
+            {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                node.context_key.hash(&mut hash);
+                result.footnotes.fingerprint().hash(&mut hash);
+                node.context_key = hash.finish();
+            }
+        }
         result
     }
 

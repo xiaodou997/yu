@@ -60,7 +60,7 @@ impl ExtensionOutput {
         owned: &[EmbeddedSpan],
         active: Option<TextRange>,
     ) {
-        use yu_core::{ByteOffset, TextAttrs, TextStyle, WidgetId};
+        use yu_core::WidgetId;
         use yu_decoration::Decoration;
 
         let revealed: Vec<_> = self
@@ -101,33 +101,43 @@ impl ExtensionOutput {
             true
         });
         self.widgets = retained;
-        let style = self.style(TextAttrs::new(TextStyle::Code));
         for span in revealed {
-            self.replace(TextRange::new(span.source.start(), span.content.start()).expect("math opening"));
-            self.replace(TextRange::new(span.content.end(), span.source.end()).expect("math closing"));
-            self.mark(span.content, style);
-            let mut cursor = span.content.start().get() as usize;
-            let end = span.content.end().get() as usize;
-            while cursor < end {
-                let Some(tail) = source.get(cursor..end) else {
-                    break;
-                };
-                if tail.starts_with('&')
-                    && let Some(stop) = tail.as_bytes().iter().take(34).position(|&byte| byte == b';')
-                    && let Some(decoded) = super::entity::decode(&tail[..=stop])
-                {
-                    self.substitute_text(
-                        TextRange::new(
-                            ByteOffset::new(cursor as u64),
-                            ByteOffset::new((cursor + stop + 1) as u64),
-                        )
-                        .expect("HTML entity"),
-                        decoded,
-                    );
-                    cursor += stop + 1;
-                } else {
-                    cursor += tail.chars().next().expect("nonempty TeX").len_utf8();
-                }
+            self.reveal_html_leaf(source, span.source, span.content);
+        }
+    }
+
+    /// Math and footnote bodies share one entity-to-source editing projection.
+    pub(crate) fn reveal_html_leaf(&mut self, source: &str, full: TextRange, content: TextRange) {
+        use yu_core::{ByteOffset, TextAttrs, TextStyle};
+        self.replace(TextRange::new(full.start(), content.start()).expect("leaf opening"));
+        self.replace(TextRange::new(content.end(), full.end()).expect("leaf closing"));
+        let style = self.style(TextAttrs::new(TextStyle::Code));
+        self.mark(content, style);
+        let mut cursor = content.start().get() as usize;
+        let end = content.end().get() as usize;
+        while cursor < end {
+            let Some(tail) = source.get(cursor..end) else {
+                break;
+            };
+            if tail.starts_with('&')
+                && let Some(stop) = tail
+                    .as_bytes()
+                    .iter()
+                    .take(34)
+                    .position(|&byte| byte == b';')
+                && let Some(decoded) = super::entity::decode(&tail[..=stop])
+            {
+                self.substitute_text(
+                    TextRange::new(
+                        ByteOffset::new(cursor as u64),
+                        ByteOffset::new((cursor + stop + 1) as u64),
+                    )
+                    .expect("HTML entity"),
+                    decoded,
+                );
+                cursor += stop + 1;
+            } else {
+                cursor += tail.chars().next().expect("nonempty leaf").len_utf8();
             }
         }
     }

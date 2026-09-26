@@ -304,7 +304,11 @@ impl HtmlIndex {
         let presentation = if regions.is_empty() {
             document.presentation.clone()
         } else {
-            std::sync::Arc::new(document.presentation.with_html_regions(&regions))
+            std::sync::Arc::new(
+                document
+                    .presentation
+                    .with_html_regions(&regions, document.source()),
+            )
         };
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -435,14 +439,27 @@ impl HtmlIndex {
         }
         let mut out = crate::ExtensionOutput::default();
         if part.content.kind == super::HtmlFlowKind::Table {
-            return Some(if model.decorate_table_active(snapshot.as_str(), part, active, &mut out) {
-                crate::BlockDecorations::from_output(snapshot, part.source, out)
-            } else {
-                crate::BlockDecorations::source(snapshot, block)
-            });
+            return Some(
+                if model.decorate_table_active(snapshot.as_str(), part, active, &mut out) {
+                    document.footnotes().decorate_html(
+                        snapshot.as_str(),
+                        part.source,
+                        active,
+                        &mut out,
+                    );
+                    crate::BlockDecorations::from_output(snapshot, part.source, out)
+                } else {
+                    crate::BlockDecorations::source(snapshot, block)
+                },
+            );
         }
         if !model.decorate_paragraph(snapshot.as_str(), part, active, &mut out) {
             return Some(crate::BlockDecorations::source(snapshot, block));
+        }
+        if !crate::reveals(active, part.source) {
+            document
+                .footnotes()
+                .decorate_html(snapshot.as_str(), part.source, None, &mut out);
         }
         if !crate::reveals(active, part.source)
             && let Some(alignment) = model.alignment(part)

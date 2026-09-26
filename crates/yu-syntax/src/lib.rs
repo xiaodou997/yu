@@ -71,6 +71,13 @@ pub use input::Input;
 pub use node::NodeKind;
 pub use tree::{Tree, TreeCursor};
 
+/// Validate one complete footnote reference with the parser's own label scanner.
+/// HTML promotion uses this without reparsing or inventing a second grammar.
+#[must_use]
+pub fn footnote_reference_label(source: &str) -> Option<&str> {
+    (inline::footnote_label_end(source, 0)? == source.len()).then(|| &source[2..source.len() - 1])
+}
+
 /// 解析失败的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {

@@ -22,9 +22,9 @@ class PreparePasteChecksTests(unittest.TestCase):
 
     def test_all_cases_have_exact_history_bytes_hashes_and_utf16_ranges(self):
         manifest = PREPARE.prepare(self.output)
-        self.assertEqual(manifest["schema_version"], 2)
-        self.assertEqual(len(manifest["cases"]), 36)
-        self.assertEqual(sum(c["expected_paste_result"] == "reject" for c in manifest["cases"]), 16)
+        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(len(manifest["cases"]), 52)
+        self.assertEqual(sum(c["expected_paste_result"] == "reject" for c in manifest["cases"]), 24)
         for case in manifest["cases"]:
             with self.subTest(case=case["id"]):
                 directory = self.output / case["id"]
@@ -62,9 +62,23 @@ class PreparePasteChecksTests(unittest.TestCase):
                 elif case["id"].startswith("math-mixed-target-"):
                     self.assertEqual(case["expected_paste_result"], "accept")
                     self.assertEqual(case["expected_inline_math_tex"], ["h", "x^2", "a+b", "z"])
-                elif case["id"].startswith(("math-invalid-target-", "footnote-target-", "cross-")):
+                elif case["id"].startswith(("math-invalid-target-", "cross-")):
                     self.assertEqual(case["expected_paste_result"], "reject")
         self.assertIn("arbitrary multiple selections still reject", manifest["selection_scope"])
+
+    def test_footnote_expectations_keep_labels_and_rejection_controls(self):
+        manifest = PREPARE.prepare(self.output)
+        for case in manifest["cases"]:
+            with self.subTest(case=case["id"]):
+                if case["id"].startswith("footnote-target-"):
+                    self.assertEqual(case["expected_paste_result"], "accept")
+                    self.assertEqual(case["expected_footnote_numbers"], [1])
+                elif case["id"].startswith("footnote-mixed-target-"):
+                    self.assertEqual(case["expected_paste_result"], "accept")
+                    self.assertEqual(case["expected_footnote_numbers"], [1, 2, 2, 3, 2])
+                    self.assertEqual(case["expected_inline_math_tex"], ["x^2"])
+                elif case["id"].startswith(("footnote-missing-", "footnote-duplicate-", "footnote-invalid-")):
+                    self.assertEqual(case["expected_paste_result"], "reject")
 
     def test_preparation_never_claims_native_or_visual_pass(self):
         manifest = PREPARE.prepare(self.output)

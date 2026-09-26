@@ -9,14 +9,22 @@ impl HtmlBlockModel {
     /// Only resolved, text-only math leaves can become native resources.
     /// Both ranges address canonical HTML bytes, never a decoded buffer.
     pub fn inline_math_span(&self, id: usize) -> Option<crate::EmbeddedSpan> {
-        if !self.resolution.elements.get(id)?.as_ref()?.attributes.inline_math {
+        if !self
+            .resolution
+            .elements
+            .get(id)?
+            .as_ref()?
+            .attributes
+            .inline_math
+        {
             return None;
         }
         let node = self.fragment.nodes.get(id)?;
         let HtmlNodeKind::Element {
             opening,
             closing: Some(closing),
-        } = &node.kind else {
+        } = &node.kind
+        else {
             return None;
         };
         Some(crate::EmbeddedSpan {
@@ -142,6 +150,13 @@ impl HtmlBlockModel {
                         continue;
                     }
                     let kind = resolved.expect("checked resolution").kind;
+                    if self.footnote_span(id).is_some() {
+                        // The document index supplies number/diagnostic and
+                        // editing projection; never display a stale saved number.
+                        text.visible(out);
+                        opaque_end = node.source.end();
+                        continue;
+                    }
                     if kind == Kind::Break {
                         text.discard_space(out);
                         if let Some(range) = intersection(opening.source, part.source) {

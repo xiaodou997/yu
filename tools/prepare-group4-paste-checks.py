@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates/yu-editor/tests/fixtures/group4-paste"
 HISTORY_A = " HISTORY-A-中文🙂"
 HISTORY_B = " HISTORY-B-中文🙂"
-NAMES = ("cross-groups", "math-target", "footnote-target", "merged-payload", "math-mixed-target")
+NAMES = ("cross-groups", "math-target", "footnote-target", "merged-payload", "math-mixed-target", "footnote-mixed-target")
 
 
 def digest(data: bytes) -> str:
@@ -35,7 +35,12 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
     cases = [
         ("cross-groups", text["cross-groups"], "reject"),
         ("math-target", text["math-target"], "accept"),
-        ("footnote-target", text["footnote-target"], "reject"),
+        ("footnote-target", text["footnote-target"], "accept"),
+        ("footnote-mixed-target", text["footnote-mixed-target"], "accept"),
+        ("footnote-missing-target", text["footnote-target"].replace("[^note]", "[^missing]", 1), "reject"),
+        ("footnote-duplicate-target", text["footnote-target"] + "\n[^NOTE]: duplicate\n", "reject"),
+        ("footnote-invalid-target", text["footnote-target"].replace("[^note]",
+         "<span data-yu-footnote='reference'><b>[^note]</b></span>", 1), "reject"),
         ("cross-head-body", text["cross-groups"].replace("<tbody>", "<thead>", 1)
          .replace("</tbody>", "</thead>", 1), "reject"),
         ("same-group-control", text["cross-groups"].replace("</tbody><tbody>", "", 1), "accept"),
@@ -57,7 +62,7 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
         "<table><tr><td colspan='2'>传入中文🙂</td></tr></table>\n".encode("utf-8")
     )
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "native_test_status": "not_run",
         "visual_review_required": True,
         "fixture_sha256": {name: digest(data) for name, data in raw.items()},
@@ -89,6 +94,11 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
                     "expected_inline_math_tex": {
                         "math-target": ["x^2"],
                         "math-mixed-target": ["h", "x^2", "a+b", "z"],
+                        "footnote-mixed-target": ["x^2"],
+                    }.get(name),
+                    "expected_footnote_numbers": {
+                        "footnote-target": [1],
+                        "footnote-mixed-target": [1, 2, 2, 3, 2],
                     }.get(name),
                     "newline": newline_name,
                     "bom": bom,

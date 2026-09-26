@@ -150,6 +150,9 @@ impl EditorDocument {
         if text.trim() != source.trim() {
             return Err(invalid());
         }
+        if !self.markdown.html_footnote_targets_resolve(model, source) {
+            return Err(invalid());
+        }
         if self.grid_paste_is_outside_table() {
             return Ok(None);
         }
@@ -305,6 +308,7 @@ impl EditorDocument {
         // accepting any conversion. TeX escapes must not be normalized away.
         let converted = yu_export::export_table_html(document, original_range.clone())
             .and_then(|html| self.markdown.preserve_table_math_source(&html, &target))
+            .and_then(|html| self.markdown.preserve_table_footnote_source(&html, &target))
             .ok_or_else(invalid)?;
         let parsed = yu_markdown::parse(&TextBuffer::new(&converted).snapshot());
         let index = parsed.html_regions();
@@ -417,7 +421,9 @@ impl EditorDocument {
         let contents = table.rows.iter().flat_map(|row| &row.cells).map(|cell| {
             &source[cell.content.start().get() as usize..cell.content.end().get() as usize]
         });
-        if !contents.eq(cells.iter().map(AsRef::as_ref)) {
+        if !contents.eq(cells.iter().map(AsRef::as_ref))
+            || !self.markdown.html_footnote_targets_resolve(model, &source)
+        {
             return Err(invalid());
         }
         Ok(source)
@@ -468,13 +474,9 @@ impl EditorDocument {
         block: Block,
         active: Option<TextRange>,
     ) -> Option<BlockDecorations> {
-        let index = self.markdown.html_regions();
-        let model = index.region_for(block.range())?.model.as_ref().ok()?;
-        let part = index.partition_for(block.range())?;
-        let mut output = yu_markdown::ExtensionOutput::default();
-        model
-            .decorate_table_active(self.markdown.source().as_str(), part, active, &mut output)
-            .then(|| BlockDecorations::from_output(self.markdown.source(), block.range(), output))
+        self.markdown
+            .html_regions()
+            .decorate(&self.markdown, block, active)
     }
 
     pub(super) fn html_table_edit_plan(
@@ -748,10 +750,15 @@ impl EditorDocument {
             yu_markdown::image_spans(self.markdown(), self.markdown.source(), Some(content))
                 .into_iter()
                 .map(|image| image.source())
-                .chain(decorations.widgets().iter().filter_map(|widget| match widget {
-                    yu_markdown::BlockWidget::Embedded(span) => Some(span.source),
-                    _ => None,
-                }))
+                .chain(
+                    decorations
+                        .widgets()
+                        .iter()
+                        .filter_map(|widget| match widget {
+                            yu_markdown::BlockWidget::Embedded(span) => Some(span.source),
+                            _ => None,
+                        }),
+                )
                 .filter(|object| object.start() >= content.start() && object.end() <= content.end())
                 .filter(|object| {
                     if forward {
@@ -792,13 +799,22 @@ impl EditorDocument {
         )?;
         // A collapsed tag can share a visual boundary with the first/last
         // TeX grapheme. Body editing must not delete the formula's identity.
-        if let Some(span) = self.markdown.html_regions()
+        if let Some(span) = self
+            .markdown
+            .html_regions()
             .region_for(block.range())
             .and_then(|region| region.model.as_ref().ok())
-            .and_then(|model| model.inline_math_spans().into_iter().find(|span| {
-                span.content.start() <= from && from <= span.content.end()
-                    && if forward { from < span.content.end() } else { from > span.content.start() }
-            }))
+            .and_then(|model| {
+                model.inline_math_spans().into_iter().find(|span| {
+                    span.content.start() <= from
+                        && from <= span.content.end()
+                        && if forward {
+                            from < span.content.end()
+                        } else {
+                            from > span.content.start()
+                        }
+                })
+            })
             && let Some(body) = TextRange::new(
                 coverage.start().max(span.content.start()),
                 coverage.end().min(span.content.end()),
@@ -1018,10 +1034,11 @@ impl EditorDocument {
         let index = self.markdown.html_regions();
         let model = index.region_for(block.range())?.model.as_ref().ok()?;
         let source = self.markdown.source().as_str();
-        let whole_math: Vec<_> = model
+        let whole_leaves: Vec<_> = model
             .inline_math_spans()
             .into_iter()
             .map(|span| span.source)
+            .chain(model.footnote_spans().into_iter().map(|span| span.source))
             .filter(|span| range.start() <= span.start() && span.end() <= range.end())
             .collect();
         let mut removed = model
@@ -1029,9 +1046,9 @@ impl EditorDocument {
             .nodes
             .iter()
             .filter_map(|node| {
-                // Remove a selected formula including its identity tags once.
+                // Remove a selected source leaf including its identity tags once.
                 // Body-only edits retain those tags, even for an empty body.
-                if whole_math.iter().any(|span| {
+                if whole_leaves.iter().any(|span| {
                     *span != node.source
                         && span.start() <= node.source.start()
                         && node.source.end() <= span.end()
@@ -1041,7 +1058,7 @@ impl EditorDocument {
                 let removable = match &node.kind {
                     HtmlNodeKind::Text => true,
                     HtmlNodeKind::Element { opening, .. } => {
-                        whole_math.contains(&node.source)
+                        whole_leaves.contains(&node.source)
                             || opening.name == "br"
                             || (opening.name == "img"
                                 && node.source.start() >= range.start()

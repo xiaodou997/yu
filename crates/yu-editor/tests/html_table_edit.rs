@@ -1415,6 +1415,47 @@ fn markdown_promotion_retains_writing_marks_and_rejects_unsupported_embeds_atomi
             format!("| H | TARGET |\n| --- | --- |\n| {content} | keep |\n\n[^ref]: note\n");
         let mut doc = EditorDocument::new(&source);
         focus(&mut doc, "TARGET");
+        let before = doc.selection();
+        doc.execute(EditorCommand::PasteHtmlTableSource(payload.into()))
+            .expect("supported source leaf");
+        let converted = doc.snapshot().as_str().to_owned();
+        assert!(converted.ends_with("[^ref]: note\n"));
+        if content.starts_with('$') {
+            let spans: Vec<_> = doc
+                .markdown()
+                .html_regions()
+                .regions
+                .iter()
+                .filter_map(|region| region.model.as_ref().ok())
+                .flat_map(|model| model.inline_math_spans())
+                .collect();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(
+                doc.markdown().embedded_source(spans[0]).as_deref(),
+                Some("x^2")
+            );
+        } else {
+            let index = doc.markdown().footnotes();
+            assert_eq!(index.references().len(), 1);
+            assert_eq!(index.references()[0].number, Some(1));
+            assert_eq!(
+                index.navigation_target(index.references()[0].source.start()),
+                Some(index.definitions()[0].source)
+            );
+        }
+        doc.undo().expect("replay source-leaf promotion");
+        assert_eq!(doc.snapshot().as_str(), source);
+        assert_eq!(doc.selection().anchor(), before.anchor());
+        assert_eq!(doc.selection().focus(), before.focus());
+        assert_eq!(doc.selection().affinity(), before.affinity());
+        doc.redo().expect("replay source-leaf promotion");
+        assert_eq!(doc.snapshot().as_str(), converted);
+    }
+    for content in ["<span data-math-style='display'>x^2</span>", "[^missing]"] {
+        let source =
+            format!("| H | TARGET |\n| --- | --- |\n| {content} | keep |\n\n[^ref]: note\n");
+        let mut doc = EditorDocument::new(&source);
+        focus(&mut doc, "TARGET");
         let revision = doc.revision();
         assert!(
             doc.execute(EditorCommand::PasteHtmlTableSource(payload.into()))

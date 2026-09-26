@@ -18,6 +18,8 @@ pub struct FootnoteDefinition {
 pub struct FootnoteReference {
     pub source: TextRange,
     pub number: Option<u32>,
+    /// HTML references retain their editable marker body in canonical bytes.
+    pub content: Option<TextRange>,
     label: Vec<u8>,
     owner: Option<usize>,
 }
@@ -75,6 +77,7 @@ impl FootnoteIndex {
                     result.references.push(FootnoteReference {
                         source: range(from, end),
                         number: None,
+                        content: None,
                         label,
                         owner,
                     });
@@ -85,6 +88,61 @@ impl FootnoteIndex {
                     stack.push((child, from + offset, owner));
                 }
             }
+        }
+        result.resolve_relationships();
+        result
+    }
+
+    /// Merge source-backed HTML references into the same document-wide graph.
+    /// Always derive from the syntax index, never from an already projected copy.
+    pub(crate) fn with_html_regions(
+        &self,
+        regions: &[crate::html::HtmlRegion],
+        source: &TextSnapshot,
+    ) -> Self {
+        let mut result = self.clone();
+        for span in regions
+            .iter()
+            .filter_map(|region| region.model.as_ref().ok())
+            .flat_map(|model| model.footnote_spans())
+        {
+            let Some(marker) = span.marker_text(source.as_str()) else {
+                continue;
+            };
+            let Some(label) = yu_syntax::footnote_reference_label(&marker) else {
+                continue;
+            };
+            let owner = result.definitions.iter().position(|definition| {
+                definition.source.start() <= span.source.start()
+                    && span.source.end() <= definition.source.end()
+            });
+            result.references.retain(|reference| {
+                reference.source.start() < span.source.start()
+                    || span.source.end() < reference.source.end()
+            });
+            result.references.push(FootnoteReference {
+                source: span.source,
+                content: Some(span.content),
+                number: None,
+                label: crate::reference::normalized_label_text(label),
+                owner,
+            });
+        }
+        result
+            .references
+            .sort_by_key(|reference| reference.source.start());
+        result.resolve_relationships();
+        result
+    }
+
+    fn resolve_relationships(&mut self) {
+        let result = self;
+        result.diagnostics.clear();
+        for definition in &mut result.definitions {
+            definition.number = None;
+        }
+        for reference in &mut result.references {
+            reference.number = None;
         }
         let mut nested = vec![Vec::new(); result.definitions.len()];
         let mut pending = VecDeque::new();
@@ -144,11 +202,18 @@ impl FootnoteIndex {
             definition.number.hash(&mut hash);
         }
         result.fingerprint = hash.finish();
-        result
     }
 
     pub fn references(&self) -> &[FootnoteReference] {
         &self.references
+    }
+    pub fn definition_for_marker(&self, marker: &str) -> Option<&FootnoteDefinition> {
+        let label =
+            crate::reference::normalized_label_text(yu_syntax::footnote_reference_label(marker)?);
+        let &[id] = self.labels.get(&label)?.as_slice() else {
+            return None;
+        };
+        self.definitions.get(id)
     }
     pub fn definitions(&self) -> &[FootnoteDefinition] {
         &self.definitions
