@@ -53,6 +53,29 @@ def center(rect):
     return rect['x'] + rect['width'] / 2, rect['y'] + rect['height'] / 2
 
 
+def preview_ink(image, rect, frame):
+    """Count contrast only inside a known, visible formula-only screen gap."""
+    import math
+    from statistics import median
+    values = [rect[k] for k in ('x', 'y', 'width', 'height')]
+    values += [frame[k] for k in ('X', 'Y', 'Width', 'Height')]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError('Nonfinite preview geometry')
+    if min(rect['width'], rect['height'], frame['Width'], frame['Height']) <= 0:
+        raise ValueError('Empty preview geometry')
+    sx, sy = image.width/frame['Width'], image.height/frame['Height']
+    box = (math.floor((rect['x']-frame['X'])*sx),
+           math.floor((rect['y']-frame['Y'])*sy),
+           math.ceil((rect['x']+rect['width']-frame['X'])*sx),
+           math.ceil((rect['y']+rect['height']-frame['Y'])*sy))
+    if not (0 <= box[0] < box[2] <= image.width and 0 <= box[1] < box[3] <= image.height):
+        raise ValueError('Formula pixel rectangle is off screen')
+    patch = image.crop(box).convert('RGB')
+    levels = [sum(pixel)/3 for pixel in patch.getdata()]
+    background = median(levels)
+    return sum(abs(value-background) >= 60 for value in levels), box, patch
+
+
 class Checks:
     def __init__(self, run, stable_bounds, out, fixture, result):
         self.run, self.bounds = run, stable_bounds
@@ -357,6 +380,45 @@ class Checks:
         stats.update(elapsed_seconds=time.monotonic()-started,helper_pids=sorted(pids),min_app_bytes=min(s['app']['physical_footprint_bytes'] for s in samples),max_app_bytes=max(s['app']['physical_footprint_bytes'] for s in samples))
         self.record('resource stress: {} completed valid/error/plain cycles in {:.1f}s; exact source/history, one helper while rendering and no new process for plain text; measured memory, no leak-proof claim'.format(rounds,stats['elapsed_seconds']))
         return final
+
+    def restored_preview(self, expected):
+        """A live helper and unchanged bytes cannot prove that pixels arrived.
+
+        This narrow oracle checks the isolated stress fixture's x^2 only. It
+        never focuses the formula, resizes the window or triggers an edit.
+        """
+        from PIL import Image
+        if expected != '# Stress restored\r\n\r\n$x^2$\r\n\r\nTAIL\r\n':
+            raise AssertionError('Unexpected restored-preview fixture')
+        observations = self.result.setdefault('restored_preview', [])
+        for attempt in range(3):
+            self.expect(expected)
+            # Use adjacent plain-text bounds: a math source interval may
+            # collapse to one caret pixel, which is not its painted footprint.
+            heading = self.bounds(2, utf16('Stress restored'))
+            tail = self.bounds(utf16(expected[:expected.index('TAIL')]), 4)
+            top = heading['y'] + heading['height'] + 2
+            rect = {'x':tail['x'], 'y':top, 'width':80,
+                    'height':tail['y']-top-2}
+            if rect['height'] <= 0:
+                raise AssertionError('No visible gap between restored heading and tail')
+            state = self.run('snapshot')
+            window = next(w for w in state['windows'] if w.get('kCGWindowLayer') == 0
+                          and w['kCGWindowBounds']['Width'] >= 400)
+            frame = window['kCGWindowBounds']
+            name = 'restored-preview-{}'.format(attempt)
+            self.capture(name)
+            path = self.out/('{}-{}.png'.format(name, window['kCGWindowNumber']))
+            with Image.open(path) as image:
+                ink, box, patch = preview_ink(image, rect, frame)
+                patch.save(self.out/(name+'-formula.png'))
+            observations.append({'attempt':attempt, 'rect':rect, 'pixel_box':box,
+                                 'image':path.name, 'contrasting_pixels':ink})
+            if ink >= 12:
+                self.record('restored x^2 has visible pixels at its native source rectangle without input, resize or scroll')
+                return
+            time.sleep(1)
+        raise AssertionError('Reopened formula stayed blank despite live helper and saved source')
 
     def list_gestures(self):
         parent = "<li id='parent'>父项中文<ul><li>子项🙂</li><li>后子</li></ul></li>"

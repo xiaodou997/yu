@@ -972,7 +972,14 @@ static int yu_metal_encode_command(
         return 0;
     }
 
-    if (vertex_buffer != nil) {
+    // Images are individual quads (yu_metal_batch_end never merges them).
+    // Bind their own immutable 96-byte vertices, not an offset into the
+    // recycled glyph stream. The cold-reopen pixel regression exercises this
+    // path with an asynchronously arriving formula in an unchanged viewport.
+    if ((vertex_buffer == nil || command.kind == 2) && vertex_count != 6) {
+        return 0;
+    }
+    if (vertex_buffer != nil && command.kind != 2) {
         [encoder setVertexBuffer:vertex_buffer offset:vertex_offset atIndex:0];
     } else {
         [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
