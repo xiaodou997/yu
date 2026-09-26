@@ -98,6 +98,10 @@ if (( ${#failed} > 0 )); then
     print -r -- "${#failed} 个 self-check 失败: ${failed[*]}" >&2
     exit 1
 fi
+# A failed bridge initializer must report an error, not double-destroy Rust.
+# The child tests use their own incomplete bundle and never alter this app.
+YU_BRIDGE_TEST_APP="$host_dir/.build/Yu.app" python3 \
+    "$host_dir/../../../tools/test_macos_bridge_resources.py" -v
 print -r -- "全部 ${#checks} 个 self-check 通过"
 
 # launch-window-self-check 会经由 applicationDidFinishLaunching 真正创建
