@@ -1242,6 +1242,8 @@ try:
         if after_reopen_check:
             after_reopen_check()
         run('capture',str(out/'reopened-document'))
+        if args.resource_audit and args.stress_seconds:
+            audit.restored_preview(expected)
         assert fixture.read_bytes()==saved_before_reopen
         end = len(expected.encode('utf-16-le'))//2
         run('select',end,0)
