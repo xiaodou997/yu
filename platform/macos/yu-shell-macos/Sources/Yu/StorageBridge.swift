@@ -787,6 +787,8 @@ final class StorageBridge {
         // mirror before returning from init.  A malformed path/file or an ABI
         // mismatch now becomes a normal launch error instead of a later
         // `precondition` abort while AppKit is laying out the first window.
+        // All stored properties are initialized: deinit owns handle even if a
+        // validation below throws. Manually destroying it here would free twice.
         do {
             guard let library = Bundle.main.url(forResource: "yu_shaders", withExtension: "metallib") else {
                 throw NSError(domain: "Yu.Renderer", code: 1,
@@ -812,9 +814,6 @@ final class StorageBridge {
             openedPath = try copyBytesThrowing { output, capacity, written in
                 yu_storage_session_copy_path(created, output, capacity, written)
             }
-        } catch {
-            yu_storage_session_destroy(created)
-            throw error
         }
         do {
             try configureTableWidthStore()
