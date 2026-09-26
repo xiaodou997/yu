@@ -938,6 +938,22 @@ impl EmbeddedResourceCache {
         self.failures.get(key)
     }
 
+    /// Forget work/diagnostics owned by obsolete source revisions. Successful
+    /// content-addressed payloads keep their bounded LRU residency so undo can
+    /// reuse them. Current failures stay settled, including exhausted retries.
+    /// In-flight worker results still pass the normal revision gate; removing
+    /// old ownership here permits a newer request for the same resource key.
+    pub fn retain_revision(&mut self, revision: Revision) {
+        self.failures
+            .retain(|_, failure| failure.revision == revision);
+        self.pending
+            .retain(|request| request.revision() == revision);
+        self.pending_keys.clear();
+        self.pending_keys
+            .extend(self.pending.iter().map(|request| request.key().clone()));
+        self.in_flight.retain(|_, owner| *owner == revision);
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.failures.clear();
@@ -1176,6 +1192,66 @@ mod tests {
             cache.request(make_request(5, 8, EmbeddedResourceKind::Math, "x^2")),
             EmbeddedRequestResult::Pending
         ));
+    }
+
+    #[test]
+    fn revision_cleanup_keeps_reusable_payloads_and_current_failure_policy() {
+        let mut cache = EmbeddedResourceCache::new();
+        let ready = make_request(1, 0, EmbeddedResourceKind::Math, "x");
+        cache
+            .publish(ready.clone(), Revision::new(1), raster(7))
+            .expect("ready");
+        let bad = make_request(1, 5, EmbeddedResourceKind::Mermaid, "invalid");
+        cache
+            .record_failure(
+                bad.clone(),
+                Revision::new(1),
+                EmbeddedFailureKind::InvalidSource,
+            )
+            .expect("invalid");
+        cache.retain_revision(Revision::new(1));
+        assert!(matches!(
+            cache.request(bad),
+            EmbeddedRequestResult::Failed(_)
+        ));
+        assert!(cache.pending().is_none());
+        cache.retain_revision(Revision::new(2));
+        assert_eq!(cache.failure_count(), 0);
+        assert_eq!(cache.len(), 1);
+        let rebased = make_request(2, 10, EmbeddedResourceKind::Math, "x");
+        let EmbeddedRequestResult::Ready(publication) = cache.request(rebased) else {
+            panic!("successful payload should survive revision cleanup")
+        };
+        assert_eq!(publication.revision(), Revision::new(2));
+        assert_eq!(publication.source_range().start(), ByteOffset::new(10));
+    }
+
+    #[test]
+    fn revision_cleanup_drops_queued_work_without_clearing_new_in_flight_owner() {
+        let mut cache = EmbeddedResourceCache::new();
+        let old = make_request(1, 0, EmbeddedResourceKind::Math, "shared");
+        let _ = cache.request(old.clone());
+        assert!(cache.pending().is_some());
+        let _ = cache.request(make_request(1, 5, EmbeddedResourceKind::Math, "queued"));
+        cache.retain_revision(Revision::new(2));
+        assert!(cache.pending().is_none());
+        assert!(cache.pending_keys.is_empty());
+        let fresh = make_request(2, 10, EmbeddedResourceKind::Math, "shared");
+        let _ = cache.request(fresh.clone());
+        assert_eq!(
+            cache.pending().expect("fresh job").revision(),
+            Revision::new(2)
+        );
+        assert!(matches!(
+            cache.complete(old, Revision::new(2), Err(EmbeddedRenderError::Worker)),
+            Err(EmbeddedCacheError::StaleRevision { .. })
+        ));
+        assert_eq!(cache.in_flight.get(fresh.key()), Some(&Revision::new(2)));
+        cache
+            .complete(fresh, Revision::new(2), Ok(raster(8)))
+            .expect("current result");
+        assert!(cache.in_flight.is_empty());
+        assert_eq!(cache.failure_count(), 0);
     }
 
     #[test]

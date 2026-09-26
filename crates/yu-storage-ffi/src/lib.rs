@@ -844,6 +844,7 @@ struct MacosImageResourceState {
 #[cfg(target_os = "macos")]
 struct MacosEmbeddedResourceState {
     cache: EmbeddedResourceCache,
+    revision: Option<Revision>,
     jobs: std::sync::mpsc::Sender<EmbeddedRenderRequest>,
     results: std::sync::mpsc::Receiver<EmbeddedWorkerResult>,
     control: RenderControl,
@@ -909,6 +910,7 @@ impl MacosEmbeddedResourceState {
             });
         Self {
             cache: EmbeddedResourceCache::new(),
+            revision: None,
             jobs,
             results,
             control,
@@ -944,6 +946,10 @@ impl MacosEmbeddedResourceState {
     }
 
     fn advance(&mut self, revision: Revision) -> Result<(), i32> {
+        if self.revision != Some(revision) {
+            self.cache.retain_revision(revision);
+            self.revision = Some(revision);
+        }
         self.control.set_revision(revision.get());
         self.publications
             .retain(|publication| publication.revision() == revision);
@@ -10176,6 +10182,7 @@ mod tests {
         let (completed, results) = std::sync::mpsc::channel();
         let mut state = MacosEmbeddedResourceState {
             cache: EmbeddedResourceCache::new(),
+            revision: None,
             jobs,
             results,
             control: RenderControl::default(),
@@ -10264,6 +10271,7 @@ mod tests {
         let (completed, results) = std::sync::mpsc::channel();
         let mut state = MacosEmbeddedResourceState {
             cache: EmbeddedResourceCache::new(),
+            revision: None,
             jobs,
             results,
             control: RenderControl::default(),
@@ -10312,6 +10320,7 @@ mod tests {
         let (completed, results) = std::sync::mpsc::channel();
         let mut state = MacosEmbeddedResourceState {
             cache: EmbeddedResourceCache::new(),
+            revision: None,
             jobs,
             results,
             control: RenderControl::default(),
@@ -13108,6 +13117,44 @@ mod tests {
                 }
                 assert_eq!(document.snapshot().as_str(), source);
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_revision_advance_drops_obsolete_failure_metadata() {
+        let mut resources = MacosEmbeddedResourceState::new();
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("source");
+        for version in 1..64 {
+            let revision = Revision::new(version);
+            resources.advance(revision).expect("new revision");
+            assert_eq!(
+                resources.cache.failure_count(),
+                0,
+                "failures from old document versions must be released"
+            );
+            let request = EmbeddedRenderRequest::new(
+                revision,
+                source,
+                EmbeddedResourceKind::Mermaid,
+                format!("bad graph {version}"),
+            )
+            .expect("request");
+            resources
+                .cache
+                .record_failure(
+                    request,
+                    revision,
+                    yu_assets::EmbeddedFailureKind::InvalidSource,
+                )
+                .expect("diagnostic");
+            resources.advance(revision).expect("same revision");
+            assert_eq!(
+                resources.cache.failure_count(),
+                1,
+                "same-version rejection must remain settled"
+            );
         }
     }
 

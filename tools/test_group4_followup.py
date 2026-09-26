@@ -63,6 +63,12 @@ class FollowupHarnessTests(unittest.TestCase):
         self.assertEqual(calls, [('snapshot',), ('snapshot',)])
         self.assertEqual(result['source_observation_waits'], [1])
 
+    def test_idle_phase_requires_bounded_stress_before_effects(self):
+        for value in [-1, 121]:
+            self.assertIsNotNone(followup.option_error({'stress_seconds': 30, 'stress_idle_seconds': value}))
+        self.assertIsNotNone(followup.option_error({'stress_idle_seconds': 70}))
+        self.assertIsNone(followup.option_error({'stress_seconds': 300, 'stress_idle_seconds': 70, 'resource_audit': True, 'reopen': True}))
+
     def test_pure_validation_does_not_touch_output(self):
         target = Path('this-path-is-never-created-by-option-validation')
         existed = target.exists()
