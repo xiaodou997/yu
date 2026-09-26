@@ -23,6 +23,8 @@ parser.add_argument('--math-suite', action='store_true', help='Exercise aligned,
 parser.add_argument('--diagram-suite', action='store_true', help='Exercise seven Mermaid families in the actual application')
 parser.add_argument('--recent-diagrams', action='store_true', help='Exercise the three central-connection and four Gantt-calendar fixtures with real caption edits')
 parser.add_argument('--promotion-suite', action='store_true', help='Copy real native merged cells and paste into math/footnote/grouped targets')
+parser.add_argument('--ime', action='store_true', help='Verify real system Pinyin hardware-key composition, commit, cancellation and history')
+parser.add_argument('--list-inputs', type=Path, help='Prepared group4 list manifest; run single-range standalone/cell CRLF cases through native commands')
 parser.add_argument('--reopen', action='store_true', help='Quit and relaunch the isolated application; verify disk source, resources and editing')
 parser.add_argument('--cjk-math', action='store_true')
 parser.add_argument('--multiline-diagram', action='store_true')
@@ -134,6 +136,8 @@ result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required
           'isolated_bundle':identifier,
           'recent_diagrams':args.recent_diagrams,
           'promotion_suite':args.promotion_suite,
+          'ime':args.ime,
+          'list_inputs':str(args.list_inputs) if args.list_inputs else None,
           'test_app_sha256':sha(app/'Contents/MacOS/Yu'),
           'test_helper_sha256':sha(app/'Contents/Helpers/yu-document-renderer'),
           'test_runner_sha256':sha(Path(__file__)),
@@ -1058,6 +1062,25 @@ try:
                 run('key',6,'cmd'); assert run('snapshot')['AXValue'] == before
                 run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == after
                 run('select',0,0); time.sleep(.3)
+                if name == 'math-target':
+                    at = after.index('x^2'); offset = utf16(after[:at])
+                    b = stable_bounds(offset,3)
+                    run('click',b['x']+b['width']*.25,b['y']+b['height']/2)
+                    selected = run('snapshot')['AXSelectedTextRange']
+                    assert selected['length'] == 0 and offset <= selected['location'] <= offset+3
+                    position = at + selected['location']-offset
+                    edited = after[:position]+'q'+after[position:]
+                    run('paste-text','q'); assert run('snapshot')['AXValue'] == edited
+                    run('key',6,'cmd'); assert run('snapshot')['AXValue'] == after
+                    run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == edited
+                    run('key',6,'cmd'); assert run('snapshot')['AXValue'] == after
+                    result['checks'].append(case_id+': native formula mouse hit, TeX body edit and exact undo/redo')
+                if name == 'footnote-target':
+                    at = after.index('[^note]'); b = stable_bounds(utf16(after[:at]),utf16('[^note]'))
+                    run('click',b['x']+b['width']/2,b['y']+b['height']/2,'cmd')
+                    assert run('snapshot')['AXSelectedTextRange']['location'] == utf16(after[:after.index('[^note]:')])
+                    result['checks'].append(case_id+': converted HTML footnote Command-click reaches its document definition')
+                run('select',0,0); time.sleep(.3)
                 run('capture',str(out/case_id))
                 run('key',1,'cmd'); time.sleep(.3)
                 assert fixture.read_bytes() == b'\xef\xbb\xbf'+after.encode()
@@ -1079,6 +1102,69 @@ try:
                 assert fixture.read_bytes() == b'\xef\xbb\xbf'+before.encode()
                 source = before
             result['checks'].append(case_id+': real Option+Shift donor selection and version-2 native clipboard; '+('conversion/owner preservation, undo/redo and saved bytes' if accept else 'cross-group rejection preserves source and pre-existing redo branch'))
+
+    if args.ime:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        original_input = run('snapshot')['input_source']
+        try:
+            run('source','com.apple.inputmethod.SCIM.ITABC')
+            current = run('snapshot')['AXValue']
+            run('select',utf16(current),0); run('paste-text','\r\nIME: ')
+            before = current+'\r\nIME: '
+            run('keys',6,4,31,45,5,13,14,45)  # zhongwen, actual hardware keys
+            run('capture',str(out/'ime-composing'))
+            run('key',49)  # Commit the native candidate with Space.
+            committed = before+'中文'
+            assert run('snapshot')['AXValue'] == committed
+            run('key',6,'cmd'); assert run('snapshot')['AXValue'] == before
+            run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == committed
+            run('select',utf16(committed),0)
+            run('keys',6,4); run('key',53)  # Cancel a second marked-text session.
+            assert run('snapshot')['AXValue'] == committed
+            run('key',1,'cmd'); time.sleep(.3)
+            assert fixture.read_bytes() == b'\xef\xbb\xbf'+committed.encode()
+            run('capture',str(out/'ime-committed'))
+            source = committed
+            result['checks'].append('System Pinyin hardware-key composition commits 中文, one undo/redo restores exact source, Escape cancels a second composition, and saved BOM/CRLF bytes are exact')
+        finally:
+            run('source',original_input)
+
+    if args.list_inputs:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        manifest_path = args.list_inputs/'manifest.json'
+        list_manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        selected_cases = [case for case in list_manifest['cases']
+            if case['line_ending'] == 'crlf' and not case['bom'] and len(case['before_selections']) == 1]
+        assert len(selected_cases) == 8
+        result['list_manifest_sha256'] = sha(manifest_path)
+        prefix = '# List audit\r\n\r\n```math\r\nx^2\r\n```\r\n\r\n'
+        for case in selected_cases:
+            directory = args.list_inputs/case['id']
+            fixture_source = ROOT/'crates/yu-editor/tests/fixtures/group4-list'/case['fixture']
+            assert sha(fixture_source) == case['fixture_sha256']
+            values = {name:prefix+(directory/name).read_bytes().decode('utf-8-sig') for name in ['expected-0.md','expected-a.md','expected-b.md','expected-list-a.md']}
+            base, before, seeded, expected = [values[name] for name in ['expected-0.md','expected-a.md','expected-b.md','expected-list-a.md']]
+            current = run('snapshot')['AXValue']
+            run('select',0,utf16(current)); run('paste-text',base)
+            run('select',utf16(base),0); run('paste-text',before[len(base):])
+            run('select',0,0); run('select',utf16(before),0); run('paste-text',seeded[len(before):])
+            run('key',6,'cmd'); assert run('snapshot')['AXValue'] == before
+            selection = case['before_selections'][0]
+            anchor,focus = selection['anchor_utf16'],selection['focus_utf16']
+            run('select',utf16(prefix)+min(anchor,focus),abs(anchor-focus))
+            prior_selection = run('snapshot')['AXSelectedTextRange']
+            assert case['command'] in ('indent','outdent') and case['expected_changed']
+            run('key',30 if case['command']=='indent' else 33,'cmd')
+            assert run('snapshot')['AXValue'] == expected,case['id']
+            run('key',6,'cmd')
+            state = run('snapshot'); assert state['AXValue'] == before and state['AXSelectedTextRange'] == prior_selection
+            run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == expected
+            run('select',0,0); time.sleep(.25)
+            run('capture',str(out/('list-'+case['id'])))
+            run('key',1,'cmd'); time.sleep(.2)
+            assert fixture.read_bytes() == b'\xef\xbb\xbf'+expected.encode()
+            source = expected
+            result['checks'].append('list-'+case['id']+': native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass')
 
     saved_before_reopen = fixture.read_bytes()
     old_helpers = helpers()
