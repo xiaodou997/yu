@@ -4,6 +4,8 @@
 
 测试文档总目录见 [mac-group4-test-index.md](mac-group4-test-index.md)。机器可读证据、逐组断言和截图哈希见 [audit-record.json](evidence/group4-freeze-20260926-rc3/audit-record.json)。没有修复或使用 GitHub CI，没有提前开发导出。
 
+> 后续收尾记录：`e4e2cf35`／`c747ea13`已修复分隔线坐标与跨条目拖选的真实缺陷，并补实窗回归，见[收尾第一轮](mac-group4-followup-01.md)。下文保持RC3原始结果；旧标签不移动，不能把其二进制哈希套用到后续构建。
+
 ## 1. 冻结身份
 
 | 项目 | 本轮实际值 |

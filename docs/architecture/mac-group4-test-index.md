@@ -2,13 +2,15 @@
 
 更新：2026-09-26。本页区分可直接在 Yu 打开的样本、验收说明和自动化入口；文档存在或输入生成不等于测试通过。当前冻结候选为标签 `group4-freeze-20260926-rc3`，源码 `6afb7a3dac785d2674236cff1fab65f3546fee39`；旧候选 `70b54992` 因表格公式未接入生产渲染而被拒绝，修复和重跑证据均保留。本轮执行结果见 [冻结构建与综合审计](mac-group4-freeze-audit.md)。
 
+最新增量入口：[收尾第一轮](mac-group4-followup-01.md)。产品修复已推进到 `c747ea13`，其打包身份与旧RC3分别记录，不移动历史标签。该轮新增真实整表正反选择／列宽、列表拖选／多光标、整文档联动及有限资源压力。
+
 ## 一、直接打开的测试文档
 
 以下链接均指向仓库固定语料，先复制再测试，不在仓库原件上编辑。
 
 | 文件 | 用途与预期 |
 | --- | --- |
-| [group4-smoke.md](../../platform/macos/yu-shell-macos/Fixtures/group4-smoke.md) | 第四组综合文档：公式、七类图表、脚注、目录、front matter、扩展文字、HTML 列表/合并表格/details 和图片。末尾两项故意出错，应显示诊断。复制时同时保留 `assets/yu-mark.png`。 |
+| [group4-smoke.md](../../platform/macos/yu-shell-macos/Fixtures/group4-smoke.md) | 第四组综合文档：公式、七类图表、脚注、目录、front matter、扩展文字、HTML 列表/合并表格/details 和图片。末尾两项故意出错，应显示诊断；`blockquote`不在当前有限HTML白名单中，保持源码回退，不算原生引用布局通过。复制时同时保留 `assets/yu-mark.png`。 |
 | [group4-sequence-central.md](../../platform/macos/yu-shell-macos/Fixtures/group4-sequence-central.md) | 第六批中心连接与生命周期：前三段有效，后两段预期诊断；检查圆、箭头、编号、创建/销毁及嵌套激活。 |
 | [group4-gantt-calendar.md](../../platform/macos/yu-shell-macos/Fixtures/group4-gantt-calendar.md) | 第七批日期时间与日历：前四段有效，后两段分别检查非法时刻和刻度超限；包含本地纯时间、跨年毫秒、12小时制、月份刻度。 |
 | [render-embedded.md](../../platform/macos/yu-shell-macos/Fixtures/render-embedded.md) | 原有最小公式和流程图冒烟文档，不覆盖近七批全部组合。 |
@@ -63,5 +65,7 @@ python3 tools/prepare-group4-paste-checks.py artifacts/group4-acceptance/paste-i
 | [run-self-checks.sh](../../platform/macos/yu-shell-macos/run-self-checks.sh) | 原生宿主/FFI自检；未带构建参数时使用既有包，先核对哈希。 |
 | [run-embedded-checks.py](../../platform/macos/yu-shell-macos/run-embedded-checks.py) | 隔离应用、真实外部输入、截图、保存重开和资源场景；新增 `--recent-diagrams`、`--promotion-suite`、`--ime`、`--list-inputs`。旗标和二进制哈希分别记录，截图生成不等于复核通过。 |
 | [run-writing-checks.py](../../platform/macos/yu-shell-macos/run-writing-checks.py) | 写作、图片及表格等相邻能力实窗回归。 |
+
+收尾新增入口仍在同一 `run-embedded-checks.py`：`--table-interactions`、`--table-resize`、`--list-gestures`、`--smoke-document`、`--stress-seconds 300`。除两个表格模式外各新专项互斥，可搭配 `--dark --reopen`。`tools/test_group4_followup.py`仅检查测试工具，不是产品验收。各项范围与证据见收尾记录。
 
 检查命令、实际受测哈希和逐项结果统一记录在本轮冻结审计，不把一个层级的通过替代另一个层级。
