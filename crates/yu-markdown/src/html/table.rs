@@ -62,6 +62,56 @@ pub enum HtmlTableError {
     EmptyTable,
     NestedTable,
     UnsupportedCellLayout,
+    /// One incoming owner would cross an existing target row-group boundary.
+    CrossRowGroupSpan,
+}
+
+impl HtmlTable {
+    /// Plan against the target's groups, not the clipboard's group names.
+    /// Growth appends only to the final group; it never moves a boundary to
+    /// make an otherwise illegal span fit. No source edits occur in this gate.
+    fn validate_paste_groups(
+        &self,
+        incoming: &Self,
+        start: (usize, usize),
+    ) -> Result<(), HtmlTableError> {
+        if start.0 >= self.rows.len() || start.1 >= self.columns {
+            return Err(HtmlTableError::InvalidStructure);
+        }
+        let end_row = start
+            .0
+            .checked_add(incoming.rows.len())
+            .ok_or(HtmlTableError::InvalidStructure)?;
+        let end_column = start
+            .1
+            .checked_add(incoming.columns)
+            .ok_or(HtmlTableError::InvalidStructure)?;
+        let rows = end_row.max(self.rows.len());
+        let columns = end_column.max(self.columns);
+        if rows
+            .checked_mul(columns)
+            .is_none_or(|slots| slots > 1_048_576)
+        {
+            return Err(HtmlTableError::InvalidStructure);
+        }
+        // Record the end of each contiguous target group in linear time.
+        // Direct rows separated by an explicit group are distinct runs too.
+        let mut ends = vec![rows; self.rows.len()];
+        let mut end = rows;
+        for row in (0..self.rows.len()).rev() {
+            if row + 1 < self.rows.len() && self.rows[row].group != self.rows[row + 1].group {
+                end = row + 1;
+            }
+            ends[row] = end;
+        }
+        for cell in &incoming.grid.cells {
+            let row = start.0 + cell.source_row;
+            if row + cell.rows > ends.get(row).copied().unwrap_or(rows) {
+                return Err(HtmlTableError::CrossRowGroupSpan);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl HtmlBlockModel {
@@ -296,6 +346,10 @@ impl HtmlBlockModel {
         {
             return Err(HtmlTableError::InvalidStructure);
         }
+        // Reject boundary conflicts before even preparing a split/grown copy.
+        // A multi-group rectangle is legal when each incoming owner fits.
+        self.native_table(owner)?
+            .validate_paste_groups(&incoming, start)?;
         let empty = vec![
             String::new();
             incoming
@@ -338,7 +392,7 @@ impl HtmlBlockModel {
                     .iter()
                     .any(|candidate| candidate.group != target.rows[start.0 + row].group)
                 {
-                    return Err(HtmlTableError::InvalidStructure);
+                    return Err(HtmlTableError::CrossRowGroupSpan);
                 }
                 let original = &incoming.rows[cell.source_row].cells[cell.source_cell];
                 let mut text = payload
@@ -388,6 +442,37 @@ impl HtmlBlockModel {
         )?;
         if result.columns != target.columns || result.rows.len() != target.rows.len() {
             return Err(HtmlTableError::InvalidStructure);
+        }
+        // Dimensions alone do not prove preservation: a syntactically valid
+        // result could still have clipped a span or collapsed a row boundary.
+        if target
+            .rows
+            .iter()
+            .zip(&result.rows)
+            .any(|(before, after)| before.section != after.section)
+            || target
+                .rows
+                .windows(2)
+                .zip(result.rows.windows(2))
+                .any(|(before, after)| {
+                    (before[0].group == before[1].group) != (after[0].group == after[1].group)
+                })
+        {
+            return Err(HtmlTableError::InvalidStructure);
+        }
+        for cell in &incoming.grid.cells {
+            let row = start.0 + cell.source_row;
+            let column = start.1 + cell.column;
+            let id = result.grid.slots[row * result.columns + column]
+                .ok_or(HtmlTableError::InvalidStructure)?;
+            let actual = result.grid.cells[id];
+            if actual.source_row != row
+                || actual.column != column
+                || actual.rows != cell.rows
+                || actual.columns != cell.columns
+            {
+                return Err(HtmlTableError::InvalidStructure);
+            }
         }
         Ok((range, prepared))
     }

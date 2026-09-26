@@ -9,7 +9,20 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates/yu-editor/tests/fixtures/group4-paste"
 HISTORY_A = " HISTORY-A-中文🙂"
 HISTORY_B = " HISTORY-B-中文🙂"
-NAMES = ("cross-groups", "math-target", "footnote-target", "merged-payload", "math-mixed-target", "footnote-mixed-target")
+NAMES = (
+    "cross-groups", "math-target", "footnote-target", "merged-payload",
+    "math-mixed-target", "footnote-mixed-target", "row-groups-target",
+    "row-groups-whole-target", "row-groups-merged-payload",
+    "row-groups-conflict-payload", "row-groups-rows-payload",
+)
+ROW_GROUP_PAYLOADS = {
+    "row-groups-head-body": "row-groups-merged-payload.md",
+    "row-groups-body-body": "row-groups-merged-payload.md",
+    "row-groups-body-foot": "row-groups-merged-payload.md",
+    "row-groups-span-conflict": "row-groups-conflict-payload.md",
+    "row-groups-whole-accept": "row-groups-rows-payload.md",
+    "row-groups-whole-reject": "merged-payload.md",
+}
 
 
 def digest(data: bytes) -> str:
@@ -49,6 +62,13 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
         ("math-mixed-target", text["math-mixed-target"], "accept"),
         ("math-invalid-target", text["math-target"].replace(
             "$x^2$", "<span data-math-style='inline'><em>x</em></span>", 1), "reject"),
+        ("row-groups-head-body", text["row-groups-target"], "accept"),
+        ("row-groups-body-body", text["row-groups-target"].replace("thead", "tbody"), "accept"),
+        ("row-groups-body-foot", text["row-groups-target"].replace("tbody", "tfoot")
+         .replace("thead", "tbody"), "accept"),
+        ("row-groups-span-conflict", text["row-groups-target"], "reject"),
+        ("row-groups-whole-accept", text["row-groups-whole-target"], "accept"),
+        ("row-groups-whole-reject", text["row-groups-whole-target"], "reject"),
     ]
     for _, source, _ in cases:
         for label in ("目标中文🙂", "矩形终点🙂"):
@@ -57,12 +77,14 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
 
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    (output / "merged-payload.md").write_bytes(text["merged-payload"].encode("utf-8"))
+    payload_names = {"merged-payload.md", *ROW_GROUP_PAYLOADS.values()}
+    for filename in sorted(payload_names):
+        (output / filename).write_bytes(text[Path(filename).stem].encode("utf-8"))
     (output / "legal-one-row-payload.md").write_bytes(
         "<table><tr><td colspan='2'>传入中文🙂</td></tr></table>\n".encode("utf-8")
     )
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "native_test_status": "not_run",
         "visual_review_required": True,
         "fixture_sha256": {name: digest(data) for name, data in raw.items()},
@@ -91,6 +113,9 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
                 manifest["cases"].append({
                     "id": case_id,
                     "expected_paste_result": expected,
+                    "payload": ROW_GROUP_PAYLOADS.get(name, "merged-payload.md"),
+                    "required_selection": "whole_table" if name.startswith("row-groups-whole-") else "target_or_rectangle",
+                    "preserve_target_row_groups": name in ROW_GROUP_PAYLOADS,
                     "expected_inline_math_tex": {
                         "math-target": ["x^2"],
                         "math-mixed-target": ["h", "x^2", "a+b", "z"],

@@ -166,11 +166,46 @@ impl EditorDocument {
             return self.markdown_table_source_plan(block, text, table.rows.len(), table.columns);
         }
         let target = self.html_table_grid(block).ok_or_else(invalid)?;
+        // HTML follows the same selection contract as Markdown promotion:
+        // arbitrary multicaret ranges are not inferred to be a rectangle.
+        if selection.is_multiple() && selection.table_columns().is_none() {
+            return Err(invalid());
+        }
+        if selection.as_slice().iter().any(|selected| {
+            let range = selected.ordered_range();
+            target
+                .visible_cell_for_source(range.start().get() as usize)
+                .and_then(|address| target.visible_cell(address))
+                .is_none_or(|cell| range.end().get() as usize > cell.end())
+        }) {
+            return Err(invalid());
+        }
+        let target_index = self.markdown.html_regions();
+        let target_model = target_index
+            .region_for(block.range())
+            .and_then(|r| r.model.as_ref().ok())
+            .ok_or_else(invalid)?;
+        let owner = target_index
+            .partition_for(block.range())
+            .and_then(|p| p.content.owner)
+            .ok_or_else(invalid)?;
+        // Selecting all cells does not select the row-group tags themselves.
+        // Keep even empty groups. Bare grids retain their existing whole-grid
+        // replacement behavior; grouped grids always use the overlay plan.
+        let grouped = target_model.fragment.nodes[owner]
+            .children
+            .iter()
+            .any(|&id| {
+                matches!(&target_model.fragment.nodes[id].kind,
+                HtmlNodeKind::Element { opening, .. }
+                    if matches!(opening.name.as_str(), "thead" | "tbody" | "tfoot"))
+            });
         let originals: Vec<_> = std::iter::once(target.first_row())
             .chain(target.rows().iter().map(Vec::as_slice))
             .flatten()
             .collect();
-        if originals.len() != selection.len()
+        if grouped
+            || originals.len() != selection.len()
             || !originals
                 .iter()
                 .zip(selection.as_slice())
@@ -188,15 +223,6 @@ impl EditorDocument {
             }) {
                 return Err(invalid());
             }
-            let target_index = self.markdown.html_regions();
-            let target_model = target_index
-                .region_for(block.range())
-                .and_then(|r| r.model.as_ref().ok())
-                .ok_or_else(invalid)?;
-            let owner = target_index
-                .partition_for(block.range())
-                .and_then(|p| p.content.owner)
-                .ok_or_else(invalid)?;
             let (range, pasted) = target_model
                 .paste_table_edit(
                     self.markdown.source().as_str(),
