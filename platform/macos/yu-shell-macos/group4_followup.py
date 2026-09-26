@@ -4,8 +4,28 @@ Used by run-embedded-checks.py so the isolated bundle, clipboard restoration,
 foreground safety, exact saved bytes and complete quit/reopen remain shared.
 """
 import json
+import re
+import shutil
+import subprocess
 from pathlib import Path
 import time
+
+
+def option_error(options):
+    """Reject conflicting follow-up modes before any file or desktop effects."""
+    seconds = options.get('stress_seconds', 0)
+    if seconds and not 30 <= seconds <= 1800:
+        return '--stress-seconds must be between 30 and 1800'
+    groups = [('table_interactions', 'table_resize'), ('smoke_document',), ('stress_seconds',), ('list_gestures',)]
+    active = [group for group in groups if any(options.get(key) for key in group)]
+    if not active:
+        return None  # Preserve existing independent suites.
+    if len(active) > 1:
+        return 'Choose one follow-up suite (table-interactions and table-resize may combine)'
+    allowed = {'output', 'dark', 'reopen', *active[0]}
+    if any(value for key, value in options.items() if key not in allowed):
+        return 'Follow-up suites combine only with --dark and --reopen'
+    return None
 
 
 def utf16(text):
@@ -178,3 +198,147 @@ class Checks:
             self.result['merged_column_resize']['reopened_relative_x'] = x
             self.record('merged column presentation width survives full application quit/reopen without source rewriting')
         return source, reopened
+
+    def smoke_document(self, root):
+        original = root/'platform/macos/yu-shell-macos/Fixtures/group4-smoke.md'
+        source = original.read_bytes().decode('utf-8').replace('\r\n','\n').replace('\n','\r\n')
+        assets = self.fixture.parent/'assets'
+        assets.mkdir(exist_ok=True)
+        shutil.copyfile(original.parent/'assets/yu-mark.png', assets/'yu-mark.png')
+        self.install(source)
+        marker = utf16(source[:source.index('[TOC]')])
+        # The fixed sample's short, unwrapped headings occupy one row each.
+        # Measure the generated block through its canonical marker, never OCR.
+        self.run('select',marker-2,0)
+        rect = self.bounds(marker,5)
+        headings = list(re.finditer(r'^#{1,6} (.+)\r?$',source,re.M))
+        self.result['smoke_toc_geometry'] = {'rect':rect,'headings':len(headings)}
+        self.capture('smoke-toc')
+        self.run('click',rect['x']+40,rect['y']+rect['height']/len(headings)*1.5,'cmd')
+        target = utf16(source[:headings[1].start(1)])
+        state = self.run('snapshot')
+        assert state['AXValue'] == source and state['AXSelectedTextRange']['location'] == target, (state['AXSelectedTextRange'],target,rect)
+        self.record('fixed smoke: real Command-click in generated TOC reaches canonical second heading without source edits')
+        self.capture('smoke-toc-jump')
+        # Native find brings a deeply off-screen summary into view, then the
+        # actual disclosure pointer must change only the opening details tag.
+        summary = '展开查看内容'
+        at = utf16(source[:source.index(summary)])
+        self.run('select',at,0)
+        rect = self.bounds(at,utf16(summary))
+        self.capture('smoke-details-closed')
+        self.run('click',rect['x']-10,rect['y']+rect['height']/2)
+        opened = source.replace('<details>','<details open>')
+        self.expect(opened); self.capture('smoke-details-open')
+        self.run('key',6,'cmd'); self.expect(source)
+        self.run('key',6,'cmd+shift'); self.expect(opened)
+        self.run('key',6,'cmd'); self.expect(source)
+        self.record('fixed smoke: actual disclosure click opens body; one undo/redo changes only the details open attribute')
+        self.run('key',3,'cmd'); self.run('paste-text','折叠容器的正文。'); self.run('key',36)
+        found = self.run('snapshot')
+        assert found['AXSelectedText'] == '折叠容器的正文。' and found['AXValue'] == source
+        self.run('key',53); self.capture('smoke-hidden-find')
+        self.run('paste-text','折叠正文已编辑🙂。')
+        changed = source.replace('折叠容器的正文。','折叠正文已编辑🙂。')
+        self.expect(changed); self.save(changed)
+        self.run('key',6,'cmd'); self.expect(source)
+        self.run('key',6,'cmd+shift'); self.expect(changed)
+        self.run('key',6,'cmd'); self.expect(source)
+        self.record('fixed smoke: real Find reveals closed body without rewriting source; body edit, exact history and save preserve all other content')
+        # Capture each heading viewport rather than infer off-screen geometry.
+        for i, heading in enumerate(headings):
+            self.run('select',utf16(source[:heading.start(1)]),0)
+            time.sleep(.35)
+            self.capture('smoke-section-{:02}'.format(i))
+        self.expect(source); self.save(source)
+        return source
+
+    def resource_stress(self, root, app_pid, helpers, duration):
+        probe = self.out/'process-footprint'
+        subprocess.run(['clang','-Wall','-Wextra','-Werror',str(root/'tools/process-footprint.c'),'-o',str(probe)],check=True)
+        def footprint(pid):
+            return json.loads(subprocess.check_output([str(probe),str(pid)],text=True))
+        started = time.monotonic()
+        samples, pids, rounds = [], set(), 0
+        stats = {'requested_seconds':duration,'rounds':0,'samples':samples,'metric':'RUSAGE_INFO_V4 physical footprint','scope':'single document; repeated valid/error/plain source, not multi-document or overnight stress'}
+        self.result['resource_stress'] = stats
+        while time.monotonic()-started < duration:
+            rounds += 1
+            valid = ('# Stress {}\r\n\r\n$x_{}^2$\r\n\r\n```mermaid\r\nflowchart LR\r\nA[轮次 {}] --> B[Done]\r\n```\r\n\r\nTAIL\r\n').format(rounds,rounds,rounds)
+            self.install(valid)
+            deadline = time.monotonic()+15
+            while not helpers():
+                assert time.monotonic() < deadline, 'No helper for current valid document'
+                time.sleep(.1)
+            live = helpers(); assert len(live) == 1, live; pids.update(live)
+            bad = valid.replace('flowchart LR','yuUnsupportedGraph')
+            self.install(bad)
+            self.run('key',6,'cmd'); self.expect(valid)
+            self.run('key',6,'cmd+shift'); self.expect(bad)
+            plain = '# Plain {}\r\n\r\n中文🙂\r\n'.format(rounds)
+            before_plain = set(helpers())
+            self.install(plain)
+            # A completed helper may legitimately remain until its idle timer.
+            # Plain text must not accumulate processes or start a new one.
+            self.expect(plain)
+            time.sleep(.15)
+            remaining = helpers()
+            assert len(remaining) <= 1 and set(remaining) <= before_plain, remaining
+            samples.append({'seconds':time.monotonic()-started,'round':rounds,'app':footprint(app_pid),'helpers_after_plain':len(remaining)})
+            stats['rounds'] = rounds
+            (self.out/'stress-progress.json').write_text(json.dumps(stats,indent=2)+'\n')
+        final = '# Stress restored\r\n\r\n$x^2$\r\n\r\nTAIL\r\n'
+        self.install(final); self.save(final); self.capture('stress-restored')
+        stats.update(elapsed_seconds=time.monotonic()-started,helper_pids=sorted(pids),min_app_bytes=min(s['app']['physical_footprint_bytes'] for s in samples),max_app_bytes=max(s['app']['physical_footprint_bytes'] for s in samples))
+        self.record('resource stress: {} completed valid/error/plain cycles in {:.1f}s; exact source/history, one helper while rendering and no new process for plain text; measured memory, no leak-proof claim'.format(rounds,stats['elapsed_seconds']))
+        return final
+
+    def list_gestures(self):
+        parent = "<li id='parent'>父项中文<ul><li>子项🙂</li><li>后子</li></ul></li>"
+        body = '<ul><li>前项</li>'+parent+'<li>尾项</li></ul>'
+        indented = '<ul><li>前项<ul>'+parent+'</ul></li><li>尾项</li></ul>'
+        for in_cell in (False, True):
+            for multicaret in (False, True):
+                def wrap(content):
+                    if in_cell:
+                        content = '<table><tr><td>'+content+'</td><td>NEIGHBOR</td></tr></table>'
+                    return '# List gestures\r\n\r\n'+content+'\r\n\r\n$x^2$\r\n\r\nTAIL'
+                base = wrap(body)
+                self.install(base)
+                self.run('select',utf16(base),0); self.run('paste-text',' HISTORY-A')
+                before = base+' HISTORY-A'
+                self.run('select',0,0)
+                # A whole parent label's AX range may span a hidden boundary
+                # and two visual rows. Hit a single visible CJK glyph instead
+                # of the empty midpoint of that multi-line rectangle.
+                def glyph(label):
+                    return center(self.bounds(utf16(before[:before.index(label)]),1))
+                child = glyph('子项🙂'); parent_point = glyph('父项中文')
+                self.capture('list-before-{}-{}'.format(in_cell,multicaret))
+                if multicaret:
+                    self.run('click',*parent_point)
+                    child = glyph('子项🙂')
+                    self.run('click',*child,'alt')
+                else:
+                    self.run('click',*child)
+                    self.capture('list-child-active-{}'.format(in_cell))
+                    child = glyph('子项🙂'); parent_point = glyph('父项中文')
+                    self.run('drag',*child,*parent_point)
+                selected = self.run('snapshot')['AXSelectedTextRanges']
+                self.capture('list-selection-{}-{}'.format(in_cell,multicaret))
+                self.expect(before)
+                if multicaret:
+                    assert len(selected) == 2 and all(s['length'] == 0 for s in selected), selected
+                else:
+                    assert len(selected) == 1 and selected[0]['length'] > 0, selected
+                self.run('key',30,'cmd')
+                expected = wrap(indented)+' HISTORY-A'
+                self.expect(expected)
+                self.run('key',6,'cmd'); self.expect(before)
+                assert self.run('snapshot')['AXSelectedTextRanges'] == selected
+                self.run('key',6,'cmd+shift'); self.expect(expected)
+                self.run('select',0,0); self.save(expected)
+                name = 'list-{}-{}'.format('cell' if in_cell else 'standalone','multi' if multicaret else 'reverse')
+                self.capture(name)
+                self.record(name+': actual pointer range or two Option-click carets move parent subtree once; exact undo/ranges, redo, neighbor and saved bytes')
+        return expected
