@@ -8075,6 +8075,23 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 retained_presentation_viewport.is_some()
             );
         }
+        if std::env::var_os("YU_RESOURCE_AUDIT").is_some() {
+            // Opt-in read-only counters: no source text, no history reset, and
+            // logical RGBA bytes are not advertised as process/driver memory.
+            let history = session.session.document().editor().history_stats();
+            eprintln!(
+                "yu-resource-audit {{\"revision\":{},\"source_bytes\":{},\"undo_entries\":{},\"redo_entries\":{},\"embedded_cache_entries\":{},\"embedded_failures\":{},\"embedded_gpu_textures\":{},\"embedded_gpu_rgba_bytes\":{},\"gpu_evictions\":{}}}",
+                expected_revision,
+                session.session.snapshot().as_str().len(),
+                history.undo_entries(),
+                history.redo_entries(),
+                session.macos_embedded_resources.cache.len(),
+                session.macos_embedded_resources.cache.failure_count(),
+                surface_state.image_atlas.embedded_resource_count(),
+                surface_state.image_atlas.embedded_texture_bytes(),
+                surface_state.image_atlas.eviction_count(),
+            );
+        }
         // SAFETY: `snapshot` is a caller-owned output pointer checked above.
         unsafe {
             *snapshot = YuStorageMacosRenderHostSurfaceSnapshot {

@@ -20,6 +20,7 @@ ROOT = HERE.parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
+parser.add_argument('--resource-audit', action='store_true', help='Read-only per-frame CPU cache/history/GPU residency counters')
 parser.add_argument('--list-gestures', action='store_true', help='Actual reverse mouse range and parent/child Option-click multicursors')
 parser.add_argument('--smoke-document', action='store_true', help='Fixed combined document TOC/disclosure/find/save interaction without OCR')
 parser.add_argument('--stress-seconds', type=int, default=0, help='Bounded real-window resource churn, 30..1800 seconds; not a leak proof')
@@ -138,10 +139,13 @@ if args.html_lists:
 fixture.write_bytes(b'\xef\xbb\xbf'+initial.encode())
 env = {k:v for k,v in os.environ.items() if not k.startswith('YU_')}
 env.update(YU_DOCUMENT_STATE_DIR=str(out/'state'), YU_PRESENTATION_STATE_DIR=str(out/'columns'), YU_NATIVE_INPUT_TRACE='1')
+if args.resource_audit:
+    env['YU_RESOURCE_AUDIT'] = '1'
 command = [str(app/'Contents/MacOS/Yu'), str(fixture)] + (['--dark-mode'] if args.dark else [])
 log = (out/'app.log').open('w')
 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
 result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required':True,
+          'resource_audit':args.resource_audit,
           'isolated_bundle':identifier,
           'recent_diagrams':args.recent_diagrams,
           'promotion_suite':args.promotion_suite,

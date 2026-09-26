@@ -1516,18 +1516,61 @@ impl MetalImageAtlas {
         Ok(true)
     }
 
-    /// Synchronizes all first-seen embedded uploads from one render plan.
+    /// Reconciles textures against the complete current plan, not its upload
+    /// delta. Stage every missing texture before eviction so an invalid SVG
+    /// leaves the previous atlas usable. A retained plan carries enough SVG
+    /// data to recover after eviction, device recreation or an unsubmitted plan.
     pub fn sync_embedded_plan(
         &mut self,
         uploader: &mut MetalUploader,
         plan: &RenderPlan,
     ) -> Result<usize, MetalRenderError> {
-        let mut uploaded = 0_usize;
-        for upload in plan.embedded_uploads() {
-            if self.sync_embedded_svg(uploader, upload)? {
-                uploaded = uploaded.saturating_add(1);
-            }
+        let device = uploader.device().registry_id();
+        if self
+            .device_registry_id
+            .is_some_and(|existing| existing != device)
+        {
+            return Err(MetalRenderError::DeviceMismatch);
         }
+        let required: BTreeMap<_, _> = plan
+            .embedded_resources()
+            .iter()
+            .map(|upload| ((upload.resource(), u32::from(upload.kind())), upload))
+            .collect();
+        let mut staged = Vec::new();
+        for (&resource, upload) in &required {
+            let identity = ImageTextureIdentity {
+                width: upload.width(),
+                height: upload.height(),
+                generation: upload.generation(),
+            };
+            if self.embedded_identities.get(&resource) == Some(&identity)
+                && self.embedded_images.contains_key(&resource)
+            {
+                continue;
+            }
+            let image = MacosEmbeddedSvgRasterizer::new()
+                .rasterize_upload(upload)
+                .map_err(|_| {
+                    MetalRenderError::NativeFailure("embedded SVG rasterization failed")
+                })?;
+            staged.push((resource, identity, uploader.upload_rgba_image(&image)?));
+        }
+        let uploaded = staged.len();
+        for (resource, identity, texture) in staged {
+            self.embedded_images.insert(resource, texture);
+            self.embedded_identities.insert(resource, identity);
+        }
+        let before = self.embedded_images.len();
+        self.embedded_images
+            .retain(|key, _| required.contains_key(key));
+        self.embedded_identities
+            .retain(|key, _| required.contains_key(key));
+        self.evictions = self
+            .evictions
+            .saturating_add(u64::try_from(before - self.embedded_images.len()).unwrap_or(u64::MAX));
+        self.device_registry_id =
+            (!self.images.is_empty() || !self.embedded_images.is_empty()).then_some(device);
         Ok(uploaded)
     }
 
@@ -1539,6 +1582,15 @@ impl MetalImageAtlas {
     #[must_use]
     pub fn embedded_resource_count(&self) -> usize {
         self.embedded_images.len()
+    }
+
+    /// Logical RGBA texel bytes, not Metal allocation or process footprint.
+    #[must_use]
+    pub fn embedded_texture_bytes(&self) -> u64 {
+        self.embedded_images
+            .values()
+            .map(|texture| u64::from(texture.width()) * u64::from(texture.height()) * 4)
+            .sum()
     }
 
     #[must_use]

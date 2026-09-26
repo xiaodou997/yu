@@ -185,6 +185,9 @@ pub struct RenderPlan {
     damage: Vec<Rect>,
     uploads: Vec<AtlasPageUpload>,
     embedded_uploads: Vec<EmbeddedSvgUpload>,
+    // Complete, shared-Arc recovery data for the current plan. Delta uploads
+    // alone cannot reconstruct an evicted texture or a retained frame.
+    embedded_resources: Vec<EmbeddedSvgUpload>,
     commands: Vec<RenderCommand>,
 }
 
@@ -217,6 +220,14 @@ impl RenderPlan {
     #[must_use]
     pub fn embedded_uploads(&self) -> &[EmbeddedSvgUpload] {
         &self.embedded_uploads
+    }
+
+    /// All SVG resources needed by this plan, including unchanged resources.
+    /// Backends reconcile residency against these identities before drawing;
+    /// a missing texture can be recovered without editing or re-rendering TeX.
+    #[must_use]
+    pub fn embedded_resources(&self) -> &[EmbeddedSvgUpload] {
+        &self.embedded_resources
     }
 
     #[must_use]
@@ -356,6 +367,8 @@ impl RenderPlanBuilder {
     ) -> Result<RenderPlan, RenderError> {
         let mut uploads = Vec::new();
         let mut embedded_uploads = Vec::new();
+        let mut embedded_resources = Vec::new();
+        let mut required_embedded = HashSet::new();
         let mut commands = Vec::with_capacity(scene.primitives().len());
         let mut next_pages = self.uploaded_pages.clone();
         let mut next_embedded = self.uploaded_embedded.clone();
@@ -481,18 +494,21 @@ impl RenderPlanBuilder {
                     let width = (svg.bounds().width() * scale).ceil().clamp(1.0, maximum) as u32;
                     let height = (svg.bounds().height() * scale).ceil().clamp(1.0, maximum) as u32;
                     let identity = (publication.key().fingerprint(), width, height);
+                    let resource = EmbeddedSvgUpload {
+                        resource: svg.resource(),
+                        generation: svg.generation(),
+                        kind: svg.kind(),
+                        source: svg.source(),
+                        width,
+                        height,
+                        markup: Arc::clone(markup),
+                    };
                     if next_embedded.get(&upload_key).copied() != Some(identity) {
-                        embedded_uploads.push(EmbeddedSvgUpload {
-                            resource: svg.resource(),
-                            generation: svg.generation(),
-                            kind: svg.kind(),
-                            source: svg.source(),
-                            width,
-                            height,
-                            markup: Arc::clone(markup),
-                        });
+                        embedded_uploads.push(resource.clone());
                         next_embedded.insert(upload_key, identity);
                     }
+                    embedded_resources.push(resource);
+                    required_embedded.insert(upload_key);
                     commands.push(RenderCommand::EmbeddedSvg {
                         resource: svg.resource(),
                         generation: svg.generation(),
@@ -537,6 +553,9 @@ impl RenderPlanBuilder {
             }
         }
 
+        // Only commit residency metadata after every primitive validates.
+        // Historical generations must not grow with document edit history.
+        next_embedded.retain(|key, _| required_embedded.contains(key));
         self.uploaded_pages = next_pages;
         self.uploaded_embedded = next_embedded;
         Ok(RenderPlan {
@@ -546,6 +565,7 @@ impl RenderPlanBuilder {
             damage: scene.damage().rects().to_vec(),
             uploads,
             embedded_uploads,
+            embedded_resources,
             commands,
         })
     }

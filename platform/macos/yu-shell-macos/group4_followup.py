@@ -22,10 +22,22 @@ def option_error(options):
         return None  # Preserve existing independent suites.
     if len(active) > 1:
         return 'Choose one follow-up suite (table-interactions and table-resize may combine)'
-    allowed = {'output', 'dark', 'reopen', *active[0]}
+    allowed = {'output', 'dark', 'reopen', 'resource_audit', *active[0]}
     if any(value for key, value in options.items() if key not in allowed):
         return 'Follow-up suites combine only with --dark and --reopen'
     return None
+
+
+def resource_records(text):
+    """Ignore other log lines and a trailing incomplete write, not bad counters."""
+    records = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith('yu-resource-audit ') and line.endswith('\n'):
+            record = json.loads(line[len('yu-resource-audit '):])
+            if not isinstance(record, dict):
+                raise ValueError('Resource audit record must be an object')
+            records.append(record)
+    return records
 
 
 def utf16(text):
@@ -45,7 +57,17 @@ class Checks:
         return self.run('snapshot')['AXValue']
 
     def expect(self, text):
+        # Native menu/clipboard dispatch can settle after the input driver
+        # returns. Observe only; never resend a mutation or relax exact bytes.
+        deadline = time.monotonic()+3
         actual = self.text()
+        polls = 0
+        while actual != text and time.monotonic() < deadline:
+            time.sleep(.05)
+            polls += 1
+            actual = self.text()
+        if polls:
+            self.result.setdefault('source_observation_waits', []).append(polls)
         if actual != text:
             (self.out/'mismatch-expected.txt').write_bytes(text.encode())
             (self.out/'mismatch-actual.txt').write_bytes(actual.encode())
@@ -262,6 +284,20 @@ class Checks:
         samples, pids, rounds = [], set(), 0
         stats = {'requested_seconds':duration,'rounds':0,'samples':samples,'metric':'RUSAGE_INFO_V4 physical footprint','scope':'single document; repeated valid/error/plain source, not multi-document or overnight stress'}
         self.result['resource_stress'] = stats
+        audit = self.result.get('resource_audit', False)
+        def plain_residency(plain, after_revision):
+            deadline = time.monotonic()+10
+            while time.monotonic() < deadline:
+                records = resource_records((self.out/'app.log').read_text())
+                if records:
+                    record = records[-1]
+                    if record['revision'] > after_revision and record['source_bytes'] == len(plain.encode()):
+                        assert record['embedded_gpu_textures'] == 0, record
+                        assert record['embedded_gpu_rgba_bytes'] == 0, record
+                        return record
+                time.sleep(.1)
+            raise AssertionError('Current plain frame did not publish resource counters')
+
         while time.monotonic()-started < duration:
             rounds += 1
             valid = ('# Stress {}\r\n\r\n$x_{}^2$\r\n\r\n```mermaid\r\nflowchart LR\r\nA[轮次 {}] --> B[Done]\r\n```\r\n\r\nTAIL\r\n').format(rounds,rounds,rounds)
@@ -277,6 +313,8 @@ class Checks:
             self.run('key',6,'cmd+shift'); self.expect(bad)
             plain = '# Plain {}\r\n\r\n中文🙂\r\n'.format(rounds)
             before_plain = set(helpers())
+            records_before = resource_records((self.out/'app.log').read_text()) if audit else []
+            revision_before = records_before[-1]['revision'] if records_before else -1
             self.install(plain)
             # A completed helper may legitimately remain until its idle timer.
             # Plain text must not accumulate processes or start a new one.
@@ -285,6 +323,8 @@ class Checks:
             remaining = helpers()
             assert len(remaining) <= 1 and set(remaining) <= before_plain, remaining
             samples.append({'seconds':time.monotonic()-started,'round':rounds,'app':footprint(app_pid),'helpers_after_plain':len(remaining)})
+            if audit:
+                samples[-1]['residency'] = plain_residency(plain, revision_before)
             stats['rounds'] = rounds
             (self.out/'stress-progress.json').write_text(json.dumps(stats,indent=2)+'\n')
         final = '# Stress restored\r\n\r\n$x^2$\r\n\r\nTAIL\r\n'

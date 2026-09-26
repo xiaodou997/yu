@@ -39,6 +39,30 @@ class FollowupHarnessTests(unittest.TestCase):
         for seconds in [0, 30, 300, 1800]:
             self.assertIsNone(followup.option_error({'stress_seconds': seconds}))
 
+    def test_resource_audit_is_read_only_and_composes_with_stress(self):
+        self.assertIsNone(followup.option_error({'stress_seconds': 300, 'resource_audit': True, 'reopen': True}))
+        self.assertIsNotNone(followup.option_error({'stress_seconds': 300, 'resource_audit': True, 'smoke_document': True}))
+
+    def test_resource_counter_parser_preserves_complete_records(self):
+        text = 'unrelated diagnostic\nyu-resource-audit {"revision":1,"embedded_gpu_textures":0}\nyu-resource-audit {"revision":2'
+        self.assertEqual(followup.resource_records(text), [{'revision': 1, 'embedded_gpu_textures': 0}])
+
+    def test_resource_counter_parser_never_hides_corrupt_completed_records(self):
+        for text in ['yu-resource-audit broken\n', 'yu-resource-audit []\n']:
+            with self.assertRaises(ValueError):
+                followup.resource_records(text)
+
+    def test_source_wait_observes_without_resending_input(self):
+        values = iter(['before', 'after'])
+        calls = []
+        def run(*args):
+            calls.append(args)
+            return {'AXValue': next(values)}
+        result = {}
+        followup.Checks(run, None, None, None, result).expect('after')
+        self.assertEqual(calls, [('snapshot',), ('snapshot',)])
+        self.assertEqual(result['source_observation_waits'], [1])
+
     def test_pure_validation_does_not_touch_output(self):
         target = Path('this-path-is-never-created-by-option-validation')
         existed = target.exists()
