@@ -491,16 +491,8 @@ fn collect_declared_participants(lines: &[&str]) -> Vec<String> {
 ///
 /// Matches the common arrow shapes: `->`, `-->`, `->>`, `-x`,
 /// `--x`, `-)`, `--)`. Message text after a `:` is stripped.
-fn split_sequence_arrow(trimmed: &str) -> Option<(&str, &str)> {
-    // Strip any trailing `: message` payload.
-    let before_colon = trimmed.split_once(':').map_or(trimmed, |(a, _)| a);
-    // Longer patterns first so `-->` wins over `->`.
-    for pat in crate::parser::SEQUENCE_ARROWS {
-        if let Some((lhs, rhs)) = before_colon.split_once(pat) {
-            return Some((lhs, rhs.trim_start().trim_start_matches(['+', '-'])));
-        }
-    }
-    None
+fn split_sequence_arrow(trimmed: &str) -> Option<(String, String)> {
+    crate::parser::sequence_message_participants(trimmed)
 }
 
 /// Return up to three declared names whose lowercase form shares

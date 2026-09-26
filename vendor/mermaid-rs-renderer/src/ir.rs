@@ -70,6 +70,18 @@ pub struct SequenceActivation {
     pub participant: String,
     pub index: usize,
     pub kind: SequenceActivationKind,
+    /// Inline +/- belongs to this message; a directive belongs before index.
+    pub at_message: bool,
+    /// Notes already seen at a standalone directive's source position.
+    pub notes_before: usize,
+}
+
+/// Independent endpoint markers, expressed after message direction normalization.
+/// A central connection never starts or ends an activation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SequenceConnection {
+    pub from: bool,
+    pub to: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +131,13 @@ pub struct GanttTodayMarker {
     pub opacity: f32,
 }
 impl Default for GanttTodayMarker {
-    fn default() -> Self { Self { stroke: "#e05252".into(), width: 2.0, opacity: 1.0 } }
+    fn default() -> Self {
+        Self {
+            stroke: "#e05252".into(),
+            width: 2.0,
+            opacity: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,16 +150,29 @@ pub struct GanttCalendar {
 }
 impl Default for GanttCalendar {
     fn default() -> Self {
-        Self { weekends: false, weekend_start: 6, weekdays: [false; 7], excluded: Default::default(), included: Default::default() }
+        Self {
+            weekends: false,
+            weekend_start: 6,
+            weekdays: [false; 7],
+            excluded: Default::default(),
+            included: Default::default(),
+        }
     }
 }
 impl GanttCalendar {
-    pub fn is_active(&self) -> bool { self.weekends || self.weekdays.iter().any(|v| *v) || !self.excluded.is_empty() }
+    pub fn is_active(&self) -> bool {
+        self.weekends || self.weekdays.iter().any(|v| *v) || !self.excluded.is_empty()
+    }
     pub fn is_excluded(&self, day: i32) -> bool {
-        if self.included.contains(&day) { return false; }
+        if self.included.contains(&day) {
+            return false;
+        }
         let weekday = (day + 4).rem_euclid(7) as usize;
-        self.excluded.contains(&day) || self.weekdays[weekday] || (self.weekends &&
-            (weekday == usize::from(self.weekend_start) || weekday == usize::from((self.weekend_start + 1) % 7)))
+        self.excluded.contains(&day)
+            || self.weekdays[weekday]
+            || (self.weekends
+                && (weekday == usize::from(self.weekend_start)
+                    || weekday == usize::from((self.weekend_start + 1) % 7)))
     }
 }
 
@@ -480,6 +511,7 @@ pub struct Graph {
     pub sequence_notes: Vec<SequenceNote>,
     pub sequence_activations: Vec<SequenceActivation>,
     pub sequence_message_numbers: Vec<Option<SequenceNumber>>,
+    pub sequence_connections: HashMap<usize, SequenceConnection>,
     pub sequence_boxes: Vec<SequenceBox>,
     pub state_notes: Vec<StateNote>,
     pub pie_slices: Vec<PieSlice>,
@@ -642,6 +674,7 @@ impl Graph {
             sequence_notes: Vec::new(),
             sequence_activations: Vec::new(),
             sequence_message_numbers: Vec::new(),
+            sequence_connections: HashMap::new(),
             sequence_boxes: Vec::new(),
             state_notes: Vec::new(),
             pie_slices: Vec::new(),

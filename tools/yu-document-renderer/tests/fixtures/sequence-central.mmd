@@ -1,0 +1,20 @@
+sequenceDiagram
+autonumber 1.25 0.25
+actor User as 中文使用者🙂
+participant Server as 服务端
+User->>()Server: 接收端中心连接
+activate Server
+Server()->>User: 发送端中心连接
+Server()->>()Server: 双端自调用
+loop 工作
+    create actor Worker as 临时工作者
+    Server()->>()Worker: 创建
+    activate Worker
+    Worker()->>()Worker: 处理
+    deactivate Worker
+    destroy Worker
+    Worker()-->>Server: 销毁工作者
+end
+deactivate Server
+Server-->>User: 完成
+User()->>()User: 继续编辑

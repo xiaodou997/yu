@@ -185,8 +185,13 @@ pub(super) fn compute_sequence_layout(
         label_blocks.insert(id.clone(), label);
     }
 
-    let actor_height = if graph.nodes.values().any(|node| node.shape == crate::ir::NodeShape::Actor) {
-        (max_label_height + theme.font_size * 4.0 + geometry.actor_pad_y).max(geometry.actor_min_height)
+    let actor_height = if graph
+        .nodes
+        .values()
+        .any(|node| node.shape == crate::ir::NodeShape::Actor)
+    {
+        (max_label_height + theme.font_size * 4.0 + geometry.actor_pad_y)
+            .max(geometry.actor_min_height)
     } else {
         (max_label_height + geometry.actor_pad_y * 2.0).max(geometry.actor_min_height)
     };
@@ -328,11 +333,18 @@ pub(super) fn compute_sequence_layout(
             }
         }
         if idx < graph.edges.len() {
-            let creation = graph.sequence_created.values().any(|created| *created == idx);
+            let creation = graph
+                .sequence_created
+                .values()
+                .any(|created| *created == idx);
             message_cursor += extra_before[idx] + message_row_spacing[idx];
-            if creation { message_cursor += actor_height / 2.0; }
+            if creation {
+                message_cursor += actor_height / 2.0;
+            }
             message_ys.push(message_cursor);
-            if creation { message_cursor += actor_height / 2.0; }
+            if creation {
+                message_cursor += actor_height / 2.0;
+            }
         }
     }
 
@@ -366,10 +378,20 @@ pub(super) fn compute_sequence_layout(
         } else {
             vec![
                 (sequence_lane_center(from), y),
-                (if graph.sequence_created.get(&edge.to) == Some(&idx) {
-                    if to.shape == crate::ir::NodeShape::Actor { sequence_lane_center(to) }
-                    else if sequence_lane_center(from) < sequence_lane_center(to) { to.x } else { to.x + to.width }
-                } else { sequence_lane_center(to) }, y),
+                (
+                    if graph.sequence_created.get(&edge.to) == Some(&idx) {
+                        if to.shape == crate::ir::NodeShape::Actor {
+                            sequence_lane_center(to)
+                        } else if sequence_lane_center(from) < sequence_lane_center(to) {
+                            to.x
+                        } else {
+                            to.x + to.width
+                        }
+                    } else {
+                        sequence_lane_center(to)
+                    },
+                    y,
+                ),
             ]
         };
 
@@ -581,7 +603,9 @@ pub(super) fn compute_sequence_layout(
     for note in &sequence_notes {
         last_message_y = last_message_y.max(note.y + note.height);
     }
-    for node in nodes.values() { last_message_y = last_message_y.max(node.y + node.height); }
+    for node in nodes.values() {
+        last_message_y = last_message_y.max(node.y + node.height);
+    }
     let lifeline_end = last_message_y + geometry.footbox_gap;
     let lifelines = participants
         .iter()
@@ -590,8 +614,17 @@ pub(super) fn compute_sequence_layout(
             id: node.id.clone(),
             x: sequence_lane_center(node),
             y1: node.y + node.height,
-            y2: graph.sequence_destroyed.get(&node.id).and_then(|index| edges.get(*index))
-                .and_then(|edge| if edge.to == node.id { edge.points.last() } else { edge.points.first() })
+            y2: graph
+                .sequence_destroyed
+                .get(&node.id)
+                .and_then(|index| edges.get(*index))
+                .and_then(|edge| {
+                    if edge.to == node.id {
+                        edge.points.last()
+                    } else {
+                        edge.points.first()
+                    }
+                })
                 .map_or(lifeline_end, |point| point.1),
             destroyed: graph.sequence_destroyed.contains_key(&node.id),
         })
@@ -648,11 +681,7 @@ pub(super) fn compute_sequence_layout(
 
     let activation_width = (theme.font_size * 0.625).max(10.0);
     let activation_offset = (activation_width * 0.6).max(4.0);
-    let activation_end_default = message_ys
-        .last()
-        .copied()
-        .unwrap_or(lifeline_start + base_spacing * 0.5)
-        + base_spacing * 0.6;
+    let activation_end_default = lifeline_end;
     let mut sequence_activations = Vec::new();
     let mut activation_stacks: HashMap<String, Vec<(f32, usize)>> = HashMap::new();
     let mut events = graph
@@ -663,15 +692,38 @@ pub(super) fn compute_sequence_layout(
         .map(|(order, event)| (event.index, order, event))
         .collect::<Vec<_>>();
     events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let activation_y_for = |idx: usize| {
-        if idx < message_ys.len() {
-            message_ys[idx]
+    let activation_y_for = |event: &crate::ir::SequenceActivation| {
+        if event.at_message {
+            edges
+                .get(event.index)
+                .and_then(|edge| {
+                    // Self calls complete at their return segment, not the send row.
+                    if event.kind == crate::ir::SequenceActivationKind::Activate
+                        || edge.from == edge.to
+                    {
+                        edge.points.last()
+                    } else {
+                        edge.points.first()
+                    }
+                })
+                .map_or(lifeline_start, |point| point.1)
         } else {
-            activation_end_default
+            let previous = event
+                .index
+                .checked_sub(1)
+                .and_then(|idx| edges.get(idx))
+                .and_then(|edge| edge.points.last())
+                .map_or(lifeline_start, |point| point.1);
+            // A directive after a note must not be pulled up before that note.
+            sequence_notes
+                .iter()
+                .take(event.notes_before)
+                .map(|note| note.y + note.height)
+                .fold(previous, f32::max)
         }
     };
     for (_, _, event) in events {
-        let y = activation_y_for(event.index);
+        let y = activation_y_for(&event);
         let stack = activation_stacks
             .entry(event.participant.clone())
             .or_default();
@@ -687,10 +739,8 @@ pub(super) fn compute_sequence_layout(
                     let base_x = sequence_lane_center(node) - activation_width / 2.0;
                     let x = base_x + depth as f32 * activation_offset;
                     let mut y0 = start_y.min(y);
-                    let mut height = (y - start_y).abs();
-                    if height < base_spacing * 0.6 {
-                        height = base_spacing * 0.6;
-                    }
+                    let height = (y - start_y).max(0.0);
+                    // Never extend a completed activation past its end event.
                     if y0 < lifeline_start {
                         y0 = lifeline_start;
                     }
@@ -712,10 +762,8 @@ pub(super) fn compute_sequence_layout(
                 let base_x = sequence_lane_center(node) - activation_width / 2.0;
                 let x = base_x + depth as f32 * activation_offset;
                 let mut y0 = start_y.min(activation_end_default);
-                let mut height = (activation_end_default - start_y).abs();
-                if height < base_spacing * 0.6 {
-                    height = base_spacing * 0.6;
-                }
+                let height = (activation_end_default - start_y).max(0.0);
+                // An unclosed activation reaches the visible lifetime end.
                 if y0 < lifeline_start {
                     y0 = lifeline_start;
                 }
@@ -732,13 +780,56 @@ pub(super) fn compute_sequence_layout(
     }
 
     sequence_activations.retain_mut(|activation| {
-        if let Some(life) = lifelines.iter().find(|life| life.id == activation.participant) {
+        if let Some(life) = lifelines
+            .iter()
+            .find(|life| life.id == activation.participant)
+        {
             let bottom = (activation.y + activation.height).min(life.y2);
             activation.y = activation.y.max(life.y1);
             activation.height = bottom - activation.y;
         }
         activation.height > 0.0
     });
+
+    // Circles are endpoint metadata, not replacement arrowheads. Save their
+    // centers before trimming the line by the radius. Self calls have two
+    // distinct Y endpoints. Creation retains the existing header attachment.
+    let mut sequence_connections = Vec::new();
+    let connection_radius = (theme.font_size * 0.3125).max(5.0);
+    for (idx, edge) in edges.iter_mut().enumerate() {
+        let Some(connection) = graph.sequence_connections.get(&idx) else {
+            continue;
+        };
+        let last = edge.points.len() - 1;
+        for (at_start, enabled) in [(true, connection.from), (false, connection.to)] {
+            if !enabled {
+                continue;
+            }
+            let end = if at_start { 0 } else { last };
+            let neighbor = if at_start { 1 } else { last - 1 };
+            let (x, y) = edge.points[end];
+            let (dx, dy) = (edge.points[neighbor].0 - x, edge.points[neighbor].1 - y);
+            let length = dx.hypot(dy);
+            sequence_connections.push(SequenceConnectionLayout {
+                message: idx,
+                participant: if at_start {
+                    edge.from.clone()
+                } else {
+                    edge.to.clone()
+                },
+                at_start,
+                x,
+                y,
+                radius: connection_radius,
+            });
+            if length > connection_radius * 2.0 {
+                edge.points[end] = (
+                    x + dx / length * connection_radius,
+                    y + dy / length * connection_radius,
+                );
+            }
+        }
+    }
 
     let mut sequence_numbers = Vec::new();
     for (idx, edge) in graph.edges.iter().enumerate() {
@@ -752,7 +843,14 @@ pub(super) fn compute_sequence_layout(
                 let label = measure_label(&value.to_string(), theme, config);
                 let height = (label.height + 4.0).max(12.0);
                 let width = (label.width + 8.0).max(height);
-                let offset = (width * 0.5 + 4.0) * if to_x >= from_x { 1.0 } else { -1.0 };
+                let marker_clearance =
+                    if graph.sequence_connections.get(&idx).is_some_and(|c| c.from) {
+                        connection_radius
+                    } else {
+                        0.0
+                    };
+                let offset = (width * 0.5 + marker_clearance + 4.0)
+                    * if to_x >= from_x { 1.0 } else { -1.0 };
                 let number_y = y - (theme.font_size * 0.85).max(10.0);
                 sequence_numbers.push(SequenceNumberLayout {
                     x: from_x + offset,
@@ -781,6 +879,7 @@ pub(super) fn compute_sequence_layout(
             notes: sequence_notes,
             activations: sequence_activations,
             numbers: sequence_numbers,
+            connections: sequence_connections,
         }),
     };
     finalize_sequence_layout_bounds(&mut layout);
@@ -806,6 +905,7 @@ pub(super) fn resolve_sequence_label_positions(layout: &mut Layout, theme: &Them
         &seq.notes,
         &seq.activations,
         &seq.numbers,
+        &seq.connections,
         theme,
     );
 }
@@ -819,6 +919,7 @@ fn place_sequence_label_anchors(
     notes: &[SequenceNoteLayout],
     activations: &[SequenceActivationLayout],
     numbers: &[SequenceNumberLayout],
+    connections: &[SequenceConnectionLayout],
     theme: &Theme,
 ) {
     if edges.is_empty() {
@@ -826,6 +927,15 @@ fn place_sequence_label_anchors(
     }
 
     let mut occupied: Vec<Rect> = Vec::new();
+    for circle in connections {
+        let radius = circle.radius + 2.0;
+        occupied.push((
+            circle.x - radius,
+            circle.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        ));
+    }
     for node in nodes.values() {
         occupied.push((node.x, node.y, node.width, node.height));
     }
@@ -1532,6 +1642,19 @@ pub(super) fn finalize_sequence_layout_bounds(layout: &mut Layout) {
             activation.height,
         );
     }
+    for circle in &seq.connections {
+        let radius = circle.radius + 1.0;
+        extend_bounds(
+            &mut min_x,
+            &mut min_y,
+            &mut max_x,
+            &mut max_y,
+            circle.x - radius,
+            circle.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        );
+    }
     for number in &seq.numbers {
         extend_bounds(
             &mut min_x,
@@ -1652,6 +1775,10 @@ pub(super) fn finalize_sequence_layout_bounds(layout: &mut Layout) {
         for activation in &mut seq.activations {
             activation.x += shift_x;
             activation.y += shift_y;
+        }
+        for circle in &mut seq.connections {
+            circle.x += shift_x;
+            circle.y += shift_y;
         }
         for number in &mut seq.numbers {
             number.x += shift_x;

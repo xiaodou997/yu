@@ -118,7 +118,10 @@ pub fn parse_mermaid(input: &str) -> Result<ParseOutput> {
     parse_with_consumption_checks(input, false, None)
 }
 
-pub(crate) fn parse_mermaid_checked(input: &str, reference_day: Option<i32>) -> Result<ParseOutput> {
+pub(crate) fn parse_mermaid_checked(
+    input: &str,
+    reference_day: Option<i32>,
+) -> Result<ParseOutput> {
     parse_with_consumption_checks(input, true, reference_day)
 }
 
@@ -314,7 +317,11 @@ pub fn prepare_frontmatter_source(input: &str) -> Result<String> {
     Ok(prepared_frontmatter(&read_frontmatter(input)?))
 }
 
-fn parse_with_consumption_checks(input: &str, strict: bool, reference_day: Option<i32>) -> Result<ParseOutput> {
+fn parse_with_consumption_checks(
+    input: &str,
+    strict: bool,
+    reference_day: Option<i32>,
+) -> Result<ParseOutput> {
     let frontmatter = read_frontmatter(input)?;
     let prepared = prepared_frontmatter(&frontmatter);
     let normalized = normalize_flowchart_multiline(&prepared)?;
@@ -1524,9 +1531,9 @@ fn ensure_sequence_node(
 // Longest first: arrow tokens must be consumed as a whole before activation
 // suffixes, participant identities or message text are interpreted.
 pub(crate) const SEQUENCE_ARROWS: &[&str] = &[
-    "<<-->>", "<<->>", r"--|\", "--|/", r"--\\", "--//", "/|--", r"\|--", "//--", r"\\--",
-    "-->>", r"-|\", "-|/", r"-\\", "-//", "/|-", r"\|-", "//-", r"\\-",
-    "->>", "--x", "-x", "--)", "-)", "-->", "->", "<--", "<-",
+    "<<-->>", "<<->>", r"--|\", "--|/", r"--\\", "--//", "/|--", r"\|--", "//--", r"\\--", "-->>",
+    r"-|\", "-|/", r"-\\", "-//", "/|-", r"\|-", "//-", r"\\-", "->>", "--x", "-x", "--)", "-)",
+    "-->", "->", "<--", "<-",
 ];
 
 fn parse_sequence_message(
@@ -1537,6 +1544,7 @@ fn parse_sequence_message(
     Option<String>,
     EdgeMeta,
     Option<crate::ir::SequenceActivationKind>,
+    crate::ir::SequenceConnection,
 )> {
     let (participants, label) = line.split_once(':').map_or((line, None), |(head, text)| {
         (head, Some(text.trim().to_string()))
@@ -1547,7 +1555,11 @@ fn parse_sequence_message(
             continue;
         };
         let left = left.trim();
+        let central_left = left.ends_with("()");
+        let left = left.strip_suffix("()").unwrap_or(left).trim_end();
         let right = right.trim_start();
+        let central_right = right.starts_with("()");
+        let right = right.strip_prefix("()").unwrap_or(right).trim_start();
         let (right, activation) = if let Some(rest) = right.strip_prefix('+') {
             (
                 rest.trim(),
@@ -1564,8 +1576,11 @@ fn parse_sequence_message(
         // Reject partial matches (e.g. ->>>), never create an actor called >Bob.
         if left.is_empty()
             || right.is_empty()
-            || left.contains(['<', '>', '|', '/', '\\', '(', ')'])
-            || right.contains(['<', '>', '|', '/', '\\', '(', ')'])
+            || left.contains(['<', '>', '|', '/', '\\', '(', ')', '+'])
+            || right.contains(['<', '>', '|', '/', '\\', '(', ')', '+'])
+            || left.ends_with('-')
+            || right.starts_with('-')
+            || (activation.is_some() && (central_left || central_right))
         {
             continue;
         }
@@ -1607,9 +1622,25 @@ fn parse_sequence_message(
                 crate::ir::EdgeStyle::Solid
             },
         };
-        return Some((from.into(), to.into(), label, meta, activation));
+        let connection = if reverse {
+            crate::ir::SequenceConnection {
+                from: central_right,
+                to: central_left,
+            }
+        } else {
+            crate::ir::SequenceConnection {
+                from: central_left,
+                to: central_right,
+            }
+        };
+        return Some((from.into(), to.into(), label, meta, activation, connection));
     }
     None
+}
+
+/// Preflight and parser use the same complete-token identity rules.
+pub(crate) fn sequence_message_participants(line: &str) -> Option<(String, String)> {
+    parse_sequence_message(line).map(|(from, to, ..)| (from, to))
 }
 
 fn parse_sequence_note(
@@ -1976,7 +2007,10 @@ fn parse_er_entity_name(input: &str) -> Option<ErEntityName> {
             alias: Some(name(&rest[..close])?),
         })
     } else {
-        Some(ErEntityName { id: name(input)?, alias: None })
+        Some(ErEntityName {
+            id: name(input)?,
+            alias: None,
+        })
     }
 }
 
@@ -1986,16 +2020,35 @@ fn find_er_separator(input: &str, token: &str) -> Option<usize> {
     let mut escaped = false;
     let mut brackets = 0usize;
     for (index, ch) in input.char_indices() {
-        if escaped { escaped = false; continue; }
-        if ch == '\\' { escaped = true; continue; }
-        if let Some(active) = quote {
-            if ch == active { quote = None; }
+        if escaped {
+            escaped = false;
             continue;
         }
-        if ch == '\"' || ch == '\'' { quote = Some(ch); continue; }
-        if ch == '[' { brackets += 1; continue; }
-        if ch == ']' { brackets = brackets.saturating_sub(1); continue; }
-        if brackets == 0 && input[index..].starts_with(token) { return Some(index); }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\"' || ch == '\'' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == '[' {
+            brackets += 1;
+            continue;
+        }
+        if ch == ']' {
+            brackets = brackets.saturating_sub(1);
+            continue;
+        }
+        if brackets == 0 && input[index..].starts_with(token) {
+            return Some(index);
+        }
     }
     None
 }
@@ -2159,7 +2212,11 @@ fn parse_er_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
         )) = parse_er_relation_line(line)
         {
             graph.ensure_node(&left.id, left.alias, Some(crate::ir::NodeShape::RoundRect));
-            graph.ensure_node(&right.id, right.alias, Some(crate::ir::NodeShape::RoundRect));
+            graph.ensure_node(
+                &right.id,
+                right.alias,
+                Some(crate::ir::NodeShape::RoundRect),
+            );
             // Don't use start_label/end_label for ER diagrams - crow's foot symbols convey cardinality
             graph.edges.push(crate::ir::Edge {
                 from: left.id,
@@ -2181,7 +2238,8 @@ fn parse_er_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
 
         if let Some(open_idx) = find_unquoted_delimiter(line, '{') {
             let name = line[..open_idx].trim();
-            let entity = parse_er_entity_name(name).ok_or_else(|| anyhow::anyhow!("invalid ER entity name: {name}"))?;
+            let entity = parse_er_entity_name(name)
+                .ok_or_else(|| anyhow::anyhow!("invalid ER entity name: {name}"))?;
             let name = entity.id;
             if !name.is_empty() {
                 graph.ensure_node(&name, entity.alias, Some(crate::ir::NodeShape::RoundRect));
@@ -2210,11 +2268,19 @@ fn parse_er_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
         }
 
         if let Some(entity) = parse_er_entity_name(line) {
-            graph.ensure_node(&entity.id, entity.alias, Some(crate::ir::NodeShape::RoundRect));
+            graph.ensure_node(
+                &entity.id,
+                entity.alias,
+                Some(crate::ir::NodeShape::RoundRect),
+            );
         } else if strict {
             bail!("unrecognized ER statement: {line}");
         } else {
-            graph.ensure_node(&strip_quotes(line), None, Some(crate::ir::NodeShape::RoundRect));
+            graph.ensure_node(
+                &strip_quotes(line),
+                None,
+                Some(crate::ir::NodeShape::RoundRect),
+            );
         }
     }
 
@@ -2742,7 +2808,9 @@ fn parse_timeline_diagram(input: &str) -> Result<ParseOutput> {
 }
 
 fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseOutput> {
-    if reference_day.is_some_and(|day| !(-719162..=2932896).contains(&day)) { bail!("Invalid Gantt reference day"); }
+    if reference_day.is_some_and(|day| !(-719162..=2932896).contains(&day)) {
+        bail!("Invalid Gantt reference day");
+    }
     let mut graph = Graph::new();
     graph.kind = DiagramKind::Gantt;
     graph.gantt_reference_day = reference_day;
@@ -2762,7 +2830,6 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
     }
     let date_format = date_format.to_owned();
 
-
     let mut header_seen = false;
     let mut current_section: Option<usize> = None;
     let mut current_section_name: Option<String> = None;
@@ -2777,24 +2844,35 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         let lower = keyword.to_ascii_lowercase();
         let data = data.trim();
         if lower == "gantt" {
-            if header_seen || !data.is_empty() { bail!("Invalid Gantt header: {line}"); }
+            if header_seen || !data.is_empty() {
+                bail!("Invalid Gantt header: {line}");
+            }
             header_seen = true;
             continue;
         }
         if lower == "topaxis" || lower == "inclusiveenddates" {
-            if !data.is_empty() { bail!("Unexpected Gantt option arguments: {line}"); }
-            if lower == "topaxis" { graph.gantt_top_axis = true; }
-            else { graph.gantt_inclusive_end_dates = true; }
+            if !data.is_empty() {
+                bail!("Unexpected Gantt option arguments: {line}");
+            }
+            if lower == "topaxis" {
+                graph.gantt_top_axis = true;
+            } else {
+                graph.gantt_inclusive_end_dates = true;
+            }
             continue;
         }
         if lower == "title" {
-            if data.is_empty() { bail!("Empty Gantt title"); }
+            if data.is_empty() {
+                bail!("Empty Gantt title");
+            }
             graph.gantt_title = Some(data.to_owned());
             continue;
         }
         if keyword == "axisFormat" {
             let format = data;
-            if format.is_empty() { bail!("Empty Gantt axisFormat"); }
+            if format.is_empty() {
+                bail!("Empty Gantt axisFormat");
+            }
             let mut chars = format.trim().chars();
             while let Some(ch) = chars.next() {
                 if ch == '%' && !matches!(chars.next(), Some('Y' | 'm' | 'd' | '%')) {
@@ -2807,8 +2885,13 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         if keyword == "weekday" {
             let day = data;
             graph.gantt_weekday = match day.trim() {
-                "sunday" => 0, "monday" => 1, "tuesday" => 2, "wednesday" => 3,
-                "thursday" => 4, "friday" => 5, "saturday" => 6,
+                "sunday" => 0,
+                "monday" => 1,
+                "tuesday" => 2,
+                "wednesday" => 3,
+                "thursday" => 4,
+                "friday" => 5,
+                "saturday" => 6,
                 _ => bail!("Invalid Gantt weekday: {day}"),
             };
             continue;
@@ -2826,8 +2909,12 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             if number.starts_with('0') || !number.bytes().all(|b| b.is_ascii_digit()) {
                 bail!("Invalid Gantt tickInterval: {interval}");
             }
-            let days = number.parse::<u32>().ok().and_then(|n| n.checked_mul(multiplier))
-                .filter(|n| *n > 0).ok_or_else(|| anyhow::anyhow!("Invalid Gantt tickInterval: {interval}"))?;
+            let days = number
+                .parse::<u32>()
+                .ok()
+                .and_then(|n| n.checked_mul(multiplier))
+                .filter(|n| *n > 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid Gantt tickInterval: {interval}"))?;
             graph.gantt_tick_days = Some(days);
             graph.gantt_tick_weekly = multiplier == 7;
             continue;
@@ -2837,30 +2924,60 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         }
         if let Some((directive, data)) = line.split_once(char::is_whitespace) {
             if directive == "weekend" {
-                graph.gantt_calendar.weekend_start = match data.trim() { "friday" => 5, "saturday" => 6, _ => bail!("Invalid Gantt weekend: {data}") };
+                graph.gantt_calendar.weekend_start = match data.trim() {
+                    "friday" => 5,
+                    "saturday" => 6,
+                    _ => bail!("Invalid Gantt weekend: {data}"),
+                };
                 continue;
             }
             if directive == "excludes" || directive == "includes" {
                 let mut count = 0;
-                for value in data.split(|c: char| c.is_whitespace() || c == ',').filter(|v| !v.is_empty()) {
+                for value in data
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|v| !v.is_empty())
+                {
                     count += 1;
                     let value = value.to_ascii_lowercase();
-                    if let Some(day) = crate::gantt_time::formatted_date(&value, &date_format).or_else(|| crate::gantt_time::formatted_date(&value, "YYYY-MM-DD")) {
-                        if directive == "includes" { graph.gantt_calendar.included.insert(day); }
-                        else { graph.gantt_calendar.excluded.insert(day); }
+                    if let Some(day) = crate::gantt_time::formatted_date(&value, &date_format)
+                        .or_else(|| crate::gantt_time::formatted_date(&value, "YYYY-MM-DD"))
+                    {
+                        if directive == "includes" {
+                            graph.gantt_calendar.included.insert(day);
+                        } else {
+                            graph.gantt_calendar.excluded.insert(day);
+                        }
                     } else if directive == "excludes" && value == "weekends" {
                         graph.gantt_calendar.weekends = true;
                     } else if directive == "excludes" {
-                        let weekday = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].iter().position(|d| *d == value)
-                            .ok_or_else(|| anyhow::anyhow!("Invalid Gantt excluded date/day: {value}"))?;
+                        let weekday = [
+                            "sunday",
+                            "monday",
+                            "tuesday",
+                            "wednesday",
+                            "thursday",
+                            "friday",
+                            "saturday",
+                        ]
+                        .iter()
+                        .position(|d| *d == value)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Invalid Gantt excluded date/day: {value}")
+                        })?;
                         graph.gantt_calendar.weekdays[weekday] = true;
-                    } else { bail!("Invalid Gantt included date: {value}"); }
+                    } else {
+                        bail!("Invalid Gantt included date: {value}");
+                    }
                 }
-                if count == 0 { bail!("Empty Gantt calendar directive"); }
+                if count == 0 {
+                    bail!("Empty Gantt calendar directive");
+                }
                 continue;
             }
         }
-        if matches!(line, "excludes" | "includes" | "weekend") { bail!("Empty Gantt calendar directive"); }
+        if matches!(line, "excludes" | "includes" | "weekend") {
+            bail!("Empty Gantt calendar directive");
+        }
         if lower == "dateformat" {
             if line.split_whitespace().next() != Some("dateFormat") {
                 bail!("Invalid Gantt dateFormat directive: {line}");
@@ -2868,24 +2985,44 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             continue;
         }
         if lower == "todaymarker" {
-            if keyword != "todayMarker" || data.is_empty() { bail!("Invalid Gantt todayMarker directive"); }
-            if data == "off" { graph.gantt_today_marker = None; continue; }
+            if keyword != "todayMarker" || data.is_empty() {
+                bail!("Invalid Gantt todayMarker directive");
+            }
+            if data == "off" {
+                graph.gantt_today_marker = None;
+                continue;
+            }
             let mut style = crate::ir::GanttTodayMarker::default();
             let mut seen = HashSet::new();
             for attribute in data.split(',') {
-                let (key, value) = attribute.split_once(':').ok_or_else(|| anyhow::anyhow!("Invalid Gantt todayMarker style"))?;
-                let key = key.trim(); let value = value.trim();
-                if !seen.insert(key) { bail!("Duplicate Gantt todayMarker attribute: {key}"); }
+                let (key, value) = attribute
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Gantt todayMarker style"))?;
+                let key = key.trim();
+                let value = value.trim();
+                if !seen.insert(key) {
+                    bail!("Duplicate Gantt todayMarker attribute: {key}");
+                }
                 match key {
-                    "stroke" if value.starts_with('#') && matches!(value.len(), 4 | 7) && value[1..].bytes().all(|b| b.is_ascii_hexdigit()) => style.stroke = value.to_owned(),
+                    "stroke"
+                        if value.starts_with('#')
+                            && matches!(value.len(), 4 | 7)
+                            && value[1..].bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
+                        style.stroke = value.to_owned()
+                    }
                     "stroke-width" => {
                         let width: f32 = value.strip_suffix("px").unwrap_or(value).parse()?;
-                        if !width.is_finite() || !(0.0..=32.0).contains(&width) { bail!("Invalid Gantt marker width"); }
+                        if !width.is_finite() || !(0.0..=32.0).contains(&width) {
+                            bail!("Invalid Gantt marker width");
+                        }
                         style.width = width;
                     }
                     "opacity" => {
                         let opacity: f32 = value.parse()?;
-                        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) { bail!("Invalid Gantt marker opacity"); }
+                        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+                            bail!("Invalid Gantt marker opacity");
+                        }
                         style.opacity = opacity;
                     }
                     _ => bail!("Unsupported Gantt todayMarker attribute: {key}"),
@@ -2896,7 +3033,9 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         }
         if lower == "section" {
             let label = data;
-            if label.is_empty() { bail!("Empty Gantt section"); }
+            if label.is_empty() {
+                bail!("Empty Gantt section");
+            }
             let id = format!("section_{}", graph.subgraphs.len());
             graph.subgraphs.push(Subgraph {
                 id: Some(id),
@@ -2927,7 +3066,11 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
             }
 
             // Add to gantt_tasks
-            let start = if details.len() == 2 { Some(details[0].clone()) } else { None };
+            let start = if details.len() == 2 {
+                Some(details[0].clone())
+            } else {
+                None
+            };
             let ending = details.last().expect("validated metadata");
             let duration = looks_like_duration(ending).then(|| ending.clone());
             let end = crate::gantt_time::parse_date(ending).map(|_| ending.clone());
@@ -2957,21 +3100,21 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
 
             if let Some(after_ids) = after {
                 for after_id in after_ids.split_whitespace() {
-                graph.edges.push(crate::ir::Edge {
-                    from: after_id.to_owned(),
-                    to: node_id.clone(),
-                    label: None,
-                    start_label: None,
-                    end_label: None,
-                    directed: true,
-                    arrow_start: false,
-                    arrow_end: true,
-                    arrow_start_kind: None,
-                    arrow_end_kind: None,
-                    start_decoration: None,
-                    end_decoration: None,
-                    style: crate::ir::EdgeStyle::Solid,
-                });
+                    graph.edges.push(crate::ir::Edge {
+                        from: after_id.to_owned(),
+                        to: node_id.clone(),
+                        label: None,
+                        start_label: None,
+                        end_label: None,
+                        directed: true,
+                        arrow_start: false,
+                        arrow_end: true,
+                        arrow_start_kind: None,
+                        arrow_end_kind: None,
+                        start_decoration: None,
+                        end_decoration: None,
+                        style: crate::ir::EdgeStyle::Solid,
+                    });
                 }
             } else if let Some(prev) = last_task.take() {
                 graph.edges.push(crate::ir::Edge {
@@ -2997,15 +3140,30 @@ fn parse_gantt_diagram(input: &str, reference_day: Option<i32>) -> Result<ParseO
         bail!("Unsupported or invalid native Gantt statement: {line}");
     }
 
-    let schedule = crate::gantt_time::resolve(&graph.gantt_tasks, &graph.gantt_calendar, reference_day, graph.gantt_inclusive_end_dates)?;
+    let schedule = crate::gantt_time::resolve(
+        &graph.gantt_tasks,
+        &graph.gantt_calendar,
+        reference_day,
+        graph.gantt_inclusive_end_dates,
+    )?;
     graph.gantt_schedule = schedule.times;
     graph.gantt_render_ends = schedule.render_ends;
     Ok(ParseOutput { graph, init_config })
 }
 
-fn parse_gantt_task_meta(meta: &str, date_format: &str) -> Result<(Option<String>, Vec<String>, Option<String>, Option<crate::ir::GanttStatus>)> {
+fn parse_gantt_task_meta(
+    meta: &str,
+    date_format: &str,
+) -> Result<(
+    Option<String>,
+    Vec<String>,
+    Option<String>,
+    Option<crate::ir::GanttStatus>,
+)> {
     let mut parts: Vec<_> = meta.split(',').map(str::trim).collect();
-    if parts.iter().any(|s| s.is_empty()) { bail!("Empty Gantt task metadata"); }
+    if parts.iter().any(|s| s.is_empty()) {
+        bail!("Empty Gantt task metadata");
+    }
     let mut status = None;
     while let Some(next) = parts.first().and_then(|s| gantt_status_from_token(s)) {
         let flags = status.get_or_insert(crate::ir::GanttStatus::default());
@@ -3015,26 +3173,44 @@ fn parse_gantt_task_meta(meta: &str, date_format: &str) -> Result<(Option<String
         flags.milestone |= next.milestone;
         parts.remove(0);
     }
-    if parts.is_empty() || parts.len() > 3 { bail!("Invalid Gantt task metadata: {meta}"); }
-    let id = if parts.len() == 3 { Some(parts.remove(0).to_owned()) } else { None };
+    if parts.is_empty() || parts.len() > 3 {
+        bail!("Invalid Gantt task metadata: {meta}");
+    }
+    let id = if parts.len() == 3 {
+        Some(parts.remove(0).to_owned())
+    } else {
+        None
+    };
     let mut details = Vec::new();
     let mut after = None;
     if parts.len() == 2 {
         let start = parts.remove(0);
         if let Some(dependencies) = start.strip_prefix("after ") {
-            if dependencies.trim().is_empty() { bail!("Empty Gantt after dependency"); }
+            if dependencies.trim().is_empty() {
+                bail!("Empty Gantt after dependency");
+            }
             after = Some(dependencies.trim().to_owned());
         } else {
-            details.push(crate::gantt_time::canonical_date(start, date_format)
-                .ok_or_else(|| anyhow::anyhow!("Invalid Gantt start date for {date_format}: {start}"))?);
+            details.push(
+                crate::gantt_time::canonical_date(start, date_format).ok_or_else(|| {
+                    anyhow::anyhow!("Invalid Gantt start date for {date_format}: {start}")
+                })?,
+            );
         }
     }
     let end = parts[0];
-    if looks_like_duration(end) || end.strip_prefix("until ").is_some_and(|ids| ids.split_whitespace().next().is_some()) {
+    if looks_like_duration(end)
+        || end
+            .strip_prefix("until ")
+            .is_some_and(|ids| ids.split_whitespace().next().is_some())
+    {
         details.push(end.to_owned());
     } else {
-        details.push(crate::gantt_time::canonical_date(end, date_format)
-            .ok_or_else(|| anyhow::anyhow!("Invalid Gantt end date or duration for {date_format}: {end}"))?);
+        details.push(
+            crate::gantt_time::canonical_date(end, date_format).ok_or_else(|| {
+                anyhow::anyhow!("Invalid Gantt end date or duration for {date_format}: {end}")
+            })?,
+        );
     }
     Ok((id, details, after, status))
 }
@@ -5689,6 +5865,7 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
 
     let mut pending_create: Option<String> = None;
     let mut pending_destroy: Option<String> = None;
+    let mut activation_depths: HashMap<String, usize> = HashMap::new();
     for raw_line in lines {
         let line = raw_line.trim();
         if line.is_empty() {
@@ -5704,27 +5881,39 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
             if pending_create.is_some() || graph.nodes.contains_key(&id) {
                 bail!("participant is already declared or creation is pending: {id}");
             }
-            if let Some(label) = label { labels.insert(id.clone(), label); }
+            if let Some(label) = label {
+                labels.insert(id.clone(), label);
+            }
             ensure_sequence_node(&mut graph, &labels, &id, Some(shape));
             order.push(id.clone());
-            if let Some(group) = open_boxes.last_mut() { group.participants.push(id.clone()); }
+            if let Some(group) = open_boxes.last_mut() {
+                group.participants.push(id.clone());
+            }
             pending_create = Some(id);
             continue;
         }
         if lower.starts_with("destroy ") {
             let target = strip_quotes(line[8..].trim());
             let id = target.as_str();
-            if pending_destroy.is_some() || pending_create.as_deref() == Some(id) || !graph.nodes.contains_key(id) || graph.sequence_destroyed.contains_key(id) {
+            if pending_destroy.is_some()
+                || pending_create.as_deref() == Some(id)
+                || !graph.nodes.contains_key(id)
+                || graph.sequence_destroyed.contains_key(id)
+            {
                 bail!("cannot destroy unknown, destroyed or pending participant: {id}");
             }
             pending_destroy = Some(id.to_owned());
             continue;
         }
-        if (pending_create.is_some() || pending_destroy.is_some()) && parse_sequence_message(line).is_none() {
+        if (pending_create.is_some() || pending_destroy.is_some())
+            && parse_sequence_message(line).is_none()
+        {
             bail!("participant lifecycle directive requires an associated message: {line}");
         }
         if let Some((id, label, shape)) = parse_sequence_participant(line) {
-            if graph.sequence_destroyed.contains_key(&id) { bail!("participant already destroyed: {id}"); }
+            if graph.sequence_destroyed.contains_key(&id) {
+                bail!("participant already destroyed: {id}");
+            }
             if !order.contains(&id) {
                 order.push(id.clone());
             }
@@ -5921,7 +6110,9 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
             let id = line[9..].trim();
             if !id.is_empty() {
                 let id = strip_quotes(id);
-                if graph.sequence_destroyed.contains_key(&id) { bail!("activation references destroyed participant: {id}"); }
+                if graph.sequence_destroyed.contains_key(&id) {
+                    bail!("activation references destroyed participant: {id}");
+                }
                 if !order.contains(&id) {
                     order.push(id.clone());
                 }
@@ -5932,7 +6123,12 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
                         participant: id,
                         index: graph.edges.len(),
                         kind: crate::ir::SequenceActivationKind::Activate,
+                        at_message: false,
+                        notes_before: graph.sequence_notes.len(),
                     });
+                *activation_depths
+                    .entry(strip_quotes(line[9..].trim()))
+                    .or_default() += 1;
             }
             continue;
         }
@@ -5940,17 +6136,26 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
             let id = line[11..].trim();
             if !id.is_empty() {
                 let id = strip_quotes(id);
-                if graph.sequence_destroyed.contains_key(&id) { bail!("activation references destroyed participant: {id}"); }
+                if graph.sequence_destroyed.contains_key(&id) {
+                    bail!("activation references destroyed participant: {id}");
+                }
                 if !order.contains(&id) {
                     order.push(id.clone());
                 }
                 ensure_sequence_node(&mut graph, &labels, &id, None);
+                let depth = activation_depths.entry(id.clone()).or_default();
+                if *depth == 0 {
+                    bail!("cannot deactivate inactive participant: {id}");
+                }
+                *depth -= 1;
                 graph
                     .sequence_activations
                     .push(crate::ir::SequenceActivation {
                         participant: id,
                         index: graph.edges.len(),
                         kind: crate::ir::SequenceActivationKind::Deactivate,
+                        at_message: false,
+                        notes_before: graph.sequence_notes.len(),
                     });
             }
             continue;
@@ -5977,16 +6182,23 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
             continue;
         }
 
-        if let Some((from, to, label, meta, activation)) = parse_sequence_message(line) {
-            if graph.sequence_destroyed.contains_key(&from) || graph.sequence_destroyed.contains_key(&to) {
+        if let Some((from, to, label, meta, activation, connection)) = parse_sequence_message(line)
+        {
+            if graph.sequence_destroyed.contains_key(&from)
+                || graph.sequence_destroyed.contains_key(&to)
+            {
                 bail!("message references a destroyed participant: {line}");
             }
             if let Some(id) = pending_create.take() {
-                if id != to || from == to { bail!("creation message must target the new participant: {line}"); }
+                if id != to || from == to {
+                    bail!("creation message must target the new participant: {line}");
+                }
                 graph.sequence_created.insert(id, graph.edges.len());
             }
             if let Some(id) = pending_destroy.take() {
-                if id != from && id != to { bail!("destruction message must involve its participant: {line}"); }
+                if id != from && id != to {
+                    bail!("destruction message must involve its participant: {line}");
+                }
                 graph.sequence_destroyed.insert(id, graph.edges.len());
             }
             if !order.contains(&from) {
@@ -6006,6 +6218,11 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
             } else {
                 None
             };
+            if connection.from || connection.to {
+                graph
+                    .sequence_connections
+                    .insert(graph.edges.len(), connection);
+            }
             graph.sequence_message_numbers.push(number);
             graph.edges.push(crate::ir::Edge {
                 from,
@@ -6029,12 +6246,31 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
                     crate::ir::SequenceActivationKind::Activate => graph.edges[last].to.clone(),
                     crate::ir::SequenceActivationKind::Deactivate => graph.edges[last].from.clone(),
                 };
+                let depth = activation_depths.entry(participant.clone()).or_default();
+                match kind {
+                    crate::ir::SequenceActivationKind::Activate => {
+                        if graph.sequence_destroyed.get(&participant) == Some(&last) {
+                            bail!(
+                                "cannot activate participant on its destruction message: {participant}"
+                            );
+                        }
+                        *depth += 1;
+                    }
+                    crate::ir::SequenceActivationKind::Deactivate => {
+                        if *depth == 0 {
+                            bail!("cannot deactivate inactive participant: {participant}");
+                        }
+                        *depth -= 1;
+                    }
+                }
                 graph
                     .sequence_activations
                     .push(crate::ir::SequenceActivation {
                         participant,
                         index: last,
                         kind,
+                        at_message: true,
+                        notes_before: graph.sequence_notes.len(),
                     });
             }
         } else if strict {
@@ -6042,7 +6278,9 @@ fn parse_sequence_diagram(input: &str, strict: bool) -> Result<ParseOutput> {
         }
     }
 
-    if pending_create.is_some() || pending_destroy.is_some() { bail!("participant lifecycle directive has no message"); }
+    if pending_create.is_some() || pending_destroy.is_some() {
+        bail!("participant lifecycle directive has no message");
+    }
 
     while let Some(mut frame) = open_frames.pop() {
         let end_idx = graph.edges.len();
@@ -6155,7 +6393,9 @@ fn split_statements(line: &str) -> Vec<String> {
 }
 
 fn strip_trailing_comment(line: &str) -> String {
-    if line.trim_start().starts_with("axisFormat ") { return line.to_owned(); }
+    if line.trim_start().starts_with("axisFormat ") {
+        return line.to_owned();
+    }
     let mut quote: Option<char> = None;
     let mut chars = line.chars().peekable();
     let mut out = String::new();

@@ -55,6 +55,66 @@ fn app_client_uses_one_real_helper_and_rejects_stale_requests() {
     );
 }
 
+#[test]
+fn central_lifecycle_errors_do_not_poison_the_real_helper_or_request_identity() {
+    let mut client = NativeRendererClient::new(
+        std::env::var_os("YU_TEST_RENDERER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_yu-document-renderer").into()),
+        108,
+    );
+    let control = RenderControl::default();
+    let valid = "sequenceDiagram\nparticipant A\ncreate actor B as 工作🙂\nA()->>()B: Start\nactivate B\nB()->>()B: Work\ndeactivate B\ndestroy B\nB()->>A: Finish";
+    for revision in [11, 12] {
+        control.set_revision(revision);
+        let rendered = client
+            .render(
+                &request(revision, EmbeddedResourceKind::Mermaid, valid),
+                &control,
+            )
+            .expect("central lifecycle in real helper");
+        assert_eq!(
+            rendered
+                .markup()
+                .expect("vector source")
+                .matches("class=\"sequence-central-connection\"")
+                .count(),
+            5
+        );
+        let pid = client.process_id().expect("live helper");
+        let invalid = client.render(
+            &request(
+                revision,
+                EmbeddedResourceKind::Mermaid,
+                "sequenceDiagram\nA->>()B: not activation\ndeactivate B",
+            ),
+            &control,
+        );
+        assert!(matches!(invalid, Err(RenderFailure::InvalidSource(message))
+            if message.contains("inactive participant")));
+        let recovered = client
+            .render(
+                &request(revision, EmbeddedResourceKind::Mermaid, valid),
+                &control,
+            )
+            .expect("valid request after rejected lifetime");
+        assert_eq!(recovered.markup(), rendered.markup());
+        assert_eq!(client.process_id(), Some(pid));
+        assert_eq!(
+            client.render(
+                &request(revision - 1, EmbeddedResourceKind::Mermaid, valid),
+                &control,
+            ),
+            Err(RenderFailure::Cancelled)
+        );
+    }
+    control.close();
+    assert_eq!(
+        client.render(&request(12, EmbeddedResourceKind::Mermaid, valid), &control),
+        Err(RenderFailure::Cancelled)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn revision_change_cancels_a_running_child_without_waiting_for_its_output() {
