@@ -13096,6 +13096,82 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn native_html_list_glyph_hits_stay_in_visible_body() {
+        let source = "# List gestures\r\n\r\n<ul><li>前项</li><li id='parent'>父项中文<ul><li>子项🙂</li><li>后子</li></ul></li><li>尾项</li></ul>\r\n\r\nTAIL";
+        let path = std::env::temp_dir().join(format!("yu-list-glyph-{}.md", temp_id()));
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        for label in ["父项中文", "子项🙂", "后子", "尾项"] {
+            assert_eq!(
+                unsafe { yu_storage_session_set_selection_endpoints(raw, 0, 0, 0, 1) },
+                YU_STORAGE_OK
+            );
+            let at = source.find(label).expect("label");
+            let at16 = source[..at].encode_utf16().count() as u64;
+            let mut caret = YuStorageBlockCaret::default();
+            let mut next = YuStorageBlockCaret::default();
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_source_caret(raw, 0, at16, 1, 16.0, 760.0, &mut caret)
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_source_caret(raw, 0, at16 + 1, 1, 16.0, 760.0, &mut next)
+                },
+                YU_STORAGE_OK
+            );
+            // A drag into another list item must not reveal its structural
+            // markup under the pointer and redirect the next hit into a tag.
+            let other = if label == "父项中文" {
+                "子项🙂"
+            } else {
+                "父项中文"
+            };
+            let other16 = source[..source.find(other).expect("other list item")]
+                .encode_utf16()
+                .count() as u64;
+            assert_eq!(
+                unsafe { yu_storage_session_set_selection_endpoints(raw, 0, other16, at16, 1) },
+                YU_STORAGE_OK
+            );
+            for fraction in [0.25, 0.75] {
+                let mut hit = YuStorageProjectionHit::default();
+                assert_eq!(
+                    unsafe {
+                        yu_storage_session_projection_hit_test(
+                            raw,
+                            0,
+                            caret.caret_x + (next.caret_x - caret.caret_x) * fraction,
+                            caret.caret_y + caret.caret_height * 0.5,
+                            16.0,
+                            760.0,
+                            &mut hit,
+                        )
+                    },
+                    YU_STORAGE_OK
+                );
+                assert!(
+                    (at16..=at16 + 1).contains(&hit.source_utf16),
+                    "{label} fraction={fraction}: {} vs {at16}; caret={},{}",
+                    hit.source_utf16,
+                    caret.caret_x,
+                    caret.caret_y
+                );
+            }
+        }
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_queries_share_painted_code_and_heading_geometry() {
         let path = std::env::temp_dir().join(format!("yu-shared-geometry-{}.md", temp_id()));
         let source = "# Heading\n\nparagraph above\n\n```swift\nlet value = 1\n```\n";

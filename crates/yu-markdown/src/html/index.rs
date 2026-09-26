@@ -437,6 +437,23 @@ impl HtmlIndex {
         if part.source != block.range() {
             return None;
         }
+        // Cross-item selections keep the same visible list geometry. Revealing
+        // a focus item's tags while dragging from another item moves its text
+        // out from under the pointer and turns a valid range into raw markup.
+        // Local caret/range editing and explicit source mode keep their existing
+        // reveal behavior; tables already have an independent native projection.
+        let active = active.filter(|selection| {
+            selection.is_empty()
+                || (part.source.start() <= selection.start()
+                    && selection.end() <= part.source.end())
+                || !self
+                    .presentation
+                    .path_for_range(part.source)
+                    .iter()
+                    .any(|id| {
+                        self.presentation.nodes()[*id].kind == crate::PresentationKind::ListItem
+                    })
+        });
         let mut out = crate::ExtensionOutput::default();
         if part.content.kind == super::HtmlFlowKind::Table {
             return Some(

@@ -13,12 +13,16 @@ import signal
 import subprocess
 import time
 import uuid
+import group4_followup
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
+parser.add_argument('--list-gestures', action='store_true', help='Actual reverse mouse range and parent/child Option-click multicursors')
+parser.add_argument('--smoke-document', action='store_true', help='Fixed combined document TOC/disclosure/find/save interaction without OCR')
+parser.add_argument('--stress-seconds', type=int, default=0, help='Bounded real-window resource churn, 30..1800 seconds; not a leak proof')
 parser.add_argument('--table-interactions', action='store_true', help='Real forward/reverse whole grouped-table paste with complete history')
 parser.add_argument('--table-resize', action='store_true', help='Real merged-column drag/cancel and persisted geometry')
 parser.add_argument('--math-suite', action='store_true', help='Exercise aligned, cases and multiline formula editing in the actual application')
@@ -51,6 +55,9 @@ parser.add_argument('--html-lines', action='store_true')
 parser.add_argument('--html-details', action='store_true')
 parser.add_argument('--html-lists', action='store_true')
 args = parser.parse_args()
+option_error = group4_followup.option_error(vars(args))
+if option_error:
+    parser.error(option_error)
 if args.math_suite and (args.html_blocks or args.diagram_suite or args.recent_diagrams):
     parser.error('--math-suite cannot be combined with --html-blocks or --diagram-suite')
 if (args.lifecycle or args.cancel_helper) and any((args.html_blocks,args.dollars,args.equations,args.failures)):
@@ -145,12 +152,13 @@ result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required
           'test_runner_sha256':sha(Path(__file__)),
           'options':{'multiline_diagram':args.multiline_diagram,'cjk_math':args.cjk_math,'cancel_helper':args.cancel_helper,'lifecycle':args.lifecycle,'dark':args.dark,'themes':args.themes,'failures':args.failures,'dollars':args.dollars,'equations':args.equations,'highlight':args.highlight,'scripts':args.scripts,'footnotes':args.footnotes,'footnote_errors':args.footnote_errors,'toc':args.toc,'html':args.html,'html_blocks':args.html_blocks,'anchors':args.anchors,'alignment':args.alignment,'html_tables':args.html_tables,'merged_tables':args.merged_tables,'html_lines':args.html_lines,'html_details':args.html_details,'html_lists':args.html_lists,'reopen':args.reopen,'diagram_suite':args.diagram_suite,'math_suite':args.math_suite}}
 after_reopen_check = None
-if args.table_interactions or args.table_resize:
-    import group4_followup
+if args.table_interactions or args.table_resize or args.smoke_document or args.stress_seconds or args.list_gestures:
     result['followup_module_sha256'] = sha(Path(group4_followup.__file__))
-    result['table_interactions'] = True
     result['table_interactions'] = args.table_interactions
     result['table_resize'] = args.table_resize
+    result['smoke_document'] = args.smoke_document
+    result['list_gestures'] = args.list_gestures
+    result['stress_seconds'] = args.stress_seconds
 sequence = 0
 suspended_helpers = set()
 
@@ -1182,6 +1190,17 @@ try:
     if args.table_resize:
         audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
         source, after_reopen_check = audit.merged_resize()
+
+    if args.smoke_document:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source = audit.smoke_document(ROOT)
+    if args.stress_seconds:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source = audit.resource_stress(ROOT, process.pid, helpers, args.stress_seconds)
+
+    if args.list_gestures:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source = audit.list_gestures()
 
     saved_before_reopen = fixture.read_bytes()
     old_helpers = helpers()
