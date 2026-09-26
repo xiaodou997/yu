@@ -11,6 +11,31 @@ from pathlib import Path
 import time
 
 
+def appearance_arguments(dark, *, pin_theme=True):
+    """Pin this process, not system appearance or persisted user preferences.
+
+    Put the document path before these arguments: Yu's positional-file parser
+    must not mistake the UserDefaults argument value for a document path.
+    """
+    if type(dark) is not bool or type(pin_theme) is not bool:
+        raise ValueError('Explicit boolean appearance options are required')
+    # A theme-interaction suite must be able to change the reading theme via
+    # the real settings UI; an argument-domain default would shadow that write.
+    return ['--dark-mode' if dark else '--light-mode'] + (['-Yu.readingTheme', '0'] if pin_theme else [])
+
+
+def preview_appearance(patch, dark):
+    """Verify the requested canvas from pixels, not an output-directory name."""
+    from statistics import median
+    if type(dark) is not bool or patch.width <= 0 or patch.height <= 0:
+        raise ValueError('An explicit appearance and nonempty pixel patch are required')
+    background = median(sum(pixel) / 3 for pixel in patch.convert('RGB').getdata())
+    observed = 'dark' if background <= 100 else 'light' if background >= 155 else 'indeterminate'
+    expected = 'dark' if dark else 'light'
+    return {'expected': expected, 'observed': observed, 'background_level': background,
+            'matches': observed == expected}
+
+
 def option_error(options):
     """Reject conflicting follow-up modes before any file or desktop effects."""
     seconds = options.get('stress_seconds', 0)
@@ -414,8 +439,13 @@ class Checks:
             with Image.open(path) as image:
                 ink, box, patch = preview_ink(image, rect, frame)
                 patch.save(self.out/(name+'-formula.png'))
+            appearance = preview_appearance(patch, self.result['options']['dark'])
             observations.append({'attempt':attempt, 'rect':rect, 'pixel_box':box,
-                                 'image':path.name, 'contrasting_pixels':ink})
+                                 'image':path.name, 'contrasting_pixels':ink,
+                                 'appearance':appearance})
+            if not appearance['matches']:
+                self.result['restored_preview_status'] = 'wrong_appearance'
+                raise AssertionError('Reopened canvas does not match requested light/dark appearance')
             if ink >= 12:
                 self.result['restored_preview_status'] = 'visible'
                 self.record('restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll')

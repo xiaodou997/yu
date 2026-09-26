@@ -2876,6 +2876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if settingsController == nil {
             let settings = NativeSettingsWindowController()
             if forceDarkMode || darkModeSelfCheck { settings.window?.appearance = NSAppearance(named: .darkAqua) }
+            else if forceLightMode { settings.window?.appearance = NSAppearance(named: .aqua) }
             settings.onChange = { [weak self] in
                 guard let self else { return }
                 for document in self.documents.values { document.persistence.documentChanged() }
@@ -2892,6 +2893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var launchSelfCheck = false
     private var darkModeSelfCheck = false
     private var forceDarkMode = false
+    private var forceLightMode = false
     private var renderRegression = false
     private var resourceRegression = false
     private var documents: [NSWindow: DocumentViewController] = [:]
@@ -2917,6 +2919,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         // 冒烟/截图用的显式外观开关：默认跟随系统，不参与 self-check。
         forceDarkMode = CommandLine.arguments.contains("--dark-mode")
+        forceLightMode = CommandLine.arguments.contains("--light-mode")
+        if forceLightMode && (forceDarkMode || darkModeSelfCheck) {
+            fputs("Yu: --light-mode cannot be combined with a dark appearance override\n", stderr)
+            exit(EXIT_FAILURE)
+        }
         if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
         } else {
@@ -3088,6 +3095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titlebarSeparatorStyle = .none
         window.backgroundColor = .windowBackgroundColor
         if darkModeSelfCheck || forceDarkMode { window.appearance = NSAppearance(named: .darkAqua) }
+        else if forceLightMode { window.appearance = NSAppearance(named: .aqua) }
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.isRestorable = !launchSelfCheck && !controller.persistence.isUntitled

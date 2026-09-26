@@ -170,7 +170,8 @@ class NativeSoak:
         env = {k: v for k, v in os.environ.items() if not k.startswith('YU_')}
         env.update(YU_DOCUMENT_STATE_DIR=str(self.out / 'state'),
                    YU_PRESENTATION_STATE_DIR=str(self.out / 'columns'), YU_RESOURCE_AUDIT='1')
-        command = [str(self.binary), str(path)] + (['--dark-mode'] if self.args.dark else [])
+        from group4_followup import appearance_arguments
+        command = [str(self.binary), str(path)] + appearance_arguments(self.args.dark)
         self.process = subprocess.Popen(command, env=env, stdout=self.log,
                                         stderr=subprocess.STDOUT, start_new_session=True)
         self.result.setdefault('application_pids', []).append(self.process.pid)
