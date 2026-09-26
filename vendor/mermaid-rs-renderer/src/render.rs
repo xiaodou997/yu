@@ -1496,7 +1496,7 @@ fn render_base_svg_with_dimensions(
             if node.shape == crate::ir::NodeShape::Actor {
                 svg.push_str(&sequence_actor_body_svg(node, theme));
             } else {
-            svg.push_str(&format!(
+                svg.push_str(&format!(
                 "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"3\" ry=\"3\" fill=\"{}\" stroke=\"{}\" stroke-width=\"1.0\"/>",
                 node.x,
                 node.y,
@@ -1507,7 +1507,11 @@ fn render_base_svg_with_dimensions(
             ));
             }
             let center_x = node.x + node.width / 2.0;
-            let center_y = if node.shape == crate::ir::NodeShape::Actor { node.y + node.height - node.label.height / 2.0 - theme.font_size * 0.25 } else { node.y + node.height / 2.0 };
+            let center_y = if node.shape == crate::ir::NodeShape::Actor {
+                node.y + node.height - node.label.height / 2.0 - theme.font_size * 0.25
+            } else {
+                node.y + node.height / 2.0
+            };
             let hide_label = node.label.lines.iter().all(|line| line.trim().is_empty())
                 || node.id.starts_with("__start_")
                 || node.id.starts_with("__end_");
@@ -1536,7 +1540,7 @@ fn render_base_svg_with_dimensions(
             if footbox.shape == crate::ir::NodeShape::Actor {
                 svg.push_str(&sequence_actor_body_svg(footbox, theme));
             } else {
-            svg.push_str(&format!(
+                svg.push_str(&format!(
                 "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"3\" ry=\"3\" fill=\"{}\" stroke=\"{}\" stroke-width=\"1.0\"/>",
                 footbox.x,
                 footbox.y,
@@ -1547,7 +1551,11 @@ fn render_base_svg_with_dimensions(
             ));
             }
             let center_x = footbox.x + footbox.width / 2.0;
-            let center_y = if footbox.shape == crate::ir::NodeShape::Actor { footbox.y + footbox.height - footbox.label.height / 2.0 - theme.font_size * 0.25 } else { footbox.y + footbox.height / 2.0 };
+            let center_y = if footbox.shape == crate::ir::NodeShape::Actor {
+                footbox.y + footbox.height - footbox.label.height / 2.0 - theme.font_size * 0.25
+            } else {
+                footbox.y + footbox.height / 2.0
+            };
             let hide_label = footbox
                 .label
                 .lines
@@ -1572,7 +1580,25 @@ fn render_base_svg_with_dimensions(
         }
     }
 
-    for life in seq_data.map(|s| s.lifelines.as_slice()).unwrap_or_default().iter().filter(|life| life.destroyed) {
+    // Explicit native SVG circles survive AppKit's SVG subset and remain
+    // visible on top of activation bars. Destruction crosses are independent.
+    for circle in seq_data
+        .map(|s| s.connections.as_slice())
+        .unwrap_or_default()
+    {
+        svg.push_str(&format!(
+            r#"<circle class="sequence-central-connection" data-message="{}" data-end="{}" cx="{:.2}" cy="{:.2}" r="{:.2}" fill="{}" stroke="{}" stroke-width="1"/>"#,
+            circle.message, if circle.at_start { "from" } else { "to" },
+            circle.x, circle.y, circle.radius, theme.sequence_actor_line, theme.sequence_actor_line,
+        ));
+    }
+
+    for life in seq_data
+        .map(|s| s.lifelines.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|life| life.destroyed)
+    {
         let size = (theme.font_size * 0.4).max(6.0);
         svg.push_str(&format!(r#"<path class="sequence-destruction" d="M {} {} L {} {} M {} {} L {} {}" fill="none" stroke="{}" stroke-width="2"/>"#, life.x-size, life.y2-size, life.x+size, life.y2+size, life.x-size, life.y2+size, life.x+size, life.y2-size, theme.sequence_actor_line));
     }
@@ -1593,8 +1619,19 @@ fn sequence_actor_body_svg(node: &crate::layout::NodeLayout, theme: &Theme) -> S
     let hip = top + height * 0.64;
     let arm = height * 0.28;
     let leg = height * 0.23;
-    let stroke = node.style.stroke.as_deref().unwrap_or(&theme.sequence_actor_border);
-    format!(r#"<g class="sequence-actor" fill="none" stroke="{stroke}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="{cx}" cy="{}" r="{radius}"/><path d="M {cx} {neck} L {cx} {hip} M {} {shoulder} L {} {shoulder} M {} {bottom} L {cx} {hip} L {} {bottom}"/></g>"#, top + radius, cx-arm, cx+arm, cx-leg, cx+leg)
+    let stroke = node
+        .style
+        .stroke
+        .as_deref()
+        .unwrap_or(&theme.sequence_actor_border);
+    format!(
+        r#"<g class="sequence-actor" fill="none" stroke="{stroke}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="{cx}" cy="{}" r="{radius}"/><path d="M {cx} {neck} L {cx} {hip} M {} {shoulder} L {} {shoulder} M {} {bottom} L {cx} {hip} L {} {bottom}"/></g>"#,
+        top + radius,
+        cx - arm,
+        cx + arm,
+        cx - leg,
+        cx + leg
+    )
 }
 
 fn points_to_path(points: &[(f32, f32)]) -> String {
@@ -3481,8 +3518,13 @@ fn render_gantt(
             if let Some(top_y) = layout.top_axis_y {
                 svg.push_str("<g class=\"top-axis-tick\">");
                 svg.push_str(&text_line_svg_with_font_size(
-                    tick.x, top_y, tick.label.as_str(), theme, tick_font,
-                    theme.text_color.as_str(), "middle",
+                    tick.x,
+                    top_y,
+                    tick.label.as_str(),
+                    theme,
+                    tick_font,
+                    theme.text_color.as_str(),
+                    "middle",
                 ));
                 svg.push_str("</g>");
             }
@@ -5676,14 +5718,39 @@ fn edge_arrowheads_svg(
                 )
             };
             svg.push_str(&format!(r#"<g class="class-arrowhead" transform="translate({:.2} {:.2}) rotate({angle:.2})"><path d="{path}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" stroke-linejoin="round"/></g>"#, point.0, point.1));
-        } else if let Some(head @ (crate::ir::EdgeArrowhead::HalfTop | crate::ir::EdgeArrowhead::HalfBottom | crate::ir::EdgeArrowhead::StickTop | crate::ir::EdgeArrowhead::StickBottom)) = arrow_kind {
-            let top = matches!(head, crate::ir::EdgeArrowhead::HalfTop | crate::ir::EdgeArrowhead::StickTop);
-            let filled = matches!(head, crate::ir::EdgeArrowhead::HalfTop | crate::ir::EdgeArrowhead::HalfBottom);
+        } else if let Some(
+            head @ (crate::ir::EdgeArrowhead::HalfTop
+            | crate::ir::EdgeArrowhead::HalfBottom
+            | crate::ir::EdgeArrowhead::StickTop
+            | crate::ir::EdgeArrowhead::StickBottom),
+        ) = arrow_kind
+        {
+            let top = matches!(
+                head,
+                crate::ir::EdgeArrowhead::HalfTop | crate::ir::EdgeArrowhead::StickTop
+            );
+            let filled = matches!(
+                head,
+                crate::ir::EdgeArrowhead::HalfTop | crate::ir::EdgeArrowhead::HalfBottom
+            );
             // Top/bottom refer to the screen side even when the message points left.
-            let side = if top { -5.0 } else { 5.0 } * if angle.to_radians().cos() < 0.0 { -1.0 } else { 1.0 };
-            let path = if filled { format!("M 0 0 L -9 {side} L -9 0 Z") } else { format!("M 0 0 L -9 {side}") };
+            let side = if top { -5.0 } else { 5.0 }
+                * if angle.to_radians().cos() < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+            let path = if filled {
+                format!("M 0 0 L -9 {side} L -9 0 Z")
+            } else {
+                format!("M 0 0 L -9 {side}")
+            };
             let fill = if filled { stroke } else { "none" };
-            let class = if filled { "half-arrowhead" } else { "stick-arrowhead" };
+            let class = if filled {
+                "half-arrowhead"
+            } else {
+                "stick-arrowhead"
+            };
             svg.push_str(&format!(r#"<g class="{class}" transform="translate({:.2} {:.2}) rotate({angle:.2})"><path d="{path}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}" stroke-linejoin="round"/></g>"#, point.0, point.1));
         } else if arrow_kind == Some(crate::ir::EdgeArrowhead::OpenArrow) {
             svg.push_str(&format!(r#"<g class="open-arrowhead" transform="translate({:.2} {:.2}) rotate({angle:.2})"><path d="M -9 -5 L 0 0 L -9 5" fill="none" stroke="{stroke}" stroke-width="{stroke_width}" stroke-linejoin="round"/></g>"#, point.0, point.1));
@@ -6100,20 +6167,34 @@ fn shape_svg(node: &crate::layout::NodeLayout, theme: &Theme, config: &LayoutCon
 mod tests {
     #[test]
     fn state_final_marker_has_transparent_gap_and_filled_center() {
-        let parsed = crate::parse_mermaid_strict("stateDiagram-v2\n[*] --> A\nA --> [*]").expect("state graph");
+        let parsed = crate::parse_mermaid_strict("stateDiagram-v2\n[*] --> A\nA --> [*]")
+            .expect("state graph");
         for background in ["none", "#ffffff", "#202020"] {
             let mut theme = crate::Theme::modern();
             theme.background = background.into();
             theme.line_color = "#abcdef".into();
             let config = LayoutConfig::default();
             let layout = crate::compute_layout(&parsed.graph, &theme, &config);
-            let end = layout.nodes.values().find(|node| node.id.starts_with("__end_")).expect("end state");
+            let end = layout
+                .nodes
+                .values()
+                .find(|node| node.id.starts_with("__end_"))
+                .expect("end state");
             let svg = super::shape_svg(end, &theme, &config);
-            let circles: Vec<_> = svg.split("/>").filter(|part| part.contains("<circle")).collect();
+            let circles: Vec<_> = svg
+                .split("/>")
+                .filter(|part| part.contains("<circle"))
+                .collect();
             assert_eq!(circles.len(), 2, "{svg}");
-            assert!(circles[0].contains("fill=\"none\""), "outer ring must not cover gap: {svg}");
+            assert!(
+                circles[0].contains("fill=\"none\""),
+                "outer ring must not cover gap: {svg}"
+            );
             assert!(circles[0].contains("stroke=\"#abcdef\""), "{svg}");
-            assert!(circles[1].contains("fill=\"#abcdef\""), "final state needs a filled center: {svg}");
+            assert!(
+                circles[1].contains("fill=\"#abcdef\""),
+                "final state needs a filled center: {svg}"
+            );
         }
     }
 

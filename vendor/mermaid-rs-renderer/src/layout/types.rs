@@ -154,6 +154,17 @@ pub struct SequenceActivationLayout {
     pub depth: usize,
 }
 
+/// A measured endpoint circle, separate from arrowhead and activation geometry.
+#[derive(Debug, Clone)]
+pub struct SequenceConnectionLayout {
+    pub message: usize,
+    pub participant: String,
+    pub at_start: bool,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct SequenceNumberLayout {
     pub x: f32,
@@ -461,6 +472,7 @@ pub struct SequenceData {
     pub notes: Vec<SequenceNoteLayout>,
     pub activations: Vec<SequenceActivationLayout>,
     pub numbers: Vec<SequenceNumberLayout>,
+    pub connections: Vec<SequenceConnectionLayout>,
 }
 
 #[derive(Debug, Clone)]

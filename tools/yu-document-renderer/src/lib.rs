@@ -1736,8 +1736,14 @@ mod tests {
             ("--x", 0, false, true, true),
         ] {
             for activation in ["", "+", "-"] {
+                // A return suffix requires a live activation on its sender.
+                let setup = if activation == "-" {
+                    "activate A\n"
+                } else {
+                    ""
+                };
                 let source = format!(
-                    "sequenceDiagram\nparticipant A\nparticipant B\nA{token}{activation}B: message ->> literal"
+                    "sequenceDiagram\nparticipant A\nparticipant B\n{setup}A{token}{activation}B: message ->> literal"
                 );
                 let graph = mermaid_rs_renderer::parse_mermaid_strict(&source)
                     .expect("sequence syntax")
@@ -2131,7 +2137,7 @@ mod tests {
                 }
             }
         }
-        for token in [r"-|\>", "-|//", r"-\\\", "--|", "->>()"] {
+        for token in [r"-|\>", "-|//", r"-\\\", "--|", "->>()()"] {
             assert!(
                 render(
                     Kind::Mermaid,

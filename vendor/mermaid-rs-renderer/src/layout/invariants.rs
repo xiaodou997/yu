@@ -244,6 +244,32 @@ pub fn validate_layout_invariants(layout: &Layout) -> Result<(), Vec<LayoutInvar
             }
         }
         DiagramData::Sequence(seq) => {
+            for (idx, circle) in seq.connections.iter().enumerate() {
+                let path = format!("sequence.connections[{idx}]");
+                check_point(&mut errors, &path, (circle.x, circle.y));
+                check_finite_positive(&mut errors, &format!("{path}.radius"), circle.radius);
+                check_inside_layout(
+                    &mut errors,
+                    &path,
+                    circle.x - circle.radius,
+                    circle.y - circle.radius,
+                    circle.radius * 2.0,
+                    circle.radius * 2.0,
+                    layout,
+                );
+                if !layout.edges.get(circle.message).is_some_and(|edge| {
+                    (if circle.at_start {
+                        &edge.from
+                    } else {
+                        &edge.to
+                    }) == &circle.participant
+                }) {
+                    errors.push(LayoutInvariantError::new(
+                        path,
+                        "must belong to its message endpoint",
+                    ));
+                }
+            }
             for lifeline in &seq.lifelines {
                 check_finite(
                     &mut errors,
@@ -405,7 +431,9 @@ pub fn validate_layout_invariants(layout: &Layout) -> Result<(), Vec<LayoutInvar
             }
         }
         DiagramData::Gantt(gantt) => {
-            if let Some(y) = gantt.top_axis_y { check_finite(&mut errors, "gantt.top_axis_y", y); }
+            if let Some(y) = gantt.top_axis_y {
+                check_finite(&mut errors, "gantt.top_axis_y", y);
+            }
             if let Some(title) = &gantt.title {
                 check_text_block(&mut errors, "gantt.title", title);
             }
@@ -433,7 +461,14 @@ pub fn validate_layout_invariants(layout: &Layout) -> Result<(), Vec<LayoutInvar
                 check_finite(&mut errors, "gantt.today_marker.opacity", style.opacity);
             }
             for (idx, &(x, width)) in gantt.excluded_spans.iter().enumerate() {
-                check_rect(&mut errors, &format!("gantt.excluded_spans[{idx}]"), x, gantt.chart_y, width, gantt.chart_height);
+                check_rect(
+                    &mut errors,
+                    &format!("gantt.excluded_spans[{idx}]"),
+                    x,
+                    gantt.chart_y,
+                    width,
+                    gantt.chart_height,
+                );
             }
             for (idx, section) in gantt.sections.iter().enumerate() {
                 let path = format!("gantt.sections[{idx}]");
@@ -446,7 +481,11 @@ pub fn validate_layout_invariants(layout: &Layout) -> Result<(), Vec<LayoutInvar
                 check_text_block(&mut errors, &format!("{path}.label"), &task.label);
                 check_finite(&mut errors, &format!("{path}.start"), task.start);
                 check_finite(&mut errors, &format!("{path}.duration"), task.duration);
-                check_finite(&mut errors, &format!("{path}.border_width"), task.border_width);
+                check_finite(
+                    &mut errors,
+                    &format!("{path}.border_width"),
+                    task.border_width,
+                );
             }
             for (idx, tick) in gantt.ticks.iter().enumerate() {
                 check_finite(&mut errors, &format!("gantt.ticks[{idx}].x"), tick.x);
