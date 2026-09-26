@@ -22,12 +22,13 @@ class PreparePasteChecksTests(unittest.TestCase):
 
     def test_all_cases_have_exact_history_bytes_hashes_and_utf16_ranges(self):
         manifest = PREPARE.prepare(self.output)
-        self.assertEqual(manifest["schema_version"], 3)
-        self.assertEqual(len(manifest["cases"]), 52)
-        self.assertEqual(sum(c["expected_paste_result"] == "reject" for c in manifest["cases"]), 24)
+        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(len(manifest["cases"]), 76)
+        self.assertEqual(sum(c["expected_paste_result"] == "reject" for c in manifest["cases"]), 32)
         for case in manifest["cases"]:
             with self.subTest(case=case["id"]):
                 directory = self.output / case["id"]
+                self.assertTrue((self.output / case["payload"]).is_file())
                 initial = (directory / "expected-0.md").read_bytes()
                 first = (directory / "expected-a.md").read_bytes()
                 second = (directory / "expected-b.md").read_bytes()
@@ -85,6 +86,29 @@ class PreparePasteChecksTests(unittest.TestCase):
         self.assertEqual(manifest["native_test_status"], "not_run")
         self.assertTrue(manifest["visual_review_required"])
         self.assertTrue(all(c["status"] == "not_run" for c in manifest["cases"]))
+
+    def test_row_group_samples_pair_legal_and_rejected_native_payloads(self):
+        manifest = PREPARE.prepare(self.output)
+        cases = [c for c in manifest["cases"] if c["id"].startswith("row-groups-")]
+        self.assertEqual(len(cases), 24)
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                rejected = case["id"].startswith(("row-groups-span-conflict-", "row-groups-whole-reject-"))
+                self.assertEqual(case["expected_paste_result"], "reject" if rejected else "accept")
+                self.assertTrue(case["preserve_target_row_groups"])
+                self.assertEqual(case["required_selection"], "whole_table" if "-whole-" in case["id"] else "target_or_rectangle")
+                payload = (self.output / case["payload"]).read_bytes()
+                stem = Path(case["payload"]).stem
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), manifest["fixture_sha256"][stem])
+                canonical = (self.output / case["input"]).read_bytes().decode("utf-8-sig")
+                self.assertIn("id='body'", canonical)
+                if case["id"].startswith("row-groups-body-body-"):
+                    self.assertNotIn("<thead", canonical)
+                    self.assertEqual(canonical.count("<tbody"), 2)
+                elif case["id"].startswith("row-groups-body-foot-"):
+                    self.assertIn("<tfoot", canonical)
+                if "-whole-" in case["id"]:
+                    self.assertIn("<tbody id='empty'></tbody>", canonical)
 
     def test_existing_output_is_not_modified(self):
         self.output.mkdir()
