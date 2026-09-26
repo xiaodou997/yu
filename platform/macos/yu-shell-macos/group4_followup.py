@@ -19,7 +19,9 @@ def option_error(options):
         return '--stress-idle-seconds requires --stress-seconds and must be between 0 and 120'
     if seconds and not 30 <= seconds <= 1800:
         return '--stress-seconds must be between 30 and 1800'
-    groups = [('table_interactions', 'table_resize'), ('smoke_document',), ('stress_seconds',), ('list_gestures',)]
+    if options.get('cold_resource_reopen') and not options.get('reopen'):
+        return '--cold-resource-reopen requires --reopen'
+    groups = [('table_interactions', 'table_resize'), ('smoke_document',), ('stress_seconds',), ('list_gestures',), ('cold_resource_reopen',)]
     active = [group for group in groups if any(options.get(key) for key in group)]
     if not active:
         return None  # Preserve existing independent suites.
@@ -415,9 +417,11 @@ class Checks:
             observations.append({'attempt':attempt, 'rect':rect, 'pixel_box':box,
                                  'image':path.name, 'contrasting_pixels':ink})
             if ink >= 12:
-                self.record('restored x^2 has visible pixels at its native source rectangle without input, resize or scroll')
+                self.result['restored_preview_status'] = 'visible'
+                self.record('restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll')
                 return
             time.sleep(1)
+        self.result['restored_preview_status'] = 'blank'
         raise AssertionError('Reopened formula stayed blank despite live helper and saved source')
 
     def list_gestures(self):
