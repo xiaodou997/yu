@@ -815,18 +815,20 @@ final class MacosSurfaceHostCoordinator {
     func tableResizeAccessibilityFrame(
         for descriptor: NativeTableResizeAccessibilityDivider
     ) -> NSRect {
-        guard descriptor.revision == bridge.revision,
+        guard isAttached,
+              descriptor.revision == bridge.revision,
               !bridge.composition.active,
-              let surfaceView,
-              let window = surfaceView.window,
-              let geometry = visualDecorationGeometry() else {
+              let textView = scrollView?.documentView as? DocumentTextView,
+              let window = textView.window else {
             return .zero
         }
+        // Invert visualPoint using the actual reading-column origin.
+        // AppKit's document-view conversion applies scrolling exactly once.
         let local = descriptor.rect.offsetBy(
-            dx: 0.0,
-            dy: -CGFloat(geometry.scrollY)
+            dx: textView.contentOrigin.x,
+            dy: textView.contentOrigin.y
         )
-        return window.convertToScreen(surfaceView.convert(local, to: nil))
+        return window.convertToScreen(textView.convert(local, to: nil))
     }
 
     /// Performs one VoiceOver increment/decrement as a Rust-owned transient

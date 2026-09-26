@@ -19,6 +19,8 @@ ROOT = HERE.parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
 parser.add_argument('--dark', action='store_true')
+parser.add_argument('--table-interactions', action='store_true', help='Real forward/reverse whole grouped-table paste with complete history')
+parser.add_argument('--table-resize', action='store_true', help='Real merged-column drag/cancel and persisted geometry')
 parser.add_argument('--math-suite', action='store_true', help='Exercise aligned, cases and multiline formula editing in the actual application')
 parser.add_argument('--diagram-suite', action='store_true', help='Exercise seven Mermaid families in the actual application')
 parser.add_argument('--recent-diagrams', action='store_true', help='Exercise the three central-connection and four Gantt-calendar fixtures with real caption edits')
@@ -142,6 +144,13 @@ result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required
           'test_helper_sha256':sha(app/'Contents/Helpers/yu-document-renderer'),
           'test_runner_sha256':sha(Path(__file__)),
           'options':{'multiline_diagram':args.multiline_diagram,'cjk_math':args.cjk_math,'cancel_helper':args.cancel_helper,'lifecycle':args.lifecycle,'dark':args.dark,'themes':args.themes,'failures':args.failures,'dollars':args.dollars,'equations':args.equations,'highlight':args.highlight,'scripts':args.scripts,'footnotes':args.footnotes,'footnote_errors':args.footnote_errors,'toc':args.toc,'html':args.html,'html_blocks':args.html_blocks,'anchors':args.anchors,'alignment':args.alignment,'html_tables':args.html_tables,'merged_tables':args.merged_tables,'html_lines':args.html_lines,'html_details':args.html_details,'html_lists':args.html_lists,'reopen':args.reopen,'diagram_suite':args.diagram_suite,'math_suite':args.math_suite}}
+after_reopen_check = None
+if args.table_interactions or args.table_resize:
+    import group4_followup
+    result['followup_module_sha256'] = sha(Path(group4_followup.__file__))
+    result['table_interactions'] = True
+    result['table_interactions'] = args.table_interactions
+    result['table_resize'] = args.table_resize
 sequence = 0
 suspended_helpers = set()
 
@@ -1166,6 +1175,14 @@ try:
             source = expected
             result['checks'].append('list-'+case['id']+': native bracket command matches fixed fixture; undo restores exact source and primary AX range; redo and BOM/CRLF save pass')
 
+    if args.table_interactions:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source, after_reopen_check = audit.table_interactions(ROOT)
+
+    if args.table_resize:
+        audit = group4_followup.Checks(run, stable_bounds, out, fixture, result)
+        source, after_reopen_check = audit.merged_resize()
+
     saved_before_reopen = fixture.read_bytes()
     old_helpers = helpers()
     run('key',12,'cmd'); process.wait(timeout=10)
@@ -1197,6 +1214,8 @@ try:
                 time.sleep(.1)
             assert len(helpers())==1 and not set(old_helpers).intersection(helpers())
         time.sleep(2)
+        if after_reopen_check:
+            after_reopen_check()
         run('capture',str(out/'reopened-document'))
         assert fixture.read_bytes()==saved_before_reopen
         end = len(expected.encode('utf-16-le'))//2
