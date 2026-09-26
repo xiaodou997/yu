@@ -26,6 +26,27 @@ enum FrameWakeGateChecks {
         intent.merge(force: true)
         intent = FrameSubmitIntent()
         precondition(!intent.takeForce(), "lifecycle reset must clear pending refresh")
+        var recovery = FramePresentationRecoveryBudget()
+        precondition(!recovery.request(attached: false, visible: true, sameSurface: true))
+        precondition(!recovery.request(attached: true, visible: false, sameSurface: true))
+        precondition(!recovery.request(attached: true, visible: true, sameSurface: false))
+        precondition(recovery.attempts == 0, "unrelated or hidden surfaces must not consume a retry")
+        for _ in 0..<FramePresentationRecoveryBudget.limit {
+            precondition(recovery.request(attached: true, visible: true, sameSurface: true))
+            precondition(!recovery.request(attached: true, visible: true, sameSurface: true), "coalesce until a display tick")
+            precondition(recovery.consume())
+            precondition(!recovery.consume(), "one retry per display tick")
+        }
+        for _ in 0..<1_000 {
+            precondition(!recovery.request(attached: true, visible: true, sameSurface: true))
+        }
+        precondition(recovery.attempts == FramePresentationRecoveryBudget.limit)
+        recovery.reset()
+        precondition(recovery.request(attached: true, visible: true, sameSurface: true))
+        precondition(recovery.attempts == 1, "a new request/lifecycle restores the bounded budget")
+        recovery.reset()
+        precondition(!recovery.consume(), "reset rejects an old queued display tick")
+        print("Presentation recovery: hidden/foreign/detached rejection, bounded retries and reset passed")
         print("FrameWakeGate: burst, promotion, duplicate, lifecycle and resource-intent checks passed")
     }
 }

@@ -56,6 +56,8 @@ void yu_metal_notify_frame_work_ready(void) {
     uint64_t acquisitionGeneration;
     uint64_t submittedSerial;
     uint64_t presentedSerial;
+    uint64_t droppedSerial;
+    uint64_t droppedGeneration;
     CFTimeInterval latestPresentedTime;
 }
 - (id<CAMetalDrawable>)takeReadyDrawable;
@@ -63,6 +65,8 @@ void yu_metal_notify_frame_work_ready(void) {
 - (uint64_t)beginPresentation;
 - (void)didPresentSerial:(uint64_t)serial atTime:(CFTimeInterval)time;
 - (BOOL)hasPresentedLatest;
+- (BOOL)needsPresentationRecovery;
+- (BOOL)recordDroppedSerial:(uint64_t)serial generation:(uint64_t)generation;
 - (CFTimeInterval)latestPresentationTime;
 - (void)setAcquisitionEnabled:(BOOL)enabled;
 - (void)invalidateReadyDrawable;
@@ -71,6 +75,8 @@ void yu_metal_notify_frame_work_ready(void) {
 @implementation YuMetalLayer
 - (void)trackPresentation:(id<CAMetalDrawable>)drawable {
     uint64_t serial = [self beginPresentation];
+    uint64_t generation;
+    @synchronized (self) { generation = acquisitionGeneration; }
     if (serial == 1 && yu_render_timing_enabled()) {
         fprintf(stdout, "yu-render-metric event=presentation_policy surface=%p vsync=%d transaction=%d drawable_count=%lu\n",
             self, self.displaySyncEnabled, self.presentsWithTransaction,
@@ -78,7 +84,22 @@ void yu_metal_notify_frame_work_ready(void) {
         fflush(stdout);
     }
     [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
-        if (presented.presentedTime <= 0) return;
+        if (presented.presentedTime == 0) {
+            if ([self recordDroppedSerial:serial generation:generation]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // A newer submission, resize or detach may supersede this
+                    // callback before the main thread handles it.
+                    @synchronized (self) {
+                        if (submittedSerial != serial || acquisitionGeneration != generation
+                            || ![self needsPresentationRecovery]) return;
+                    }
+                    yu_render_metric("presentation_dropped", self, 0);
+                    [[NSNotificationCenter defaultCenter]
+                        postNotificationName:@"YuRenderPresentationDropped" object:self];
+                });
+            }
+            return;
+        }
         [self didPresentSerial:serial atTime:presented.presentedTime];
     }];
 }
@@ -92,6 +113,23 @@ void yu_metal_notify_frame_work_ready(void) {
             presentedSerial = serial;
             latestPresentedTime = time;
         }
+    }
+}
+- (BOOL)recordDroppedSerial:(uint64_t)serial generation:(uint64_t)generation {
+    @synchronized (self) {
+        if (!acquisitionEnabled || acquisitionGeneration != generation
+            || serial != submittedSerial || serial <= presentedSerial
+            || droppedSerial == serial) return NO;
+        droppedSerial = serial;
+        droppedGeneration = generation;
+        return YES;
+    }
+}
+- (BOOL)needsPresentationRecovery {
+    @synchronized (self) {
+        return acquisitionEnabled && droppedSerial != 0
+            && droppedSerial == submittedSerial && presentedSerial < droppedSerial
+            && droppedGeneration == acquisitionGeneration;
     }
 }
 - (BOOL)hasPresentedLatest {
@@ -1331,6 +1369,64 @@ int yu_metal_render_plan(
     return 1;
 }
 
+// Resolve the real production presented callback without compositor timing.
+@interface YuMetalPresentationProbeDrawable : NSObject <CAMetalDrawable> {
+    CFTimeInterval time;
+    MTLDrawablePresentedHandler completion;
+}
+- (void)resolve:(CFTimeInterval)value;
+@end
+@implementation YuMetalPresentationProbeDrawable
+- (id<MTLTexture>)texture { return nil; }
+- (CAMetalLayer *)layer { return nil; }
+- (CFTimeInterval)presentedTime { return time; }
+- (NSUInteger)drawableID { return 0; }
+- (void)present {}
+- (void)presentAtTime:(CFTimeInterval)value { (void)value; }
+- (void)presentAfterMinimumDuration:(CFTimeInterval)value { (void)value; }
+- (void)addPresentedHandler:(MTLDrawablePresentedHandler)handler {
+    [completion release]; completion = [handler copy];
+}
+- (void)resolve:(CFTimeInterval)value { time = value; completion(self); }
+- (void)dealloc { [completion release]; [super dealloc]; }
+@end
+
+int yu_metal_presentation_recovery_self_check(void) {
+    @autoreleasepool {
+        YuMetalLayer *layer = [YuMetalLayer layer];
+        [layer setAcquisitionEnabled:YES];
+        if ([layer needsPresentationRecovery]) return 0;
+        YuMetalPresentationProbeDrawable *first = [[[YuMetalPresentationProbeDrawable alloc] init] autorelease];
+        YuMetalPresentationProbeDrawable *second = [[[YuMetalPresentationProbeDrawable alloc] init] autorelease];
+        [layer trackPresentation:first];
+        [layer trackPresentation:second];
+        [first resolve:0];
+        if ([layer needsPresentationRecovery]) return 0;
+        [second resolve:0];
+        if (![layer needsPresentationRecovery]) return 0;
+        [second resolve:2.5];
+        if ([layer needsPresentationRecovery] || ![layer hasPresentedLatest]) return 0;
+        [second resolve:0];
+        if ([layer needsPresentationRecovery]) return 0;
+        [layer trackPresentation:first];
+        [layer invalidateReadyDrawable];
+        [first resolve:0];
+        if ([layer needsPresentationRecovery]) return 0;
+        [layer trackPresentation:second];
+        [layer setAcquisitionEnabled:NO];
+        [second resolve:0];
+        if ([layer needsPresentationRecovery]) return 0;
+        [layer setAcquisitionEnabled:YES];
+        [layer trackPresentation:first];
+        [second resolve:0];
+        if ([layer needsPresentationRecovery]) return 0;
+        [first resolve:0];
+        if (![layer needsPresentationRecovery]) return 0;
+        [layer beginPresentation];
+        return ![layer needsPresentationRecovery];
+    }
+}
+
 void yu_metal_release_pipeline(void *pipeline_ptr) {
     if (pipeline_ptr == NULL) {
         return;
@@ -1354,6 +1450,82 @@ void yu_metal_release(void *object) {
 
 // Real GPU pixel oracle for the C/MSL uniform contract. Test-only callers use
 // an offscreen target; no window or screen-recording permission is involved.
+// Test-only caller: exercise the production image encoder after a glyph batch.
+// Readback/wait are confined to this off-screen regression, never frame submission.
+int yu_metal_image_pixel_probe(void *device_ptr, void *pipeline_ptr, void *image_ptr,
+                               uint32_t variant, uint32_t *out_ink) {
+    if (!device_ptr || !pipeline_ptr || !image_ptr || !out_ink) return 0;
+    @autoreleasepool {
+        id<MTLDevice> device = (id<MTLDevice>)device_ptr;
+        YuMetalPipeline *pipeline = (YuMetalPipeline *)pipeline_ptr;
+        const NSUInteger width = 1320, height = 1136, count = 22;
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModePrivate;
+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        id<MTLTexture> target = [[device newTextureWithDescriptor:desc] autorelease];
+        id<MTLCommandQueue> queue = [[device newCommandQueue] autorelease];
+        id<MTLBuffer> vertices = [[device newBufferWithLength:count*6*sizeof(YuMetalVertex) options:MTLResourceStorageModeShared] autorelease];
+        const NSUInteger row = 256, sample_height = 40;
+        id<MTLBuffer> sample = [[device newBufferWithLength:row*sample_height options:MTLResourceStorageModeShared] autorelease];
+        if (!target || !queue || !vertices || !sample) return 0;
+        YuMetalDrawCommand commands[22] = {0};
+        commands[0] = (YuMetalDrawCommand){.kind=0,.width=660,.height=568,.red=1,.green=1,.blue=1,.alpha=1};
+        for (NSUInteger i=1; i<20; i++)
+            commands[i] = (YuMetalDrawCommand){.kind=1,.x=(float)i*5,.y=55,.width=3,.height=12,.u1=1,.v1=1,.red=1,.green=1,.blue=1,.alpha=1,.page=0};
+        commands[20] = (YuMetalDrawCommand){.kind=2,.x=24,.y=106.518875f,.width=25,.height=19,.u1=1,.v1=1,.red=1,.green=1,.blue=1,.alpha=1,.resource=1,.image_kind=1};
+        commands[21] = (YuMetalDrawCommand){.kind=0,.x=24,.y=48,.width=1,.height=38.4,.alpha=1};
+        YuMetalVertex *values = vertices.contents;
+        for (NSUInteger i=0; i<count; i++) {
+            YuMetalDrawCommand c = commands[i];
+            YuMetalVertex quad[6] = {{c.x,c.y,c.u0,c.v0},{c.x+c.width,c.y,c.u1,c.v0},{c.x,c.y+c.height,c.u0,c.v1},{c.x+c.width,c.y,c.u1,c.v0},{c.x+c.width,c.y+c.height,c.u1,c.v1},{c.x,c.y+c.height,c.u0,c.v1}};
+            memcpy(values+i*6,quad,sizeof(quad));
+        }
+        void *glyph_ptr = NULL;
+        uint8_t *glyph_pixels = calloc(1024*1024, 4);
+        if (!glyph_pixels) return 0;
+        int uploaded = yu_metal_upload_rgba_texture(device_ptr,1024,1024,glyph_pixels,1024*1024*4,&glyph_ptr);
+        free(glyph_pixels);
+        if (!uploaded || !glyph_ptr) return 0;
+        [(id)glyph_ptr autorelease];
+        YuMetalTextureBinding glyph = {0, glyph_ptr};
+        YuMetalImageTextureBinding image = {1,1,image_ptr};
+        id<MTLCommandBuffer> buffer = [queue commandBuffer];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = target;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(1,1,1,1);
+        id<MTLRenderCommandEncoder> encoder = [buffer renderCommandEncoderWithDescriptor:pass];
+        if (!buffer || !encoder) return 0;
+        YuMetalFrameUniforms frame = {660,568,2,0};
+        [encoder setVertexBytes:&frame length:sizeof(frame) atIndex:1];
+        for (size_t i=0; i<count;) {
+            size_t end = yu_metal_batch_end(commands,i,count);
+            BOOL inline_image = (variant & 1) && commands[i].kind == 2;
+            if (!yu_metal_encode_command(encoder,pipeline,commands[i],&glyph,1,&image,1,
+                inline_image ? nil : vertices, i*6*sizeof(YuMetalVertex),(end-i)*6)) {
+                [encoder endEncoding]; return 0;
+            }
+            i=end;
+        }
+        [encoder endEncoding];
+        id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
+        if (!blit) return 0;
+        [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(48,212,0) sourceSize:MTLSizeMake(50,sample_height,1) toBuffer:sample destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row*sample_height];
+        [blit endEncoding];
+        [buffer commit]; [buffer waitUntilCompleted];
+        if (buffer.status != MTLCommandBufferStatusCompleted) return 0;
+        uint32_t ink = 0;
+        const uint8_t *pixels = sample.contents;
+        for (NSUInteger y=0; y<sample_height; y++) for (NSUInteger x=0; x<50; x++) {
+            const uint8_t *p = pixels+y*row+x*4;
+            if (p[0]<190 && p[1]<190 && p[2]<190) ink++;
+        }
+        *out_ink=ink;
+        return 1;
+    }
+}
+
 int yu_metal_rounded_pixel_probe(void *device_ptr, void *pipeline_ptr, uint8_t *rgba) {
     if (!device_ptr || !pipeline_ptr || !rgba) return 0;
     @autoreleasepool {

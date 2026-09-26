@@ -185,6 +185,16 @@ mod native {
             pipeline: *mut c_void,
             rgba: *mut u8,
         ) -> i32;
+        #[cfg(test)]
+        pub fn yu_metal_image_pixel_probe(
+            device: *mut c_void,
+            pipeline: *mut c_void,
+            image: *mut c_void,
+            variant: u32,
+            ink: *mut u32,
+        ) -> i32;
+        #[cfg(test)]
+        pub fn yu_metal_presentation_recovery_self_check() -> i32;
         pub fn yu_metal_render_plan(
             queue: *mut c_void,
             layer: *mut c_void,
@@ -3079,6 +3089,44 @@ mod tests {
             [49, 127, 185, 255],
             "C/MSL layout must preserve color"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn latest_dropped_presentation_requires_recovery_but_stale_callbacks_do_not() {
+        assert_eq!(
+            unsafe { native::yu_metal_presentation_recovery_self_check() },
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_image_pixels_survive_a_glyph_batch() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let pipeline = MetalPipeline::new(device.clone()).expect("Metal pipeline");
+        let image = MacosEmbeddedSvgRasterizer::new().rasterize(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"50\" height=\"38\"><path fill=\"#242426\" d=\"M5 5h10v25H5z M25 10h20v10H25z\"/></svg>", 50, 38,
+        ).expect("SVG pixels");
+        let mut uploader = MetalUploader::new(device.clone());
+        let texture = uploader.upload_rgba_image(&image).expect("image texture");
+        for variant in 0..64 {
+            let mut ink = 0;
+            let result = unsafe {
+                native::yu_metal_image_pixel_probe(
+                    device.raw(),
+                    pipeline.inner.raw.as_ptr(),
+                    texture.raw(),
+                    variant,
+                    &mut ink,
+                )
+            };
+            assert_eq!(result, 1, "off-screen GPU probe must execute");
+            assert!(
+                ink >= 400,
+                "variant {variant}: missing embedded pixels ({ink})"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

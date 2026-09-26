@@ -2,7 +2,8 @@ import AppKit
 import QuartzCore
 
 /// A view-bound display link follows the window's display and refresh rate.
-/// It only runs during live scrolling; no background polling or thread hops.
+/// It runs for live scrolling or a requested one-shot presentation recovery;
+/// idle surfaces do not poll or hop threads.
 final class DisplayLinkPacer: NSObject {
     private var link: CADisplayLink?
     private weak var view: NSView?
