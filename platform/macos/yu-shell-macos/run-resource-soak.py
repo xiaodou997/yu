@@ -40,6 +40,7 @@ def parse_args(argv=None):
     parser.add_argument('--idle-seconds', type=int, default=70, help='70..3600, observed both before and after closing work documents')
     parser.add_argument('--sample-seconds', type=int, default=5, help='1..60, read-only idle sampling interval')
     parser.add_argument('--dark', action='store_true')
+    parser.add_argument('--history-audit', action='store_true', help='Opt-in bounded receipt diagnostics; not a baseline memory run')
     args = parser.parse_args(argv)
     try:
         Options(args.documents, args.seconds, args.idle_seconds, args.sample_seconds).validate()
@@ -191,6 +192,8 @@ class NativeSoak:
         env = {k: v for k, v in os.environ.items() if not k.startswith('YU_')}
         env.update(YU_DOCUMENT_STATE_DIR=str(self.out / 'state'),
                    YU_PRESENTATION_STATE_DIR=str(self.out / 'columns'), YU_RESOURCE_AUDIT='1')
+        if self.args.history_audit:
+            env['YU_HISTORY_AUDIT'] = '1'
         from group4_followup import appearance_arguments
         command = [str(self.binary), str(path)] + appearance_arguments(self.args.dark)
         self.process = subprocess.Popen(command, env=env, stdout=self.log,
@@ -529,11 +532,18 @@ def main(argv=None):
               'accounting_module_sha256': digest(HERE / 'group4_resource_soak.py'),
               'pixel_oracle_module_sha256': digest(HERE / 'group4_followup.py')}
     soak = NativeSoak(args, out, result)
+    if args.history_audit:
+        result['diagnostic_run'] = 'history receipt logging; do not compare as baseline memory'
+        result['history_audit_module_sha256'] = digest(HERE / 'group4_history_audit.py')
     exit_code = 1
     try:
         soak.progress()
         prepare(soak, production, build)
         exercise(soak)
+        if args.history_audit:
+            from group4_history_audit import summarize_history
+            with (out / 'app.log').open() as stream:
+                result['history_audit'] = summarize_history(stream, expected_pids=result['application_pids'])
         exit_code = 0
     except (Exception, KeyboardInterrupt) as error:
         result['passed'] = False

@@ -2,6 +2,7 @@ import AppKit
 
 /// Native responder checks only. These do not assert delivery through WindowServer.
 func checkHistoryShortcutRouting() throws {
+    try checkHistoryAuditContracts()
     let original = "# History routing\r\n\r\n$x^2$\r\n\r\n```mermaid\r\nflowchart LR\r\nA --> B\r\n```\r\n中文🙂\r\n"
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("yu-history-routing-\(UUID().uuidString).md")

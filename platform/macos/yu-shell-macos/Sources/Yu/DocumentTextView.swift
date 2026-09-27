@@ -56,7 +56,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
             cancelInputComposition(cancelEvent: event)
             return
         }
-        if routeListShortcut(event) || routeHistoryShortcut(event) { return }
+        if routeListShortcut(event) || routeHistoryShortcut(event, entry: .keyDown) { return }
         let handled = inputContext?.handleEvent(event) == true
         traceNativeEvent("inputContext", ["key_code": event.keyCode, "handled": handled])
         if handled { return }
@@ -1523,11 +1523,11 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
             return
         }
         if name == "undo:" {
-            routeCommand(Command.undo)
+            routeCommand(Command.undo, historyEntry: .textSystem)
             return
         }
         if name == "redo:" {
-            routeCommand(Command.redo)
+            routeCommand(Command.redo, historyEntry: .textSystem)
             return
         }
 
@@ -1580,21 +1580,33 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         // AppKit probes the whole view tree for key equivalents, including
         // this surface while a search field owns the keyboard. Rust history
         // must only receive shortcuts from the active document input host.
-        guard window?.firstResponder === self else { return false }
-        if routeListShortcut(event) || routeHistoryShortcut(event) { return true }
+        guard window?.firstResponder === self else {
+            _ = routeHistoryShortcut(event, entry: .keyEquivalent) // Diagnostic rejection only.
+            return false
+        }
+        if routeListShortcut(event) || routeHistoryShortcut(event, entry: .keyEquivalent) { return true }
         return super.performKeyEquivalent(with: event)
     }
 
     /// A key-down can reach the input host without a key-equivalent probe.
     /// Consume it before an input source swallows it, using the same Rust history
     /// route as menu actions. Never identify Z by its physical QWERTY key code.
-    private func routeHistoryShortcut(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown, window?.firstResponder === self, isEditable else { return false }
+    private func routeHistoryShortcut(_ event: NSEvent, entry: HistoryEventAudit.Entry) -> Bool {
+        guard event.type == .keyDown else { return false }
         let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
         guard modifiers == .command || modifiers == [.command, .shift],
               [event.charactersIgnoringModifiers, event.characters]
                 .compactMap({ $0 }).contains(where: { $0.lowercased() == "z" }) else { return false }
-        return routeCommand(modifiers.contains(.shift) ? Command.redo : Command.undo)
+        let command = modifiers.contains(.shift) ? Command.redo : Command.undo
+        guard window?.firstResponder === self, isEditable else {
+            if let audit = HistoryEventAudit.shared {
+                let ticket = audit.begin(entry: entry, command: command, eventTimestamp: event.timestamp,
+                    state: historyAuditState(command))
+                audit.end(ticket: ticket, revision: bridge.revision, handled: false)
+            }
+            return false
+        }
+        return routeCommand(command, historyEntry: entry, historyEvent: event)
     }
 
     // Some input sources consume Command-bracket in keyDown without invoking
@@ -1610,8 +1622,20 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         return routeCommand(key == "]" ? Command.indentList : Command.outdentList)
     }
 
+    private func historyAuditState(_ command: UInt8) -> HistoryEventAudit.State {
+        HistoryEventAudit.State(window: window?.windowNumber ?? 0,
+            firstResponder: window?.firstResponder === self, editable: isEditable,
+            composition: bridge.composition.active, available: bridge.commandAvailable(command), revision: bridge.revision)
+    }
+
     @discardableResult
-    private func routeCommand(_ command: UInt8) -> Bool {
+    private func routeCommand(_ command: UInt8, historyEntry: HistoryEventAudit.Entry = .direct,
+                              historyEvent: NSEvent? = nil) -> Bool {
+        let audit = (command == Command.undo || command == Command.redo) ? HistoryEventAudit.shared : nil
+        let ticket = audit?.begin(entry: historyEntry, command: command, eventTimestamp: historyEvent?.timestamp,
+            state: historyAuditState(command))
+        var handled = false
+        defer { if let audit { audit.end(ticket: ticket, revision: bridge.revision, handled: handled) } }
         guard !bridge.composition.active else { return false }
         let isVertical = command == Command.moveUp
             || command == Command.moveDown
@@ -1632,6 +1656,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
             synchronizeProjection()
             postAccessibilityRefresh()
             onDocumentChange?()
+            handled = true
             return true
         } catch {
             onError?(error)
@@ -1821,8 +1846,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
 
     // The standard responder-chain selectors let system panels/fields own
     // their editing while this view keeps canonical history in Rust.
-    @objc func undo(_ sender: Any?) { performUndo() }
-    @objc func redo(_ sender: Any?) { performRedo() }
+    @objc func undo(_ sender: Any?) { _ = routeCommand(Command.undo, historyEntry: .menuSelector) }
+    @objc func redo(_ sender: Any?) { _ = routeCommand(Command.redo, historyEntry: .menuSelector) }
 
     func canUndo() -> Bool {
         !bridge.composition.active && bridge.commandAvailable(Command.undo)
