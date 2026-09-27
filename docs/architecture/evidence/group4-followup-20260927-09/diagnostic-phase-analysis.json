@@ -1,0 +1,296 @@
+{
+  "full_run_passed": false,
+  "completed_lifetimes": 4,
+  "history_verifications": [
+    {
+      "event": "retained_history_verified",
+      "seconds": 152.226145375,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 154.10911770799999,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 156.017725458,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 158.13344275,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 388.973748708,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 390.669580542,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 392.507059,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 394.50445320800003,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 611.9824837499999,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 613.626,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 615.42338525,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 617.358062667,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 833.820098792,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 835.484863667,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 837.182678875,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 839.118531958,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    }
+  ],
+  "closed_endpoints": {
+    "lifetime_01_closed_idle": {
+      "event": "memory",
+      "seconds": 235.91782,
+      "session": "retained",
+      "phase": "lifetime_01_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 51013,
+        "physical_footprint_bytes": 246007104,
+        "lifetime_peak_physical_footprint_bytes": 465864096
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-diagnostic-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 10.489671792,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_02_closed_idle": {
+      "event": "memory",
+      "seconds": 472.19005991700004,
+      "session": "retained",
+      "phase": "lifetime_02_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 51013,
+        "physical_footprint_bytes": 223282544,
+        "lifetime_peak_physical_footprint_bytes": 465864096
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-diagnostic-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 10.489671792,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_03_closed_idle": {
+      "event": "memory",
+      "seconds": 695.047469083,
+      "session": "retained",
+      "phase": "lifetime_03_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 51013,
+        "physical_footprint_bytes": 221103448,
+        "lifetime_peak_physical_footprint_bytes": 465864096
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-diagnostic-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 10.489671792,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_04_closed_idle": {
+      "event": "memory",
+      "seconds": 916.664856208,
+      "session": "retained",
+      "phase": "lifetime_04_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 51013,
+        "physical_footprint_bytes": 186598720,
+        "lifetime_peak_physical_footprint_bytes": 465864096
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-diagnostic-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 10.489671792,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    }
+  },
+  "receipt_pairs": 128,
+  "cold_reopen": "not_run",
+  "failure": "Target app did not become frontmost after allocation captures",
+  "memory_verdict": "not_determined"
+}

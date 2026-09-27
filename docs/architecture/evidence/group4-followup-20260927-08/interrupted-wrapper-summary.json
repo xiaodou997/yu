@@ -1,0 +1,22 @@
+{
+  "passed": false,
+  "group4_signoff": false,
+  "runs": [
+    {
+      "name": "unified-1800-light",
+      "exit_code": 0,
+      "passed": true,
+      "wall_seconds": 2004.1038812089998,
+      "result_sha256": "3aabd49d8339457d09cc3f43a68b1ce5d2ec44a1c03b734eb6b62c13b7a8a435",
+      "completed_passes": 87,
+      "churn_elapsed_seconds": 1814.212565292
+    }
+  ],
+  "product_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+  "diagnostic_environment_removed": [
+    "MallocNanoZone",
+    "MallocSpaceEfficient"
+  ],
+  "history_receipts_enabled": false,
+  "allocation_tools_attached": false
+}

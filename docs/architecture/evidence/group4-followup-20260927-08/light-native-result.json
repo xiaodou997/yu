@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "passed": true,
+  "group4_signoff": false,
+  "checks": [
+    "restored x^2 has visible pixels in its isolated formula gap without input, resize or scroll"
+  ],
+  "build": {
+    "app": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app",
+    "app_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+    "shader_sha256": "b5f1563b90031cdf588fd00166136fbdcda9dba94df5751324142f46c7b9bbb7",
+    "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+    "helper_build_version": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/Helpers/yu-document-renderer:\nLoad command 11\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform MACOS\n    minos 26.0\n      sdk 27.0\n   ntools 1\n     tool LD\n  version 27037.1",
+    "helper_dependencies": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/Helpers/yu-document-renderer:\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)",
+    "configuration": "release",
+    "architectures": [
+      "arm64"
+    ],
+    "minimum_os": "26.0",
+    "build_version": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu:\nLoad command 11\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform MACOS\n    minos 26.0\n      sdk 27.0\n   ntools 1\n     tool LD\n  version 27037.1",
+    "xcode": "Xcode 27.0\nBuild version 27A266a",
+    "sdk": "27.0",
+    "host_os": "27.0",
+    "dependencies": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu:\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.0.69)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)\n\t/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit (compatibility version 45.0.0, current version 2775.10.103)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.0.69)\n\t/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics (compatibility version 64.0.0, current version 2050.0.0)\n\t/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText (compatibility version 1.0.0, current version 904.0.0)\n\t/System/Library/Frameworks/CryptoKit.framework/Versions/A/CryptoKit (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 382.5.3)\n\t/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore (compatibility version 1.2.0, current version 1223.2.2)\n\t/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenCaptureKit (compatibility version 1.0.0, current version 1.0.0)\n\t/usr/lib/swift/libswiftAVFoundation.dylib (compatibility version 1.0.0, current version 2450.77.5, weak)\n\t/usr/lib/swift/libswiftCore.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/swift/libswiftCoreAudio.dylib (compatibility version 1.0.0, current version 482.102.10, weak)\n\t/usr/lib/swift/libswiftCoreFoundation.dylib (compatibility version 1.0.0, current version 120.100.0)\n\t/usr/lib/swift/libswiftCoreImage.dylib (compatibility version 1.0.0, current version 3.0.0, weak)\n\t/usr/lib/swift/libswiftCoreMIDI.dylib (compatibility version 1.0.0, current version 6.0.0, weak)\n\t/usr/lib/swift/libswiftDarwin.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswiftDispatch.dylib (compatibility version 1.0.0, current version 1605.0.2)\n\t/usr/lib/swift/libswiftIOKit.dylib (compatibility version 1.0.0, current version 1.0.0, weak)\n\t/usr/lib/swift/libswiftMetal.dylib (compatibility version 1.0.0, current version 382.5.3, weak)\n\t/usr/lib/swift/libswiftOSLog.dylib (compatibility version 1.0.0, current version 10.0.0, weak)\n\t/usr/lib/swift/libswiftObjectiveC.dylib (compatibility version 1.0.0, current version 973.1.0)\n\t/usr/lib/swift/libswiftQuartzCore.dylib (compatibility version 1.0.0, current version 5.0.0, weak)\n\t/usr/lib/swift/libswiftSpatial.dylib (compatibility version 1.0.0, current version 1.0.0, weak)\n\t/usr/lib/swift/libswiftUniformTypeIdentifiers.dylib (compatibility version 1.0.0, current version 917.0.1)\n\t/usr/lib/swift/libswiftXPC.dylib (compatibility version 1.0.0, current version 167.0.2, weak)\n\t/usr/lib/swift/libswift_Builtin_float.dylib (compatibility version 0.0.0, current version 0.0.0, weak)\n\t/usr/lib/swift/libswift_Concurrency.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/swift/libswift_DarwinFoundation1.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswift_DarwinFoundation2.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswiftos.dylib (compatibility version 1.0.0, current version 1090.0.0)\n\t/usr/lib/swift/libswiftsimd.dylib (compatibility version 1.0.0, current version 25.0.0, weak)",
+    "artifact_audit_passed": true,
+    "runtime_26_verified": false,
+    "runtime_27_verified": false,
+    "visual_acceptance": false,
+    "real_input_acceptance": false,
+    "performance_acceptance": false
+  },
+  "options": {
+    "output": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-08b/unified-1800-light",
+    "documents": 4,
+    "seconds": 1800,
+    "idle_seconds": 70,
+    "sample_seconds": 5,
+    "dark": false,
+    "history_audit": false
+  },
+  "memory_verdict": "not_determined",
+  "real_calendar_events": "not_run",
+  "complete_selection_matrix": "not_run",
+  "visual_review_required": true,
+  "test_runner_sha256": "81f801862ff2550b15146868cf6dc87e6c68888ccdaeb5f45dd2895e582a8187",
+  "accounting_module_sha256": "cde22b2d1020c5809853ffbc0d209375c011031a27b35da70554ce52d975461f",
+  "pixel_oracle_module_sha256": "c19269136cff67bf2ba5a2396e6c0501e5dabf7589889910664b68bbb40e7582",
+  "footprint": {
+    "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+    "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+    "phases": [
+      {
+        "session": "retained",
+        "phase": "sentinel_baseline",
+        "pid": 54441,
+        "samples": 1,
+        "first_seconds": 7.919782375,
+        "last_seconds": 7.919782375,
+        "first_bytes": 69010440,
+        "last_bytes": 69010440,
+        "min_bytes": 69010440,
+        "max_bytes": 69010440,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "all_documents_open",
+        "pid": 54441,
+        "samples": 1,
+        "first_seconds": 12.463206332999999,
+        "last_seconds": 12.463206332999999,
+        "first_bytes": 248071368,
+        "last_bytes": 248071368,
+        "min_bytes": 248071368,
+        "max_bytes": 248071368,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "churn_valid",
+        "pid": 54441,
+        "samples": 348,
+        "first_seconds": 13.957855082999998,
+        "last_seconds": 1822.3724495410002,
+        "first_bytes": 275137760,
+        "last_bytes": 315786608,
+        "min_bytes": 272860528,
+        "max_bytes": 373769560,
+        "delta_bytes": 40648848
+      },
+      {
+        "session": "retained",
+        "phase": "churn_error",
+        "pid": 54441,
+        "samples": 348,
+        "first_seconds": 15.842688875,
+        "last_seconds": 1824.877183583,
+        "first_bytes": 279381240,
+        "last_bytes": 315688304,
+        "min_bytes": 272860528,
+        "max_bytes": 373228864,
+        "delta_bytes": 36307064
+      },
+      {
+        "session": "retained",
+        "phase": "churn_plain",
+        "pid": 54441,
+        "samples": 348,
+        "first_seconds": 17.478028666,
+        "last_seconds": 1826.6758146250002,
+        "first_bytes": 279463160,
+        "last_bytes": 315671920,
+        "min_bytes": 271893872,
+        "max_bytes": 373179712,
+        "delta_bytes": 36208760
+      },
+      {
+        "session": "retained",
+        "phase": "retained_history_idle",
+        "pid": 54441,
+        "samples": 15,
+        "first_seconds": 1826.7627327910002,
+        "last_seconds": 1896.7832773750001,
+        "first_bytes": 315671920,
+        "last_bytes": 309675376,
+        "min_bytes": 309675376,
+        "max_bytes": 315671920,
+        "delta_bytes": -5996544
+      },
+      {
+        "session": "retained",
+        "phase": "closing_documents",
+        "pid": 54441,
+        "samples": 4,
+        "first_seconds": 1903.820508125,
+        "last_seconds": 1908.6288898750001,
+        "first_bytes": 268076400,
+        "last_bytes": 164726080,
+        "min_bytes": 164726080,
+        "max_bytes": 268076400,
+        "delta_bytes": -103350320
+      },
+      {
+        "session": "retained",
+        "phase": "closed_documents_idle",
+        "pid": 54441,
+        "samples": 15,
+        "first_seconds": 1909.131655541,
+        "last_seconds": 1979.1536115410001,
+        "first_bytes": 164726080,
+        "last_bytes": 153290048,
+        "min_bytes": 153290048,
+        "max_bytes": 164726080,
+        "delta_bytes": -11436032
+      },
+      {
+        "session": "retained",
+        "phase": "same_process_resource_reopen",
+        "pid": 54441,
+        "samples": 4,
+        "first_seconds": 1981.702293583,
+        "last_seconds": 1995.4477536250001,
+        "first_bytes": 152716608,
+        "last_bytes": 168166720,
+        "min_bytes": 152651072,
+        "max_bytes": 168166720,
+        "delta_bytes": 15450112
+      },
+      {
+        "session": "cold_reopen",
+        "phase": "cold_resource_reopen",
+        "pid": 79890,
+        "samples": 1,
+        "first_seconds": 2000.868456416,
+        "last_seconds": 2000.868456416,
+        "first_bytes": 83084368,
+        "last_bytes": 83084368,
+        "min_bytes": 83084368,
+        "max_bytes": 83084368,
+        "delta_bytes": 0
+      }
+    ]
+  },
+  "elapsed_seconds": 2003.9589505830002,
+  "native_events": 10685,
+  "process_inventory_binary_sha256": "a08a846e3648a2e7eaf2202a4727cb21695b4562b8290b77b51966ad90415341",
+  "process_inventory_source_sha256": "bd603d5282ca19ea735802bd21ccceabfbcb0b69b923f761ebbd85f53669590e",
+  "isolated_bundle": "io.github.xiaodou997.yu.resource-soak.16828e2acfd74bdba10028dc588f1ddb",
+  "test_app_sha256": "d7f0c0e1df260972c4efca367bcb9f93ec52123363203d7cf497c6ff0d1c4069",
+  "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+  "native_driver_sha256": "f7c64357336b52d373d264e48bb58dc652b6bc3abebe973f1bcbb406f7d7dd07",
+  "process_inventory": {
+    "method": "libproc kernel executable path + BSD process birth identity",
+    "unreadable_unrelated_max": 13
+  },
+  "application_pids": [
+    54441,
+    79890
+  ],
+  "completed_passes": 87,
+  "churn_elapsed_seconds": 1814.212565292,
+  "same_process_phases_completed": true,
+  "cold_pixel_oracle_started": true,
+  "restored_preview": [
+    {
+      "attempt": 0,
+      "rect": {
+        "x": 1318,
+        "y": 431.4000015258789,
+        "width": 80,
+        "height": 50.79999542236328
+      },
+      "pixel_box": [
+        528,
+        280,
+        688,
+        383
+      ],
+      "image": "restored-preview-0-207016.png",
+      "contrasting_pixels": 182,
+      "appearance": {
+        "expected": "light",
+        "observed": "light",
+        "background_level": 255.0,
+        "matches": true
+      }
+    }
+  ],
+  "restored_preview_status": "visible",
+  "scope": "This finite native soak only; not Group 4 signoff or a leak verdict",
+  "remaining_isolated_processes": {
+    "app": [],
+    "helpers": []
+  },
+  "events.jsonl_sha256": "2c5205135ac2eb9282bb89c23cea804d93e861903a1e0d7cccb8d88a234415c2",
+  "app.log_sha256": "3124923234b08a368ae722a0d702ec5a56b30d6bcef514448a48a55248cde8a4"
+}

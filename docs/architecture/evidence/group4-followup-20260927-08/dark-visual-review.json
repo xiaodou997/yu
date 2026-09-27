@@ -1,0 +1,7 @@
+{
+  "image_sha256": "c6671c18c71a7cae99de2c838cd06d83e3a4844b8e040628e30841147f05536c",
+  "reviewed": "2026-09-27",
+  "method": "Direct visual inspection of the complete captured window via project_artifact image",
+  "observed": "Dark document background; x squared visible between Stress restored and TAIL. No blank formula gap.",
+  "scope": "This cold-reopen viewport only; not long-page or full selection acceptance."
+}

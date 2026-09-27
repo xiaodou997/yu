@@ -1,8 +1,16 @@
 # 第四组测试文档与执行入口索引
 
-更新：2026-09-26。本页区分可直接在 Yu 打开的样本、验收说明和自动化入口；文档存在或输入生成不等于测试通过。当前冻结候选为标签 `group4-freeze-20260926-rc3`，源码 `6afb7a3dac785d2674236cff1fab65f3546fee39`；旧候选 `70b54992` 因表格公式未接入生产渲染而被拒绝，修复和重跑证据均保留。本轮执行结果见 [冻结构建与综合审计](mac-group4-freeze-audit.md)。
+更新：2026-09-27。本页区分可直接在 Yu 打开的样本、验收说明和自动化入口；文档存在或输入生成不等于测试通过。历史冻结候选标签为 `group4-freeze-20260926-rc3`，源码 `6afb7a3dac785d2674236cff1fab65f3546fee39`；旧候选 `70b54992` 因表格公式未接入生产渲染而被拒绝，修复和重跑证据均保留。历史冻结执行结果见 [冻结构建与综合审计](mac-group4-freeze-audit.md)，最新结果以第八／九轮为准。
 
-最新增量入口：[收尾第一轮](mac-group4-followup-01.md)。产品修复已推进到 `c747ea13`，其打包身份与旧RC3分别记录，不移动历史标签。该轮新增真实整表正反选择／列宽、列表拖选／多光标、整文档联动及有限资源压力。
+最新入口：[第八轮完整长回归、接收证据与有限分配栈](mac-group4-followup-08.md)、[第九轮结果收口与闭窗驻留](mac-group4-followup-09.md)。第八轮同构建浅深色完整流程均已完成，深色终图已复核；配对分析与原失败／中断分别保存。第九轮 `run-resource-residency.py` 复用原有原生输入、进程身份和像素门禁；`--allocation-stacks` 为独立诊断，不能混入普通足迹结果。工具单元测试是 `tools/test_group4_residency.py`，不是实窗通过数量。 驻留全文替换使用驱动paste-document的有界消费确认，不重发粘贴；`tools/check-native-paste-lease.py` 是独立延迟消费夹具对照，不是产品验收。
+
+历史入口：[收尾第三轮：冷重开像素门禁与资源复验](mac-group4-followup-03.md)。顶点尝试 `6302d89c` 已被 `8a7473a1` 撤回，不能计为修复；冷重开固定 `x²` 文档要求实际像素存在，不能以进程存在／源码一致／资源计数替代。`tools/test_group4_preview.py` 只测试像素观察器，不计作实窗结果；外部脚本在 `--resource-audit --stress-seconds … --reopen` 场景自动调用此观察器，运行机需要 Pillow。测试前不要切回历史RC3。
+
+历史入口：[收尾第二轮：资源回收与增长归因](mac-group4-followup-02.md)。产品修复 `54c5856c`／`b4d8f47a` 均已在 main；直接使用最新 main 构建。新增 `crates/yu-render/tests/embedded_residency.rs`、`platform/macos/yu-render-macos/tests/embedded_residency.rs`，以及资源／FFI版本清理回归。外部脚本新增 `--resource-audit` 和 `--stress-idle-seconds`，后者必须搭配压力模式；逻辑资源计数、物理足迹及历史条目分别记录。
+
+历史增量入口：[收尾第一轮](mac-group4-followup-01.md)。产品修复已推进到 `c747ea13`，其打包身份与旧RC3分别记录，不移动历史标签。该轮新增真实整表正反选择／列宽、列表拖选／多光标、整文档联动及有限资源压力。
+
+第四轮入口：[末帧丢弃与显示节拍恢复](mac-group4-followup-04.md)。继续使用原有冷重开像素门禁，源码／资源计数与实际呈现分别判定。同进程多文档工具与参数边界见[资源压力入口](mac-group4-resource-soak.md)；实际执行结果按当前构建单独记录。
 
 ## 一、直接打开的测试文档
 

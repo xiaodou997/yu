@@ -1,0 +1,601 @@
+{
+  "passed": true,
+  "scope": "Four finite same-process lifetimes; not a capacity bound or zero-leak verdict.",
+  "product_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+  "result_sha256": "77f995483c2947779b94f5ab512caf7b5d5018b85917276fb23ade90d11efe3f",
+  "elapsed_seconds": 851.608196708,
+  "retained_process_identity": {
+    "kind": "app",
+    "pid": 45511,
+    "ppid": 45463,
+    "pgid": 45511,
+    "start_seconds": 1790485470,
+    "start_microseconds": 45228
+  },
+  "footprint": {
+    "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+    "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+    "phases": [
+      {
+        "session": "retained",
+        "phase": "sentinel_cold_baseline",
+        "pid": 45511,
+        "samples": 1,
+        "first_seconds": 6.937408333,
+        "last_seconds": 6.937408333,
+        "first_bytes": 83952696,
+        "last_bytes": 83952696,
+        "min_bytes": 83952696,
+        "max_bytes": 83952696,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_opened",
+        "pid": 45511,
+        "samples": 1,
+        "first_seconds": 11.471144958,
+        "last_seconds": 11.471144958,
+        "first_bytes": 253428936,
+        "last_bytes": 253428936,
+        "min_bytes": 253428936,
+        "max_bytes": 253428936,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_valid",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 12.560805540999999,
+        "last_seconds": 59.072426791,
+        "first_bytes": 279463136,
+        "last_bytes": 350258448,
+        "min_bytes": 279463136,
+        "max_bytes": 380650792,
+        "delta_bytes": 70795312
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_plain",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 15.30867075,
+        "last_seconds": 62.673860250000004,
+        "first_bytes": 284624096,
+        "last_bytes": 365135144,
+        "min_bytes": 284624096,
+        "max_bytes": 376423720,
+        "delta_bytes": 80511048
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_retained_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 62.73033575,
+        "last_seconds": 132.730170333,
+        "first_bytes": 365135144,
+        "last_bytes": 292554024,
+        "min_bytes": 292521256,
+        "max_bytes": 365135144,
+        "delta_bytes": -72581120
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_closed_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 145.819152333,
+        "last_seconds": 215.842610791,
+        "first_bytes": 214222096,
+        "last_bytes": 213943568,
+        "min_bytes": 213943568,
+        "max_bytes": 214222096,
+        "delta_bytes": -278528
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_opened",
+        "pid": 45511,
+        "samples": 1,
+        "first_seconds": 222.718679458,
+        "last_seconds": 222.718679458,
+        "first_bytes": 274171176,
+        "last_bytes": 274171176,
+        "min_bytes": 274171176,
+        "max_bytes": 274171176,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_valid",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 223.790722583,
+        "last_seconds": 269.445798166,
+        "first_bytes": 282428712,
+        "last_bytes": 295355688,
+        "min_bytes": 282428712,
+        "max_bytes": 322078040,
+        "delta_bytes": 12926976
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_plain",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 226.502728,
+        "last_seconds": 273.016847,
+        "first_bytes": 282314024,
+        "last_bytes": 298911016,
+        "min_bytes": 282314024,
+        "max_bytes": 321914200,
+        "delta_bytes": 16596992
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_retained_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 273.072516166,
+        "last_seconds": 343.084548208,
+        "first_bytes": 298911016,
+        "last_bytes": 302318888,
+        "min_bytes": 293274920,
+        "max_bytes": 302548264,
+        "delta_bytes": 3407872
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_closed_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 355.589887583,
+        "last_seconds": 425.60199325,
+        "first_bytes": 181077264,
+        "last_bytes": 121390328,
+        "min_bytes": 121390328,
+        "max_bytes": 181077264,
+        "delta_bytes": -59686936
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_opened",
+        "pid": 45511,
+        "samples": 1,
+        "first_seconds": 430.308441791,
+        "last_seconds": 430.308441791,
+        "first_bytes": 239682856,
+        "last_bytes": 239682856,
+        "min_bytes": 239682856,
+        "max_bytes": 239682856,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_valid",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 431.410117333,
+        "last_seconds": 478.281376,
+        "first_bytes": 260736296,
+        "last_bytes": 283477312,
+        "min_bytes": 260736296,
+        "max_bytes": 293897536,
+        "delta_bytes": 22741016
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_plain",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 434.225429291,
+        "last_seconds": 481.909764833,
+        "first_bytes": 264832296,
+        "last_bytes": 283297088,
+        "min_bytes": 264832296,
+        "max_bytes": 293766464,
+        "delta_bytes": 18464792
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_retained_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 481.9683295,
+        "last_seconds": 551.954839458,
+        "first_bytes": 283297088,
+        "last_bytes": 281462080,
+        "min_bytes": 277742912,
+        "max_bytes": 283297088,
+        "delta_bytes": -1835008
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_closed_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 564.289819416,
+        "last_seconds": 634.310040916,
+        "first_bytes": 173442344,
+        "last_bytes": 159335696,
+        "min_bytes": 159335696,
+        "max_bytes": 173442344,
+        "delta_bytes": -14106648
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_opened",
+        "pid": 45511,
+        "samples": 1,
+        "first_seconds": 639.374913416,
+        "last_seconds": 639.374913416,
+        "first_bytes": 245794040,
+        "last_bytes": 245794040,
+        "min_bytes": 245794040,
+        "max_bytes": 245794040,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_valid",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 640.577377791,
+        "last_seconds": 688.890776375,
+        "first_bytes": 261276968,
+        "last_bytes": 281822528,
+        "min_bytes": 261276968,
+        "max_bytes": 293422400,
+        "delta_bytes": 20545560
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_plain",
+        "pid": 45511,
+        "samples": 12,
+        "first_seconds": 643.42764375,
+        "last_seconds": 692.709750333,
+        "first_bytes": 264815912,
+        "last_bytes": 285984064,
+        "min_bytes": 264815912,
+        "max_bytes": 292209984,
+        "delta_bytes": 21168152
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_retained_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 692.770599833,
+        "last_seconds": 762.765294375,
+        "first_bytes": 285984064,
+        "last_bytes": 286065984,
+        "min_bytes": 280347968,
+        "max_bytes": 286131520,
+        "delta_bytes": 81920
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_closed_idle",
+        "pid": 45511,
+        "samples": 15,
+        "first_seconds": 775.20260275,
+        "last_seconds": 845.229765958,
+        "first_bytes": 169854272,
+        "last_bytes": 155501864,
+        "min_bytes": 155501864,
+        "max_bytes": 169854272,
+        "delta_bytes": -14352408
+      },
+      {
+        "session": "cold_reopen",
+        "phase": "cold_resource_reopen",
+        "pid": 50940,
+        "samples": 1,
+        "first_seconds": 848.360711583,
+        "last_seconds": 848.360711583,
+        "first_bytes": 83592272,
+        "last_bytes": 83592272,
+        "min_bytes": 83592272,
+        "max_bytes": 83592272,
+        "delta_bytes": 0
+      }
+    ]
+  },
+  "closed_endpoints": {
+    "lifetime_01_closed_idle": {
+      "event": "memory",
+      "seconds": 215.842657666,
+      "session": "retained",
+      "phase": "lifetime_01_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 45511,
+        "physical_footprint_bytes": 213943568,
+        "lifetime_peak_physical_footprint_bytes": 389350696
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-baseline-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 6.841450791,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_02_closed_idle": {
+      "event": "memory",
+      "seconds": 425.602056916,
+      "session": "retained",
+      "phase": "lifetime_02_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 45511,
+        "physical_footprint_bytes": 121390328,
+        "lifetime_peak_physical_footprint_bytes": 389350696
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-baseline-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 6.841450791,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_03_closed_idle": {
+      "event": "memory",
+      "seconds": 634.31009525,
+      "session": "retained",
+      "phase": "lifetime_03_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 45511,
+        "physical_footprint_bytes": 159335696,
+        "lifetime_peak_physical_footprint_bytes": 389350696
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-baseline-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 6.841450791,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    },
+    "lifetime_04_closed_idle": {
+      "event": "memory",
+      "seconds": 845.229821083,
+      "session": "retained",
+      "phase": "lifetime_04_closed_idle",
+      "open_documents": 1,
+      "app": {
+        "pid": 45511,
+        "physical_footprint_bytes": 155501864,
+        "lifetime_peak_physical_footprint_bytes": 389350696
+      },
+      "helpers": [],
+      "documents": [
+        {
+          "document": -1,
+          "window": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-09/residency-verified-baseline-light/sentinel.md",
+          "source": {
+            "source_bytes": 46,
+            "sha256": "0b1ac36bb6dd75d38b11163c10c3e1d386809ec310728d2cd47ad35cbed007f0"
+          },
+          "counters_observed_seconds": 6.841450791,
+          "last_settled_counters": {
+            "revision": 0,
+            "source_bytes": 46,
+            "undo_entries": 0,
+            "redo_entries": 0,
+            "embedded_cache_entries": 0,
+            "embedded_failures": 0,
+            "embedded_gpu_textures": 0,
+            "embedded_gpu_rgba_bytes": 0,
+            "gpu_evictions": 0
+          }
+        }
+      ]
+    }
+  },
+  "history_verified": [
+    {
+      "event": "retained_history_verified",
+      "seconds": 134.599726041,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 135.957327625,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 137.600143833,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 139.080552125,
+      "session": "retained",
+      "lifetime": 1,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 344.924710541,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 346.217627541,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 347.517122708,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 348.979652916,
+      "session": "retained",
+      "lifetime": 2,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 553.360455958,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 554.711784375,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 556.066395416,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 557.514953875,
+      "session": "retained",
+      "lifetime": 3,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 764.180701458,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 0,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 765.540606625,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 1,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 766.913863791,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 2,
+      "undo_entries": 9,
+      "redo_entries": 0
+    },
+    {
+      "event": "retained_history_verified",
+      "seconds": 768.380881583,
+      "session": "retained",
+      "lifetime": 4,
+      "document": 3,
+      "undo_entries": 9,
+      "redo_entries": 0
+    }
+  ],
+  "document_cycles": 48,
+  "verified_document_pastes": 145,
+  "paste_wait_seconds_max": 0.0012817499227821827,
+  "helper_samples": 505,
+  "helper_max_concurrent": 4,
+  "memory_verdict": "not_determined"
+}

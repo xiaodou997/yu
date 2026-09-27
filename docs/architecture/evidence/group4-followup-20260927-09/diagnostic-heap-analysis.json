@@ -1,0 +1,198 @@
+{
+  "lifetime_01_closed": {
+    "nodes": 140471,
+    "allocated_bytes": 35205081,
+    "groups": {
+      "yu_scene": {
+        "count": 2,
+        "bytes": 8224,
+        "rows": [
+          [
+            1,
+            8192,
+            "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene  C       Yu"
+          ],
+          [
+            1,
+            32,
+            "malloc in _RNvMsf_CsjjjKUyPE3qV_8yu_sceneNtB5_12SceneBuilder15append_viewport  C       Yu"
+          ]
+        ]
+      },
+      "RenderPlanBuilder": {
+        "count": 4,
+        "bytes": 4213408,
+        "rows": [
+          [
+            4,
+            4213408,
+            "malloc in _RNvMs3_Csbb3u75oTPiv_9yu_renderNtB5_17RenderPlanBuilder19build_with_embedded  C       Yu"
+          ]
+        ]
+      },
+      "StorageBridge": {
+        "count": 2,
+        "bytes": 4256,
+        "rows": [
+          [
+            1,
+            4096,
+            "StorageBridge.handle (malloc)                             Yu"
+          ],
+          [
+            1,
+            160,
+            "StorageBridge                                     Swift   Yu"
+          ]
+        ]
+      },
+      "DocumentTextView": {
+        "count": 1,
+        "bytes": 1280,
+        "rows": [
+          [
+            1,
+            1280,
+            "DocumentTextView                                  Swift   Yu"
+          ]
+        ]
+      },
+      "TextBuffer": {
+        "count": 1,
+        "bytes": 128,
+        "rows": [
+          [
+            1,
+            128,
+            "malloc in _RNvMs_NtCsinH3qQ2fQUe_7yu_text6bufferNtB4_10TextBuffer8snapshot  C       Yu"
+          ]
+        ]
+      },
+      "DefaultPurgeableMallocZone": {
+        "count": 8,
+        "bytes": 4194304,
+        "rows": [
+          [
+            8,
+            4194304,
+            "non-object in zone DefaultPurgeableMallocZone_0x10bfec000          <unknown>"
+          ]
+        ]
+      },
+      "glyph_atlas": {
+        "count": 2,
+        "bytes": 4210736,
+        "rows": [
+          [
+            1,
+            4210688,
+            "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new  C       Yu"
+          ],
+          [
+            1,
+            48,
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new  C       Yu"
+          ]
+        ]
+      }
+    }
+  },
+  "lifetime_04_closed": {
+    "nodes": 141985,
+    "allocated_bytes": 35394233,
+    "groups": {
+      "yu_scene": {
+        "count": 2,
+        "bytes": 8224,
+        "rows": [
+          [
+            1,
+            8192,
+            "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene  C       Yu"
+          ],
+          [
+            1,
+            32,
+            "malloc in _RNvMsf_CsjjjKUyPE3qV_8yu_sceneNtB5_12SceneBuilder15append_viewport  C       Yu"
+          ]
+        ]
+      },
+      "RenderPlanBuilder": {
+        "count": 4,
+        "bytes": 4213408,
+        "rows": [
+          [
+            4,
+            4213408,
+            "malloc in _RNvMs3_Csbb3u75oTPiv_9yu_renderNtB5_17RenderPlanBuilder19build_with_embedded  C       Yu"
+          ]
+        ]
+      },
+      "StorageBridge": {
+        "count": 2,
+        "bytes": 4256,
+        "rows": [
+          [
+            1,
+            4096,
+            "StorageBridge.handle (malloc)                             Yu"
+          ],
+          [
+            1,
+            160,
+            "StorageBridge                                     Swift   Yu"
+          ]
+        ]
+      },
+      "DocumentTextView": {
+        "count": 1,
+        "bytes": 1280,
+        "rows": [
+          [
+            1,
+            1280,
+            "DocumentTextView                                  Swift   Yu"
+          ]
+        ]
+      },
+      "TextBuffer": {
+        "count": 1,
+        "bytes": 128,
+        "rows": [
+          [
+            1,
+            128,
+            "malloc in _RNvMs_NtCsinH3qQ2fQUe_7yu_text6bufferNtB4_10TextBuffer8snapshot  C       Yu"
+          ]
+        ]
+      },
+      "DefaultPurgeableMallocZone": {
+        "count": 8,
+        "bytes": 4194304,
+        "rows": [
+          [
+            8,
+            4194304,
+            "non-object in zone DefaultPurgeableMallocZone_0x10bfec000          <unknown>"
+          ]
+        ]
+      },
+      "glyph_atlas": {
+        "count": 2,
+        "bytes": 4210736,
+        "rows": [
+          [
+            1,
+            4210688,
+            "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new  C       Yu"
+          ],
+          [
+            1,
+            48,
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new  C       Yu"
+          ]
+        ]
+      }
+    }
+  }
+}

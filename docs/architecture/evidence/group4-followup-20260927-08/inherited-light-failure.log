@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 542, in main
+    exercise(soak)
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 480, in exercise
+    soak.install(doc, warm, 'valid')
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 264, in install
+    self.await_frame(doc, stage)
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 235, in await_frame
+    self.live()
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 127, in live
+    require(rows['app'] == [self.process.pid], 'Expected exactly the same isolated application PID')
+  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/group4_resource_soak.py", line 22, in require
+    raise AssertionError(message)
+AssertionError: Expected exactly the same isolated application PID

@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "previous_interrupted_run": "unified-1800-dark",
+  "product_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+  "removed_environment_keys": [
+    "MallocNanoZone",
+    "MallocSpaceEfficient"
+  ],
+  "native_command": [
+    "/usr/bin/python3",
+    "platform/macos/yu-shell-macos/run-resource-soak.py",
+    "--documents",
+    "4",
+    "--seconds",
+    "1800",
+    "--idle-seconds",
+    "70",
+    "--dark",
+    "artifacts/group4-local-20260927-08b/standalone-1800-dark"
+  ],
+  "exit_code": 0,
+  "wall_seconds": 1996.144545209,
+  "result_sha256": "831c4f3fd943afce4190901cbfa8b647047c69f24d7bd8db97b5d174b4c9497e"
+}

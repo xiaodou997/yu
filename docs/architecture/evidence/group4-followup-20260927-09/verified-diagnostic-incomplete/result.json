@@ -1,0 +1,522 @@
+{
+  "schema_version": 1,
+  "passed": false,
+  "group4_signoff": false,
+  "checks": [],
+  "build": {
+    "app": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app",
+    "app_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+    "shader_sha256": "b5f1563b90031cdf588fd00166136fbdcda9dba94df5751324142f46c7b9bbb7",
+    "helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+    "helper_build_version": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/Helpers/yu-document-renderer:\nLoad command 11\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform MACOS\n    minos 26.0\n      sdk 27.0\n   ntools 1\n     tool LD\n  version 27037.1",
+    "helper_dependencies": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/Helpers/yu-document-renderer:\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)",
+    "configuration": "release",
+    "architectures": [
+      "arm64"
+    ],
+    "minimum_os": "26.0",
+    "build_version": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu:\nLoad command 11\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform MACOS\n    minos 26.0\n      sdk 27.0\n   ntools 1\n     tool LD\n  version 27037.1",
+    "xcode": "Xcode 27.0\nBuild version 27A266a",
+    "sdk": "27.0",
+    "host_os": "27.0",
+    "dependencies": "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu:\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.0.69)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)\n\t/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit (compatibility version 45.0.0, current version 2775.10.103)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.0.69)\n\t/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics (compatibility version 64.0.0, current version 2050.0.0)\n\t/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText (compatibility version 1.0.0, current version 904.0.0)\n\t/System/Library/Frameworks/CryptoKit.framework/Versions/A/CryptoKit (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 382.5.3)\n\t/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore (compatibility version 1.2.0, current version 1223.2.2)\n\t/System/Library/Frameworks/ScreenCaptureKit.framework/Versions/A/ScreenCaptureKit (compatibility version 1.0.0, current version 1.0.0)\n\t/usr/lib/swift/libswiftAVFoundation.dylib (compatibility version 1.0.0, current version 2450.77.5, weak)\n\t/usr/lib/swift/libswiftCore.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/swift/libswiftCoreAudio.dylib (compatibility version 1.0.0, current version 482.102.10, weak)\n\t/usr/lib/swift/libswiftCoreFoundation.dylib (compatibility version 1.0.0, current version 120.100.0)\n\t/usr/lib/swift/libswiftCoreImage.dylib (compatibility version 1.0.0, current version 3.0.0, weak)\n\t/usr/lib/swift/libswiftCoreMIDI.dylib (compatibility version 1.0.0, current version 6.0.0, weak)\n\t/usr/lib/swift/libswiftDarwin.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswiftDispatch.dylib (compatibility version 1.0.0, current version 1605.0.2)\n\t/usr/lib/swift/libswiftIOKit.dylib (compatibility version 1.0.0, current version 1.0.0, weak)\n\t/usr/lib/swift/libswiftMetal.dylib (compatibility version 1.0.0, current version 382.5.3, weak)\n\t/usr/lib/swift/libswiftOSLog.dylib (compatibility version 1.0.0, current version 10.0.0, weak)\n\t/usr/lib/swift/libswiftObjectiveC.dylib (compatibility version 1.0.0, current version 973.1.0)\n\t/usr/lib/swift/libswiftQuartzCore.dylib (compatibility version 1.0.0, current version 5.0.0, weak)\n\t/usr/lib/swift/libswiftSpatial.dylib (compatibility version 1.0.0, current version 1.0.0, weak)\n\t/usr/lib/swift/libswiftUniformTypeIdentifiers.dylib (compatibility version 1.0.0, current version 917.0.1)\n\t/usr/lib/swift/libswiftXPC.dylib (compatibility version 1.0.0, current version 167.0.2, weak)\n\t/usr/lib/swift/libswift_Builtin_float.dylib (compatibility version 0.0.0, current version 0.0.0, weak)\n\t/usr/lib/swift/libswift_Concurrency.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/swift/libswift_DarwinFoundation1.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswift_DarwinFoundation2.dylib (compatibility version 1.0.0, current version 428.0.10)\n\t/usr/lib/swift/libswiftos.dylib (compatibility version 1.0.0, current version 1090.0.0)\n\t/usr/lib/swift/libswiftsimd.dylib (compatibility version 1.0.0, current version 25.0.0, weak)",
+    "artifact_audit_passed": true,
+    "runtime_26_verified": false,
+    "runtime_27_verified": false,
+    "visual_acceptance": false,
+    "real_input_acceptance": false,
+    "performance_acceptance": false
+  },
+  "options": {
+    "output": "artifacts/group4-local-20260927-09/residency-verified-diagnostic-light",
+    "documents": 4,
+    "lifetimes": 4,
+    "passes": 3,
+    "idle_seconds": 70,
+    "sample_seconds": 5,
+    "dark": false,
+    "allocation_stacks": true,
+    "history_audit": true
+  },
+  "memory_verdict": "not_determined",
+  "real_calendar_events": "not_run",
+  "complete_selection_matrix": "not_run",
+  "visual_review_required": true,
+  "baseline_comparable": false,
+  "scope": "Finite fixed-load lifetimes, not the 30-minute soak or proof of no leaks.",
+  "source_hashes": {
+    "run-resource-residency.py": "ef8bc0ff5ee0b54e55b602453b21f35efa6ee2e4564d8ef50a37ec9ad4885a10",
+    "run-resource-soak.py": "91e39b276cf04648beb6a838e62ec41acfca0b4a24929460c111f92bf71ec8c9",
+    "group4_resource_soak.py": "cde22b2d1020c5809853ffbc0d209375c011031a27b35da70554ce52d975461f",
+    "group4_followup.py": "c19269136cff67bf2ba5a2396e6c0501e5dabf7589889910664b68bbb40e7582",
+    "group4_history_audit.py": "5cd9615e1c3fbf6fc20b1d50397497fab742e704e59b9690d57b90a32b58e52e"
+  },
+  "footprint": {
+    "metric": "RUSAGE_INFO_V4 physical footprint bytes",
+    "interpretation": "Finite observations only; no leak or long-term stability verdict. Logical history/cache/GPU counters are not additive physical footprint.",
+    "phases": [
+      {
+        "session": "retained",
+        "phase": "sentinel_cold_baseline",
+        "pid": 51013,
+        "samples": 1,
+        "first_seconds": 11.417006917,
+        "last_seconds": 11.417006917,
+        "first_bytes": 99779688,
+        "last_bytes": 99779688,
+        "min_bytes": 99779688,
+        "max_bytes": 99779688,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_opened",
+        "pid": 51013,
+        "samples": 1,
+        "first_seconds": 17.731290208,
+        "last_seconds": 17.731290208,
+        "first_bytes": 328254760,
+        "last_bytes": 328254760,
+        "min_bytes": 328254760,
+        "max_bytes": 328254760,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_valid",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 18.945890833,
+        "last_seconds": 75.614017625,
+        "first_bytes": 354518336,
+        "last_bytes": 458556808,
+        "min_bytes": 354518336,
+        "max_bytes": 458556808,
+        "delta_bytes": 104038472
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_plain",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 22.199225042000002,
+        "last_seconds": 80.419038583,
+        "first_bytes": 360367424,
+        "last_bytes": 421414280,
+        "min_bytes": 360367424,
+        "max_bytes": 457262472,
+        "delta_bytes": 61046856
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_retained_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 80.489475667,
+        "last_seconds": 150.476503708,
+        "first_bytes": 421414280,
+        "last_bytes": 380552584,
+        "min_bytes": 380552584,
+        "max_bytes": 421414280,
+        "delta_bytes": -40861696
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_01_closed_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 165.896170333,
+        "last_seconds": 235.917774125,
+        "first_bytes": 276383064,
+        "last_bytes": 246007104,
+        "min_bytes": 236963136,
+        "max_bytes": 276383064,
+        "delta_bytes": -30375960
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_opened",
+        "pid": 51013,
+        "samples": 1,
+        "first_seconds": 255.154325958,
+        "last_seconds": 255.154325958,
+        "first_bytes": 312657240,
+        "last_bytes": 312657240,
+        "min_bytes": 312657240,
+        "max_bytes": 312657240,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_valid",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 256.3863615,
+        "last_seconds": 312.41109366700005,
+        "first_bytes": 333809008,
+        "last_bytes": 364512648,
+        "min_bytes": 333809008,
+        "max_bytes": 370066824,
+        "delta_bytes": 30703640
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_plain",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 259.630453417,
+        "last_seconds": 317.151612375,
+        "first_bytes": 337970568,
+        "last_bytes": 364217736,
+        "min_bytes": 337970568,
+        "max_bytes": 369608072,
+        "delta_bytes": 26247168
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_retained_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 317.208229667,
+        "last_seconds": 387.225446667,
+        "first_bytes": 364217736,
+        "last_bytes": 358499720,
+        "min_bytes": 358499720,
+        "max_bytes": 364217736,
+        "delta_bytes": -5718016
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_02_closed_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 402.186078167,
+        "last_seconds": 472.190019375,
+        "first_bytes": 237667696,
+        "last_bytes": 223282544,
+        "min_bytes": 223282544,
+        "max_bytes": 237667696,
+        "delta_bytes": -14385152
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_opened",
+        "pid": 51013,
+        "samples": 1,
+        "first_seconds": 478.628523167,
+        "last_seconds": 478.628523167,
+        "first_bytes": 302302600,
+        "last_bytes": 302302600,
+        "min_bytes": 302302600,
+        "max_bytes": 302302600,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_valid",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 479.851526083,
+        "last_seconds": 535.4063229999999,
+        "first_bytes": 323339656,
+        "last_bytes": 352896392,
+        "min_bytes": 323339656,
+        "max_bytes": 357565832,
+        "delta_bytes": 29556736
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_plain",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 483.13013379200004,
+        "last_seconds": 540.192392208,
+        "first_bytes": 326960520,
+        "last_bytes": 357254536,
+        "min_bytes": 326960520,
+        "max_bytes": 357254536,
+        "delta_bytes": 30294016
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_retained_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 540.2475819169999,
+        "last_seconds": 610.255547292,
+        "first_bytes": 357189000,
+        "last_bytes": 360482184,
+        "min_bytes": 351618440,
+        "max_bytes": 360678792,
+        "delta_bytes": 3293184
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_03_closed_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 625.02671125,
+        "last_seconds": 695.0474134579999,
+        "first_bytes": 238503280,
+        "last_bytes": 221103448,
+        "min_bytes": 212125016,
+        "max_bytes": 238503280,
+        "delta_bytes": -17399832
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_opened",
+        "pid": 51013,
+        "samples": 1,
+        "first_seconds": 701.507557875,
+        "last_seconds": 701.507557875,
+        "first_bytes": 310035824,
+        "last_bytes": 310035824,
+        "min_bytes": 310035824,
+        "max_bytes": 310035824,
+        "delta_bytes": 0
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_valid",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 702.696841458,
+        "last_seconds": 757.390515583,
+        "first_bytes": 331122032,
+        "last_bytes": 352732552,
+        "min_bytes": 331122032,
+        "max_bytes": 364332424,
+        "delta_bytes": 21610520
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_plain",
+        "pid": 51013,
+        "samples": 12,
+        "first_seconds": 705.946292417,
+        "last_seconds": 762.034093417,
+        "first_bytes": 334759304,
+        "last_bytes": 352421256,
+        "min_bytes": 334759304,
+        "max_bytes": 362775944,
+        "delta_bytes": 17661952
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_retained_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 762.093237292,
+        "last_seconds": 832.1089529999999,
+        "first_bytes": 352355720,
+        "last_bytes": 355730824,
+        "min_bytes": 346834312,
+        "max_bytes": 355943816,
+        "delta_bytes": 3375104
+      },
+      {
+        "session": "retained",
+        "phase": "lifetime_04_closed_idle",
+        "pid": 51013,
+        "samples": 15,
+        "first_seconds": 846.618316792,
+        "last_seconds": 916.6648051249999,
+        "first_bytes": 234161520,
+        "last_bytes": 186598720,
+        "min_bytes": 186598720,
+        "max_bytes": 234161520,
+        "delta_bytes": -47562800
+      }
+    ]
+  },
+  "elapsed_seconds": 929.637070333,
+  "native_events": 2099,
+  "process_inventory_binary_sha256": "a08a846e3648a2e7eaf2202a4727cb21695b4562b8290b77b51966ad90415341",
+  "process_inventory_source_sha256": "bd603d5282ca19ea735802bd21ccceabfbcb0b69b923f761ebbd85f53669590e",
+  "isolated_bundle": "io.github.xiaodou997.yu.resource-soak.8817222ae301443ab24690f02c2e600c",
+  "test_app_sha256": "6111ffd40a49f6c7483946ce3e5950fcab17b3d1bf66a1abec325e02c7553205",
+  "test_helper_sha256": "f74c4f402bf005eee852db83f272de35c512d43bffb5e868c84da32ca769f68e",
+  "native_driver_sha256": "3694e54a620777b62e817a7584d9688f031c620c7939d3669d22da07dc01e1e4",
+  "process_inventory": {
+    "method": "libproc kernel executable path + BSD process birth identity",
+    "unreadable_unrelated_max": 13
+  },
+  "removed_child_environment_keys": [
+    "MallocNanoZone",
+    "MallocSpaceEfficient",
+    "YU_HISTORY_AUDIT"
+  ],
+  "application_pids": [
+    51013
+  ],
+  "retained_process_identity": {
+    "kind": "app",
+    "pid": 51013,
+    "ppid": 50992,
+    "pgid": 51013,
+    "start_seconds": 1790486364,
+    "start_microseconds": 166269
+  },
+  "history_input_keys": 128,
+  "completed_lifetimes": 4,
+  "allocation_captures": [
+    {
+      "phase": "lifetime_01_closed",
+      "tool": "heap",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_01_closed-heap.txt",
+      "elapsed_seconds": 3.473384708999987,
+      "sha256": "93916a340459f2cba1a396808ade22d6dc8fabd5deb4a0e7908d558c3d5b9086",
+      "exit_code": 0
+    },
+    {
+      "phase": "lifetime_01_closed",
+      "tool": "stacks",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_01_closed-stacks.txt",
+      "elapsed_seconds": 3.9687292499999955,
+      "sha256": "20b702655b6f24287404ffd635f459bd84bb073a93706c370ff3376755cc74a9",
+      "exit_code": 0
+    },
+    {
+      "phase": "lifetime_01_closed",
+      "tool": "leaks",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_01_closed-leaks.txt",
+      "elapsed_seconds": 3.557946874999999,
+      "sha256": "0725d354b7582e448bd962d1ffafed882f7d2b7d0450d349c75c8894bf397231",
+      "exit_code": 1
+    },
+    {
+      "phase": "lifetime_01_closed",
+      "tool": "vmmap",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_01_closed-vmmap.txt",
+      "elapsed_seconds": 1.274428874999984,
+      "sha256": "91cc8d67b7bad2240d7b2190bbf30a079996b40d14495edb314d388c5a1db321",
+      "exit_code": 0
+    },
+    {
+      "phase": "lifetime_04_closed",
+      "tool": "heap",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_04_closed-heap.txt",
+      "elapsed_seconds": 3.194601917,
+      "sha256": "90a4735649bdb4cfbba5369a538dc167c4eed0778dacf0cb12c37454fddafe67",
+      "exit_code": 0
+    },
+    {
+      "phase": "lifetime_04_closed",
+      "tool": "stacks",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_04_closed-stacks.txt",
+      "elapsed_seconds": 3.8677303329999404,
+      "sha256": "82ae1b7aae97b0c02fce177d11c890bf00b3fa12bb5b7ed4d999e111f9d4c9a1",
+      "exit_code": 0
+    },
+    {
+      "phase": "lifetime_04_closed",
+      "tool": "leaks",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_04_closed-leaks.txt",
+      "elapsed_seconds": 3.461120082999969,
+      "sha256": "1f6bbff87ea39ea8b039bbcbd30e7fa87f018c7464feb9f4d51388641d7c5222",
+      "exit_code": 1
+    },
+    {
+      "phase": "lifetime_04_closed",
+      "tool": "vmmap",
+      "identity": {
+        "kind": "app",
+        "pid": 51013,
+        "ppid": 50992,
+        "pgid": 51013,
+        "start_seconds": 1790486364,
+        "start_microseconds": 166269
+      },
+      "file": "lifetime_04_closed-vmmap.txt",
+      "elapsed_seconds": 1.2568424160000404,
+      "sha256": "be18e0e5704e705a63dfa846d648c37de2a2999d44322bd079b04d2196597b17",
+      "exit_code": 0
+    }
+  ],
+  "leaks_scans_all_zero": false,
+  "same_process_lifetimes_completed": true,
+  "error": "RuntimeError: Native event failed; exact output retained",
+  "forced_cleanup": true,
+  "remaining_isolated_processes": {
+    "app": [],
+    "helpers": []
+  },
+  "history_audit": {
+    "complete": true,
+    "pairs": 128,
+    "processes": [
+      51013
+    ],
+    "entries": {
+      "keyEquivalent": 128
+    },
+    "commands": {
+      "8": 64,
+      "9": 64
+    },
+    "outcomes": {
+      "handled": 128
+    },
+    "scope": "Received history routes only; absence does not prove an event was never delivered"
+  },
+  "history_audit_scope": "Pair integrity of recorded product receipts only; absence is not proof of non-delivery.",
+  "events.jsonl_sha256": "c3bd96e7529ea2e5f70085ca91b7d93159d7a64d65dcfff5aa221ce5882e4809",
+  "app.log_sha256": "55ee04a0817647a3391788678d507a345478ed916047170bbed0e909f3744916"
+}

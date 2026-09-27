@@ -1,0 +1,572 @@
+{
+  "scope": "Derived from one intrusive synthetic experiment; allocated heap bytes are not physical footprint. Not a long-term leak verdict.",
+  "phase_order": [
+    "all_documents_open",
+    "retained_history_idle",
+    "closed_documents_idle"
+  ],
+  "phases": {
+    "all_documents_open": {
+      "heap_file": "all_documents_open-heap.txt",
+      "heap_sha256": "4bba1a97e8ec85512a677e9779917fe6ae20d84789e0f8cbc63e4815e8fe2509",
+      "nodes": 367624,
+      "allocated_bytes": 115885040,
+      "leaks_reported_nodes": 294,
+      "leaks_reported_bytes": 19312,
+      "leaks_root_stacks": [
+        "STACK OF 3 INSTANCES OF 'ROOT CYCLE: <NSXPCConnection>':"
+      ]
+    },
+    "retained_history_idle": {
+      "heap_file": "retained_history_idle-heap.txt",
+      "heap_sha256": "3dedece3e5ed0a278aa2e0339ab9e86dc4101a268bbbea76c5c9ad21609ba7be",
+      "nodes": 369049,
+      "allocated_bytes": 124828269,
+      "leaks_reported_nodes": 294,
+      "leaks_reported_bytes": 19312,
+      "leaks_root_stacks": [
+        "STACK OF 3 INSTANCES OF 'ROOT CYCLE: <NSXPCConnection>':"
+      ]
+    },
+    "closed_documents_idle": {
+      "heap_file": "closed_documents_idle-heap.txt",
+      "heap_sha256": "3b2f405a5294db8e51afb00cf5d7e795b30bb322b49f0669aee42a5b97d724fc",
+      "nodes": 139930,
+      "allocated_bytes": 34913433,
+      "leaks_reported_nodes": 294,
+      "leaks_reported_bytes": 19312,
+      "leaks_root_stacks": [
+        "STACK OF 3 INSTANCES OF 'ROOT CYCLE: <NSXPCConnection>':"
+      ]
+    }
+  },
+  "groups": {
+    "glyph_atlas_backing": {
+      "all_documents_open": {
+        "count": 10,
+        "bytes": 21053680,
+        "matching_rows": [
+          [
+            "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              5,
+              21053440
+            ]
+          ],
+          [
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              5,
+              240
+            ]
+          ]
+        ]
+      },
+      "retained_history_idle": {
+        "count": 10,
+        "bytes": 21053680,
+        "matching_rows": [
+          [
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage11copy_bitmap C Yu",
+            [
+              8,
+              16842944
+            ]
+          ],
+          [
+            "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              1,
+              4210688
+            ]
+          ],
+          [
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              1,
+              48
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 2,
+        "bytes": 4210736,
+        "matching_rows": [
+          [
+            "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              1,
+              4210688
+            ]
+          ],
+          [
+            "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+            [
+              1,
+              48
+            ]
+          ]
+        ]
+      }
+    },
+    "scene_primitive_vectors": {
+      "all_documents_open": {
+        "count": 7,
+        "bytes": 7217312,
+        "matching_rows": [
+          [
+            "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene C Yu",
+            [
+              7,
+              7217312
+            ]
+          ]
+        ]
+      },
+      "retained_history_idle": {
+        "count": 7,
+        "bytes": 10592416,
+        "matching_rows": [
+          [
+            "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene C Yu",
+            [
+              7,
+              10592416
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 1,
+        "bytes": 8192,
+        "matching_rows": [
+          [
+            "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene C Yu",
+            [
+              1,
+              8192
+            ]
+          ]
+        ]
+      }
+    },
+    "render_plan_builder": {
+      "all_documents_open": {
+        "count": 15,
+        "bytes": 23349952,
+        "matching_rows": [
+          [
+            "malloc in _RNvMs3_Csbb3u75oTPiv_9yu_renderNtB5_17RenderPlanBuilder19build_with_embedded C Yu",
+            [
+              15,
+              23349952
+            ]
+          ]
+        ]
+      },
+      "retained_history_idle": {
+        "count": 23,
+        "bytes": 23351104,
+        "matching_rows": [
+          [
+            "malloc in _RNvMs3_Csbb3u75oTPiv_9yu_renderNtB5_17RenderPlanBuilder19build_with_embedded C Yu",
+            [
+              23,
+              23351104
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 3,
+        "bytes": 4213280,
+        "matching_rows": [
+          [
+            "malloc in _RNvMs3_Csbb3u75oTPiv_9yu_renderNtB5_17RenderPlanBuilder19build_with_embedded C Yu",
+            [
+              3,
+              4213280
+            ]
+          ]
+        ]
+      }
+    },
+    "purgeable_malloc_zone": {
+      "all_documents_open": {
+        "count": 0,
+        "bytes": 0,
+        "matching_rows": []
+      },
+      "retained_history_idle": {
+        "count": 8,
+        "bytes": 4194304,
+        "matching_rows": [
+          [
+            "non-object in zone DefaultPurgeableMallocZone_0x10e664000 <unknown>",
+            [
+              8,
+              4194304
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 8,
+        "bytes": 4194304,
+        "matching_rows": [
+          [
+            "non-object in zone DefaultPurgeableMallocZone_0x10e664000 <unknown>",
+            [
+              8,
+              4194304
+            ]
+          ]
+        ]
+      }
+    },
+    "source_buffer_edit": {
+      "all_documents_open": {
+        "count": 0,
+        "bytes": 0,
+        "matching_rows": []
+      },
+      "retained_history_idle": {
+        "count": 40,
+        "bytes": 455168,
+        "matching_rows": [
+          [
+            "malloc in _RNvMs_NtCsinH3qQ2fQUe_7yu_text6bufferNtB4_10TextBuffer5apply C Yu",
+            [
+              40,
+              455168
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 0,
+        "bytes": 0,
+        "matching_rows": []
+      }
+    },
+    "document_handles": {
+      "all_documents_open": {
+        "count": 5,
+        "bytes": 20480,
+        "matching_rows": [
+          [
+            "StorageBridge.handle (malloc) Yu",
+            [
+              5,
+              20480
+            ]
+          ]
+        ]
+      },
+      "retained_history_idle": {
+        "count": 5,
+        "bytes": 20480,
+        "matching_rows": [
+          [
+            "StorageBridge.handle (malloc) Yu",
+            [
+              5,
+              20480
+            ]
+          ]
+        ]
+      },
+      "closed_documents_idle": {
+        "count": 1,
+        "bytes": 4096,
+        "matching_rows": [
+          [
+            "StorageBridge.handle (malloc) Yu",
+            [
+              1,
+              4096
+            ]
+          ]
+        ]
+      }
+    }
+  },
+  "stack_excerpts": [
+    {
+      "file": "retained_history_idle-stacks.txt",
+      "line": 42,
+      "text": "4 calls for 16842752 bytes: 0x19af48cec (libsystem_pthread.dylib) thread_start | 0x19af4dd00 (libsystem_pthread.dylib) _pthread_start | 0x1049f4060 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvNvMs0_NtNtNtCs82bWklYMk3w_3std3sys6thread4unixNtB7_6Thread3new12thread_start | 0x104bce080 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNSNvYNCINvNtNtCs82bWklYMk3w_3std6thread9lifecycle15spawn_uncheckedNCINvMs_NtCse1o1dFRpRyU_14yu_storage_ffi18macos_frame_workerINtB1b_12LatestWorkerNtB1d_18MacosFrameBuildJobNtB1d_21MacosFrameBuildResultE3newNCNvB1d_22macos_new_frame_worker0E0uEs_0INtNtNtCs8Mbv00yxnRz_4core3ops8function6FnOnceuE9call_once6vtableB1d_ | 0x104bc224c (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RINvNtNtCs82bWklYMk3w_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs_NtCse1o1dFRpRyU_14yu_storage_ffi18macos_frame_workerINtB1f_12LatestWorkerNtB1h_18MacosFrameBuildJobNtB1h_21MacosFrameBuildResultE3newNCNvB1h_22macos_new_frame_worker0E0uEB1h_ | 0x104bc964c (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNCNCNvCse1o1dFRpRyU_14yu_storage_ffi22macos_new_frame_worker00B5_ | 0x104ba7c24 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RINvMs3_NtCsiUJ25pGHq0P_12yu_workspace13frame_builderINtB6_20ViewportFrameBuilderNtCsl6tlRwqDtkO_13yu_font_macos14CoreTextShaperE33publish_owned_document_cancelableNCNCNCNvCse1o1dFRpRyU_14yu_storage_ffi22macos_new_frame_worker00s8_0EB2K_ | 0x104ac04cc (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvMse_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_10GlyphAtlas6insert | 0x104abfbc8 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage11copy_bitmap | 0x19ad74630 (libsystem_malloc.dylib) _malloc_zone_malloc_instrumented_or_legacy"
+    },
+    {
+      "file": "retained_history_idle-stacks.txt",
+      "line": 54,
+      "text": "5 calls for 10592256 bytes: 0x19af48cec (libsystem_pthread.dylib) thread_start | 0x19af4dd00 (libsystem_pthread.dylib) _pthread_start | 0x1049f4060 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvNvMs0_NtNtNtCs82bWklYMk3w_3std3sys6thread4unixNtB7_6Thread3new12thread_start | 0x104bce080 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNSNvYNCINvNtNtCs82bWklYMk3w_3std6thread9lifecycle15spawn_uncheckedNCINvMs_NtCse1o1dFRpRyU_14yu_storage_ffi18macos_frame_workerINtB1b_12LatestWorkerNtB1d_18MacosFrameBuildJobNtB1d_21MacosFrameBuildResultE3newNCNvB1d_22macos_new_frame_worker0E0uEs_0INtNtNtCs8Mbv00yxnRz_4core3ops8function6FnOnceuE9call_once6vtableB1d_ | 0x104bc224c (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RINvNtNtCs82bWklYMk3w_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs_NtCse1o1dFRpRyU_14yu_storage_ffi18macos_frame_workerINtB1f_12LatestWorkerNtB1h_18MacosFrameBuildJobNtB1h_21MacosFrameBuildResultE3newNCNvB1h_22macos_new_frame_worker0E0uEB1h_ | 0x104bc964c (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNCNCNvCse1o1dFRpRyU_14yu_storage_ffi22macos_new_frame_worker00B5_ | 0x104ba7dfc (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RINvMs3_NtCsiUJ25pGHq0P_12yu_workspace13frame_builderINtB6_20ViewportFrameBuilderNtCsl6tlRwqDtkO_13yu_font_macos14CoreTextShaperE33publish_owned_document_cancelableNCNCNCNvCse1o1dFRpRyU_14yu_storage_ffi22macos_new_frame_worker00s8_0EB2K_ | 0x104bb33c8 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RINvMsn_CsiUJ25pGHq0P_12yu_workspaceNtB6_22ViewportFramePublisher22publish_with_resourcesNtCsl6tlRwqDtkO_13yu_font_macos14CoreTextShaperECse1o1dFRpRyU_14yu_storage_ffi | 0x104c176e0 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvCsiUJ25pGHq0P_12yu_workspace25append_editor_decorations | 0x104b8c29c (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvMsf_CsjjjKUyPE3qV_8yu_sceneNtB5_12SceneBuilder4push | 0x104ceea00 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvMs4_NtCshxvaOLs88l5_5alloc7raw_vecINtB5_6RawVecNtCsjjjKUyPE3qV_8yu_scene9PrimitiveE8grow_oneBO_ | 0x104ceea84 (io.github.xiaodou997.yu.resource-soak.30a411290784402f89def5b649a818dc) _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene | 0x19ad75358 (libsystem_malloc.dylib) _realloc | 0x19ad74b2c (libsystem_malloc.dylib) _malloc_zone_realloc"
+    }
+  ],
+  "net_heap_growth_bytes": 8943229,
+  "largest_growth_rows": [
+    {
+      "classification": "malloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage11copy_bitmap C Yu",
+      "delta_bytes": 16842944,
+      "before": [
+        0,
+        0
+      ],
+      "after": [
+        8,
+        16842944
+      ]
+    },
+    {
+      "classification": "non-object in zone DefaultPurgeableMallocZone_0x10e664000 <unknown>",
+      "delta_bytes": 4194304,
+      "before": [
+        0,
+        0
+      ],
+      "after": [
+        8,
+        4194304
+      ]
+    },
+    {
+      "classification": "realloc in _RNvMs5_NtCshxvaOLs88l5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsjjjKUyPE3qV_8yu_scene C Yu",
+      "delta_bytes": 3375104,
+      "before": [
+        7,
+        7217312
+      ],
+      "after": [
+        7,
+        10592416
+      ]
+    },
+    {
+      "classification": "malloc in _RNvMs_NtCsinH3qQ2fQUe_7yu_text6bufferNtB4_10TextBuffer5apply C Yu",
+      "delta_bytes": 455168,
+      "before": [
+        0,
+        0
+      ],
+      "after": [
+        40,
+        455168
+      ]
+    },
+    {
+      "classification": "calloc in img_data_lock C CoreGraphics",
+      "delta_bytes": 232256,
+      "before": [
+        9,
+        1728
+      ],
+      "after": [
+        32,
+        233984
+      ]
+    },
+    {
+      "classification": "non-object in zone DefaultMallocZone_0x1059cc000 <unknown>",
+      "delta_bytes": 231424,
+      "before": [
+        32,
+        82496
+      ],
+      "after": [
+        47,
+        313920
+      ]
+    },
+    {
+      "classification": "malloc in _RINvMs6_NtCsieo73fbYjKL_9yu_assets8embeddedNtB6_21EmbeddedRenderPayload3svgReECs8jIMMFbWO7I_18yu_embedded_client C Yu",
+      "delta_bytes": 81920,
+      "before": [
+        0,
+        0
+      ],
+      "after": [
+        24,
+        81920
+      ]
+    },
+    {
+      "classification": "malloc in _RINvMs2_NtCs8n14cqoOOuG_7yu_font6rasterNtB6_11GlyphBitmap3newINtNtCshxvaOLs88l5_5alloc3vec3VechEECsl6tlRwqDtkO_13yu_font_macos C Yu",
+      "delta_bytes": 67072,
+      "before": [
+        132,
+        179344
+      ],
+      "after": [
+        258,
+        246416
+      ]
+    },
+    {
+      "classification": "Class.methodCache._buckets (bucket_t) C libobjc.A.dylib",
+      "delta_bytes": 53072,
+      "before": [
+        2003,
+        2042672
+      ],
+      "after": [
+        2112,
+        2095744
+      ]
+    },
+    {
+      "classification": "malloc in _RNvMNtNtCshFL5XT7Mbug_5ropey4tree4nodeNtB2_4Node18insert_at_byte_idx C Yu",
+      "delta_bytes": 52096,
+      "before": [
+        0,
+        0
+      ],
+      "after": [
+        41,
+        52096
+      ]
+    },
+    {
+      "classification": "malloc in _RNvXs1p_NtCs8n14cqoOOuG_7yu_font6rasterNtB6_10GlyphAtlasNtNtCs8Mbv00yxnRz_4core5clone5Clone5clone C Yu",
+      "delta_bytes": 43776,
+      "before": [
+        20,
+        19760
+      ],
+      "after": [
+        20,
+        63536
+      ]
+    },
+    {
+      "classification": "calloc in CGGlyphBitmapCreate C CoreGraphics",
+      "delta_bytes": 42896,
+      "before": [
+        133,
+        105696
+      ],
+      "after": [
+        178,
+        148592
+      ]
+    }
+  ],
+  "largest_released_rows": [
+    {
+      "classification": "NSConcreteMutableData (Bytes Storage) C Foundation",
+      "delta_bytes": -25456,
+      "before": [
+        7,
+        43008
+      ],
+      "after": [
+        9,
+        17552
+      ]
+    },
+    {
+      "classification": "malloc in CG::DisplayList::updateBoundingAndTransparentShapes(CGRect const&, unsigned int) C++ CoreGraphics",
+      "delta_bytes": -26880,
+      "before": [
+        63,
+        40320
+      ],
+      "after": [
+        21,
+        13440
+      ]
+    },
+    {
+      "classification": "CFArray ObjC CoreFoundation",
+      "delta_bytes": -29360,
+      "before": [
+        479,
+        39968
+      ],
+      "after": [
+        120,
+        10608
+      ]
+    },
+    {
+      "classification": "CGDisplayList CFType CoreGraphics",
+      "delta_bytes": -43008,
+      "before": [
+        87,
+        89088
+      ],
+      "after": [
+        45,
+        46080
+      ]
+    },
+    {
+      "classification": "malloc in _RNvMNtCshFL5XT7Mbug_5ropey12rope_builderNtB2_11RopeBuilder13build_at_once C Yu",
+      "delta_bytes": -51200,
+      "before": [
+        41,
+        52480
+      ],
+      "after": [
+        1,
+        1280
+      ]
+    },
+    {
+      "classification": "NSDictionary ObjC CoreFoundation",
+      "delta_bytes": -66400,
+      "before": [
+        1800,
+        228096
+      ],
+      "after": [
+        1075,
+        161696
+      ]
+    },
+    {
+      "classification": "calloc in -[AGXG13XFamilyRenderContext initWithCommandBuffer:descriptor:subEncoderIndex:framebuffer:] C AGXMetalG13X",
+      "delta_bytes": -89088,
+      "before": [
+        2,
+        89088
+      ],
+      "after": [
+        0,
+        0
+      ]
+    },
+    {
+      "classification": "calloc in _RNvMsd_NtCs8n14cqoOOuG_7yu_font6rasterNtB5_9AtlasPage3new C Yu",
+      "delta_bytes": -16842752,
+      "before": [
+        5,
+        21053440
+      ],
+      "after": [
+        1,
+        4210688
+      ]
+    }
+  ],
+  "history_receipts": {
+    "complete": true,
+    "pairs": 38,
+    "processes": [
+      52066,
+      54179
+    ],
+    "entries": {
+      "keyEquivalent": 38
+    },
+    "commands": {
+      "8": 21,
+      "9": 17
+    },
+    "outcomes": {
+      "handled": 38
+    },
+    "scope": "Received history routes only; absence does not prove an event was never delivered"
+  },
+  "native_result_sha256": "667c6f3366063a923ca1c6ba559afd4485283cfc4a601a01437cb7f62968c27d"
+}

@@ -1,0 +1,9 @@
+{
+  "passed": false,
+  "scope": "Synthetic driver regression, not product acceptance",
+  "source_hashes": {
+    "tools/native-event-driver.swift": "529a94d79dd52a1c35cf65609c926bd22cd77f0a9084c68b98c5afa49d4c5eba",
+    "tools/fixtures/NativeDelayedPaste.swift": "90250fb0069d54be68b76b1b7cfc58d4424d86132b4143aac35dba7c24cb6858"
+  },
+  "cases": []
+}

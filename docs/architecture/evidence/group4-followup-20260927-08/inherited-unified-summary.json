@@ -1,0 +1,19 @@
+{
+  "product_sha256": "cc6cfc8af9cb0e226920c42a5ad9529aac08b1722340d5b70d87607db5fc2733",
+  "runs": [
+    {
+      "name": "unified-1800-light",
+      "exit_code": 1,
+      "elapsed_wall_seconds": 2000.4660503750001,
+      "passed": false,
+      "result_sha256": "b6271e06ea1a962311aa6cf0f4d38a9854743ef2af811642e1acbf589975ecf9",
+      "completed_passes": 87,
+      "churn_elapsed_seconds": 1820.305003708
+    }
+  ],
+  "diagnostic_environment_removed": [
+    "MallocNanoZone",
+    "MallocSpaceEfficient"
+  ],
+  "passed": false
+}

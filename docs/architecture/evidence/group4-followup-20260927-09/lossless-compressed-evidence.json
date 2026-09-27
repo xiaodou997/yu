@@ -1,0 +1,30 @@
+{
+  "reason": "Preserve raw CRLF and original whitespace without Git text normalization.",
+  "files": [
+    {
+      "file": "initial-baseline-failed/mismatch-actual.txt.gz",
+      "raw_bytes": 4096,
+      "raw_sha256": "3ca950dde0a8d920b4dffc351cd6d21c3caf77f683b00911b156d47e96d4985a"
+    },
+    {
+      "file": "initial-baseline-failed/mismatch-expected.txt.gz",
+      "raw_bytes": 5120,
+      "raw_sha256": "1b212ef5ece56b510d4edcc5fea9e9ca604469b3bfa4acc33299294256b4518f"
+    },
+    {
+      "file": "initial-diagnostic-failed/mismatch-actual.txt.gz",
+      "raw_bytes": 16896,
+      "raw_sha256": "67aed4f6268c18b2ec38dbf4c5064aabc93353de336475336bd7b3039bdd6601"
+    },
+    {
+      "file": "initial-diagnostic-failed/mismatch-expected.txt.gz",
+      "raw_bytes": 17408,
+      "raw_sha256": "9ef419068889893515d9daf19f928e26839e151e30920209551f4789a773644a"
+    },
+    {
+      "file": "initial-diagnostic-failed/lifetime_01_closed-vmmap.txt.gz",
+      "raw_bytes": 8967,
+      "raw_sha256": "8c641f6db978d346ffdab5f66a73b691359a96d6887210dfbe777c1396abe0d2"
+    }
+  ]
+}

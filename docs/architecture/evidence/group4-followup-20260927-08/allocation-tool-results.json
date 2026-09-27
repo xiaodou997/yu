@@ -1,0 +1,88 @@
+{
+  "native_exit_code": 0,
+  "captures": [
+    {
+      "phase": "all_documents_open",
+      "tool": "heap",
+      "pid": 52066,
+      "file": "all_documents_open-heap.txt",
+      "elapsed_seconds": 4.240428958000001,
+      "sha256": "4bba1a97e8ec85512a677e9779917fe6ae20d84789e0f8cbc63e4815e8fe2509",
+      "exit_code": 0
+    },
+    {
+      "phase": "all_documents_open",
+      "tool": "stacks",
+      "pid": 52066,
+      "file": "all_documents_open-stacks.txt",
+      "elapsed_seconds": 15.206935334,
+      "sha256": "f3d628178b03f98ca115f47ed181d6cfc3d2c1c719cfe58ae2a53d290e130b9b",
+      "exit_code": 0
+    },
+    {
+      "phase": "all_documents_open",
+      "tool": "leaks",
+      "pid": 52066,
+      "file": "all_documents_open-leaks.txt",
+      "elapsed_seconds": 4.142765167,
+      "sha256": "1f246151c61ceb7e8c4204f0234f1b80739e3baad568961a6b20f9c4d33cda24",
+      "exit_code": 1
+    },
+    {
+      "phase": "retained_history_idle",
+      "tool": "heap",
+      "pid": 52066,
+      "file": "retained_history_idle-heap.txt",
+      "elapsed_seconds": 3.6430744589999904,
+      "sha256": "3dedece3e5ed0a278aa2e0339ab9e86dc4101a268bbbea76c5c9ad21609ba7be",
+      "exit_code": 0
+    },
+    {
+      "phase": "retained_history_idle",
+      "tool": "stacks",
+      "pid": 52066,
+      "file": "retained_history_idle-stacks.txt",
+      "elapsed_seconds": 5.015483332999992,
+      "sha256": "dc1da14c00fea6496ee6a1f2dc58af63eb68a6b80657c411ad8106027164e006",
+      "exit_code": 0
+    },
+    {
+      "phase": "retained_history_idle",
+      "tool": "leaks",
+      "pid": 52066,
+      "file": "retained_history_idle-leaks.txt",
+      "elapsed_seconds": 4.325757958999986,
+      "sha256": "d4969a1e915cd129f44818cc052d03f02f9cb4b4da34b2267b4771c53ae297a9",
+      "exit_code": 1
+    },
+    {
+      "phase": "closed_documents_idle",
+      "tool": "heap",
+      "pid": 52066,
+      "file": "closed_documents_idle-heap.txt",
+      "elapsed_seconds": 2.9690138330000195,
+      "sha256": "3b2f405a5294db8e51afb00cf5d7e795b30bb322b49f0669aee42a5b97d724fc",
+      "exit_code": 0
+    },
+    {
+      "phase": "closed_documents_idle",
+      "tool": "stacks",
+      "pid": 52066,
+      "file": "closed_documents_idle-stacks.txt",
+      "elapsed_seconds": 3.6067250840000042,
+      "sha256": "78b40582839c8786bf05ec7a6998705646dcc18f844784283e39918a666e7fba",
+      "exit_code": 0
+    },
+    {
+      "phase": "closed_documents_idle",
+      "tool": "leaks",
+      "pid": 52066,
+      "file": "closed_documents_idle-leaks.txt",
+      "elapsed_seconds": 3.292755124999985,
+      "sha256": "b2a73d49ce4f795ff09c4b16f1bd241189f774fca3f71807613e89cead0e308a",
+      "exit_code": 1
+    }
+  ],
+  "baseline_comparable": false,
+  "leak_verdict": "not_determined"
+}

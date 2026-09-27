@@ -1,0 +1,1 @@
+DelayedPaste/NativeDelayedPaste.swift:5: Fatal error: Use of unimplemented initializer 'init(frame:textContainer:)' for class 'DelayedPaste.DelayedEditor'

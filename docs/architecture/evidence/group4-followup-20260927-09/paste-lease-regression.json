@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "scope": "Synthetic driver regression, not product acceptance",
+  "source_hashes": {
+    "tools/native-event-driver.swift": "529a94d79dd52a1c35cf65609c926bd22cd77f0a9084c68b98c5afa49d4c5eba",
+    "tools/fixtures/NativeDelayedPaste.swift": "8cda0310c7cbc0daa5d6d728756c4c3d49c5d68c3a1635073c2d5c7ead09bca5"
+  },
+  "cases": [
+    {
+      "action": "paste-text",
+      "expected_observed": true,
+      "paste_invocations": 1,
+      "consumer_result": "PRIOR_PAYLOAD",
+      "driver_receipt": null
+    },
+    {
+      "action": "paste-document",
+      "expected_observed": true,
+      "paste_invocations": 1,
+      "consumer_result": "AFTER",
+      "driver_receipt": {
+        "clipboard_held_until_expected_source": true,
+        "post_key_wait_seconds": 0.8174311666516587,
+        "verified_document_paste": true
+      }
+    }
+  ]
+}

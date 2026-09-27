@@ -1,0 +1,14 @@
+{
+  "exit_code": 1,
+  "completed_lifetimes": 0,
+  "failure": "First retained-history undo source unchanged",
+  "target_pid": 33873,
+  "snapshot_frontmost_pid": 49683,
+  "snapshot_AXFrontmost": false,
+  "source_unchanged": true,
+  "interpretation": "The failure snapshot shows lost foreground ownership. It does not prove state at key-down or the root cause of earlier failures. No history receipt audit was enabled.",
+  "cleanup": {
+    "app": [],
+    "helpers": []
+  }
+}
