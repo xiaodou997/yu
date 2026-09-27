@@ -287,7 +287,21 @@ case "snapshot", "activate":
     }
     result["windows"] = (CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []).filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid || ($0[kCGWindowOwnerName as String] as? String)?.contains("Input") == true }
     json(result)
-case "paste-text", "paste-image", "paste-file", "paste-files", "copy-read", "cut-read", "copy-paste":
+case "paste-text", "paste-document", "paste-image", "paste-file", "paste-files", "copy-read", "cut-read", "copy-paste":
+    // This explicit mode is for controlled whole-document replacements only.
+    // Keep the temporary clipboard alive until the exact result is observed;
+    // a fixed delay alone cannot prove AppKit has read the pasteboard.
+    let checkedDocumentPaste = action == "paste-document"
+    if checkedDocumentPaste {
+        guard args.count == 3, let editor,
+              let source = attribute(editor, "AXValue") as? String,
+              source != args[2],
+              let selected = attribute(editor, "AXSelectedTextRange"),
+              CFGetTypeID(selected) == AXValueGetTypeID() else { fail("Verified paste requires a changed whole document") }
+        var range = CFRange()
+        guard AXValueGetValue(unsafeBitCast(selected, to: AXValue.self), .cfRange, &range),
+              range.location == 0, range.length == source.utf16.count else { fail("Verified paste requires the entire source selection") }
+    }
     let board = NSPasteboard.general
     let saved: [NSPasteboardItem] = (board.pasteboardItems ?? []).map { item in
         let copy = NSPasteboardItem()
@@ -296,7 +310,7 @@ case "paste-text", "paste-image", "paste-file", "paste-files", "copy-read", "cut
     }
     failureCleanup = { board.clearContents(); if !saved.isEmpty { board.writeObjects(saved) } }
     defer { failureCleanup?(); failureCleanup = nil }
-    if action == "paste-text" {
+    if action == "paste-text" || checkedDocumentPaste {
         guard args.count == 3 else { fail("paste-text requires text") }
         board.clearContents(); board.setString(args[2],forType:.string)
     }
@@ -313,11 +327,23 @@ case "paste-text", "paste-image", "paste-file", "paste-files", "copy-read", "cut
         board.clearContents()
         guard board.writeObjects(args.dropFirst(2).map { NSURL(fileURLWithPath: $0) }) else { fail("Cannot set file batch clipboard") }
     }
-    let isPaste = ["paste-text", "paste-image", "paste-file", "paste-files"].contains(action)
+    let isPaste = ["paste-text", "paste-document", "paste-image", "paste-file", "paste-files"].contains(action)
     let beforeCopy = board.changeCount
     let code: CGKeyCode = isPaste ? 9 : (action == "cut-read" ? 7 : 8)
     for down in [true,false] { let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:down); event?.flags = down ? .maskCommand : []; post(event) }
-    RunLoop.current.run(until:Date().addingTimeInterval(0.3))
+    if checkedDocumentPaste, let editor {
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + 5
+        while attribute(editor, "AXValue") as? String != args[2] {
+            guard board.changeCount == beforeCopy else { fail("Verified paste clipboard changed before consumption") }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { fail("Verified paste did not produce the expected document; no key was repeated") }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        json(["verified_document_paste": true, "clipboard_held_until_expected_source": true,
+              "post_key_wait_seconds": ProcessInfo.processInfo.systemUptime - started])
+    } else {
+        RunLoop.current.run(until:Date().addingTimeInterval(0.3))
+    }
     if !isPaste && board.changeCount == beforeCopy { fail("Copy/cut did not update the test clipboard") }
     var copied: [String:Any] = ["text":board.string(forType:.string) ?? "", "types":board.types?.map { $0.rawValue } ?? [],
         "source_fragments":board.string(forType:NSPasteboard.PasteboardType("app.yu.source-fragments.v1")) ?? ""]

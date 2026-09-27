@@ -147,7 +147,7 @@ class NativeSoak:
         self.sequence += 1
         # Do not accumulate whole long-page sources in RAM or a file per snapshot.
         recorded = list(arguments)
-        if recorded and recorded[0] == 'paste-text':
+        if recorded and recorded[0] in ('paste-text', 'paste-document'):
             recorded[1] = text_identity(recorded[1])
         self.event('native', number=self.sequence, arguments=recorded, exit_code=response.returncode,
                    stdout_sha256=hashlib.sha256(response.stdout.encode()).hexdigest())
@@ -194,16 +194,21 @@ class NativeSoak:
                     raise
                 time.sleep(.2)
 
-    def launch(self, path):
-        require(not self.processes()['app'] and not self.processes()['helpers'], 'Old isolated processes remain')
-        log_path = self.out / 'app.log'
-        self.log = log_path.open('ab')
-        self.tail = AuditTail(log_path, start=log_path.stat().st_size)
+    def application_environment(self):
+        """Child-only environment; diagnostic runners may specialize this hook."""
         env = {k: v for k, v in os.environ.items() if not k.startswith('YU_')}
         env.update(YU_DOCUMENT_STATE_DIR=str(self.out / 'state'),
                    YU_PRESENTATION_STATE_DIR=str(self.out / 'columns'), YU_RESOURCE_AUDIT='1')
         if self.args.history_audit:
             env['YU_HISTORY_AUDIT'] = '1'
+        return env
+
+    def launch(self, path):
+        require(not self.processes()['app'] and not self.processes()['helpers'], 'Old isolated processes remain')
+        log_path = self.out / 'app.log'
+        self.log = log_path.open('ab')
+        self.tail = AuditTail(log_path, start=log_path.stat().st_size)
+        env = self.application_environment()
         from group4_followup import appearance_arguments
         command = [str(self.binary), str(path)] + appearance_arguments(self.args.dark)
         self.process = subprocess.Popen(command, env=env, stdout=self.log,
