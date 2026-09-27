@@ -123,8 +123,18 @@ class NativeSoak:
 
     def live(self):
         require(self.process is not None and self.process.poll() is None, 'The original application process exited')
+        previous = self.process_identities
         rows = self.processes()
-        require(rows['app'] == [self.process.pid], 'Expected exactly the same isolated application PID')
+        if rows['app'] != [self.process.pid]:
+            # Preserve the actual failed observation before cleanup changes it.
+            # Do not retry enumeration and turn an intermittent failure into pass.
+            atomic_json(self.out / 'process-membership-failure.json', {
+                'session': self.session, 'seconds': time.monotonic() - self.started,
+                'expected_pid': self.process.pid, 'returncode_after_inventory': self.process.poll(),
+                'observed': rows, 'identities': self.process_identities,
+                'previous_identities': previous,
+            })
+            raise AssertionError('Expected exactly the same isolated application PID')
         require(len(rows['helpers']) <= self.args.documents, 'Helper count exceeded the number of work documents')
         require(all(item['pgid'] == self.process.pid for item in self.process_identities.values()),
                 'A matching isolated executable escaped its owned process group')

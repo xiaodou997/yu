@@ -428,6 +428,39 @@ class RunnerContractTests(unittest.TestCase):
     def test_failed_sample_of_the_same_live_helper_is_not_ignored(self):
         self.sampled_helper({}, returncode=1, succeeds=False)
 
+    def test_process_membership_failure_keeps_exact_observation_without_retry(self):
+        for app_pids, returncode in [([], None), ([], -9), ([101, 202], None)]:
+            with tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                soak = runner.NativeSoak(runner.parse_args([str(out)]), out, {'passed': False})
+                child = mock.Mock(pid=101)
+                child.poll.side_effect = [None, returncode]
+                soak.process = child
+                before = {101: {'kind': 'app', 'pid': 101, 'pgid': 101}}
+                soak.process_identities = before
+                observed = {'app': app_pids, 'helpers': []}
+                after = {pid: {'kind': 'app', 'pid': pid, 'pgid': 101} for pid in app_pids}
+                def inventory():
+                    soak.process_identities = after
+                    return observed
+                soak.processes = mock.Mock(side_effect=inventory)
+                soak.run = mock.Mock(side_effect=AssertionError('No input during failed inventory'))
+                try:
+                    with self.assertRaisesRegex(AssertionError, 'same isolated application PID'):
+                        soak.live()
+                    receipt = json.loads((out / 'process-membership-failure.json').read_text())
+                    self.assertEqual(receipt['expected_pid'], 101)
+                    self.assertEqual(receipt['observed'], observed)
+                    self.assertEqual(receipt['returncode_after_inventory'], returncode)
+                    self.assertEqual(receipt['previous_identities'], {'101': before[101]})
+                    self.assertEqual(receipt['identities'], {str(pid): value for pid, value in after.items()})
+                    soak.processes.assert_called_once_with()
+                    soak.run.assert_not_called()
+                    self.assertFalse(soak.result['passed'])
+                finally:
+                    soak.process = None
+                    soak.cleanup()
+
     def test_source_mismatch_preserves_focus_before_capture_without_retrying_input(self):
         for capture_fails in (False, True):
             with tempfile.TemporaryDirectory() as directory:
