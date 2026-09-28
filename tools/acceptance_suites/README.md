@@ -32,3 +32,25 @@ def run_suite(ctx):
 真实窗口也用同一个 `ctx.run(...)` 串行启动现有桌面驱动。套件需核对驱动的 `results.json`、用例 ID、截图与保存结果，再用 `ctx.artifact(path)` 保存证据文件的路径和 SHA256，最后记录 `real_window` 或 `cold_reopen` 层。`ctx.run` 不会因为命令返回 0 就自动给每个用例通过。
 
 已有证据层：`core`、`native`、`real_window`、`cold_reopen`、`system_event`、`visual`。套件可针对功能选择需要的层，不必强制所有功能跑同一套组合。输出目录必须是全新目录；已有结果不会被覆盖。
+
+## 第五组 HTML 验收
+
+```sh
+# 核心、原生任务与产物结构。先用现有 build-app.sh --release 构建。
+python3 tools/run_acceptance.py group5-export artifacts/新的核心目录
+
+# 真实菜单、组字拒绝、保存/覆盖、未命名图片基准，以及两个文档交替10次。
+python3 tools/run_acceptance.py group5-window artifacts/新的窗口目录
+
+# 单独的固定1000公式输入，使取消发生在任务运行中；3次取消/重试及所属窗口关闭。
+GROUP5_WINDOW_PHASE=cancellation python3 tools/run_acceptance.py group5-window artifacts/新的取消目录
+
+# 对上述窗口目录中的实际输出制作移动副本，确认生产者已退出，离线直接 file:// 打开。
+GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance.py group5-browser artifacts/新的浏览器目录
+```
+
+桌面用例必须串行执行，需要已有辅助功能、事件投递和截图权限。使用重新签名的隔离应用和独立状态目录；输入不经过系统剪贴板，结束时恢复输入源。`window` 与 `cancellation` 为有界的两个阶段，不扩展验收组合。普通220公式导出可能在AX定位取消按钮时完成，因此它只承担重复输出，不把提交后的点击当成运行中取消。第一次失败保留，不能用新目录覆盖。
+
+浏览器阶段只使用测试机已有的 Chrome 和带内置 WebSocket 的 Node.js；两者不是产品依赖，也不进入 Yu 生产导出链路。新建隔离浏览器配置、关闭缓存并模拟该页面离线，不改系统网络或用户浏览器配置。只复制并移动产物副本，原始证据文件保持不动。自动检查不自动完成 `visual` 层；必须记录实际查看过的截图、哈希及范围。
+
+`tools/test_group5_window.py` 验证阶段路由与失败证据保留，不是GUI证据。所有这些入口只完成台账中的命名子项，不能自动关闭全部24组。最新结果和仍未解决的原生菜单/候选状态观察见 `docs/architecture/mac-group5-status.md`。
