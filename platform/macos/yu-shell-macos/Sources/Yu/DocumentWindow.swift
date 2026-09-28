@@ -990,8 +990,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) {
         guard htmlExport?.isRunning != true else { return }
         guard !bridge.composition.active, !textView.hasMarkedText() else {
-            show(NSError(domain: "Yu.Export", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                "请先完成或取消输入法组字，再导出。导出不会替您提交或取消组字。"])); return
+            // Do not add a modal focus transition while composition is alive.
+            // Refusal only updates existing chrome; it never enters a file panel,
+            // commits or cancels the overlay. The next document update restores
+            // the ordinary status automatically.
+            let message = "请先完成或取消组字，再导出。"
+            statusLabel.stringValue = message
+            statusLabel.toolTip = "导出不会替您提交或取消输入法组字。"
+            statusLabel.setAccessibilityValue(message)
+            return
         }
         guard let window = view.window else { return }
         htmlExport?.cancelAndClose()
