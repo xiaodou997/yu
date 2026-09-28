@@ -31,6 +31,7 @@ parser.add_argument('--table-resize', action='store_true', help='Real merged-col
 parser.add_argument('--math-suite', action='store_true', help='Exercise aligned, cases and multiline formula editing in the actual application')
 parser.add_argument('--diagram-suite', action='store_true', help='Exercise seven Mermaid families in the actual application')
 parser.add_argument('--recent-diagrams', action='store_true', help='Exercise the three central-connection and four Gantt-calendar fixtures with real caption edits')
+parser.add_argument('--fixture-errors', action='store_true', help='Run the two central-connection and two Gantt expected-error fixtures through real diagnostic and repair')
 parser.add_argument('--promotion-suite', action='store_true', help='Copy real native merged cells and paste into math/footnote/grouped targets')
 parser.add_argument('--ime', action='store_true', help='Verify real system Pinyin hardware-key composition, commit, cancellation and history')
 parser.add_argument('--list-inputs', type=Path, help='Prepared group4 list manifest; run single-range standalone/cell CRLF cases through native commands')
@@ -47,6 +48,9 @@ parser.add_argument('--highlight', action='store_true')
 parser.add_argument('--scripts', action='store_true')
 parser.add_argument('--footnotes', action='store_true')
 parser.add_argument('--footnote-errors', action='store_true')
+parser.add_argument('--footnote-edit-suite', action='store_true', help='Delete a complete table footnote reference and copy its native table within one document')
+parser.add_argument('--zoom-combo', action='store_true', help='Repeat real table resize, formula hit, footnote jump and range drag at two reading zooms')
+parser.add_argument('--long-selection', action='store_true', help='Real forward/reverse autoscrolling range drag in an extended Group 4 smoke document')
 parser.add_argument('--toc', action='store_true')
 parser.add_argument('--html', action='store_true')
 parser.add_argument('--html-blocks', action='store_true')
@@ -152,6 +156,7 @@ result = {'passed':False, 'build':manifest, 'checks':[], 'visual_review_required
           'stress_idle_seconds':args.stress_idle_seconds,
           'isolated_bundle':identifier,
           'recent_diagrams':args.recent_diagrams,
+          'fixture_errors':args.fixture_errors,
           'promotion_suite':args.promotion_suite,
           'ime':args.ime,
           'list_inputs':str(args.list_inputs) if args.list_inputs else None,
@@ -175,6 +180,17 @@ def run(*arguments):
     response = subprocess.run([str(driver), str(process.pid), *map(str,arguments)], text=True, capture_output=True, timeout=15)
     sequence += 1
     (out/f'event-{sequence:03}.json').write_text(json.dumps({'arguments':arguments, 'code':response.returncode, 'stdout':response.stdout, 'stderr':response.stderr},ensure_ascii=False,indent=2))
+    if (response.returncode and response.stderr.strip() == 'Cannot safely post event to foreground target'
+            and arguments[0] not in ('activate','snapshot')):
+        # The driver rejects this event before posting it. Reactivate once,
+        # preserve the original failure event, and record a separate retry.
+        activated = subprocess.run([str(driver), str(process.pid), 'activate'], text=True, capture_output=True, timeout=15)
+        sequence += 1
+        (out/f'event-{sequence:03}.json').write_text(json.dumps({'arguments':('activate',), 'code':activated.returncode, 'stdout':activated.stdout, 'stderr':activated.stderr, 'recovery_for':arguments},ensure_ascii=False,indent=2))
+        if activated.returncode == 0 and json.loads(activated.stdout).get('frontmost_pid') == process.pid:
+            response = subprocess.run([str(driver), str(process.pid), *map(str,arguments)], text=True, capture_output=True, timeout=15)
+            sequence += 1
+            (out/f'event-{sequence:03}.json').write_text(json.dumps({'arguments':arguments, 'code':response.returncode, 'stdout':response.stdout, 'stderr':response.stderr, 'retry_after_activation':True},ensure_ascii=False,indent=2))
     if response.returncode: raise RuntimeError(response.stderr)
     return json.loads(response.stdout) if response.stdout.strip().startswith('{') else None
 
@@ -632,6 +648,163 @@ try:
         run('select',utf16(source),0)
         result['checks'].append('footnote definition edit/undo/redo/save preserves exact BOM/CRLF source')
 
+    if args.footnote_edit_suite:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        original = ('# Footnote table\r\n\r\n'
+                    '| 甲引用[^one] | 乙引用[^two] |\r\n| --- | --- |\r\n\r\n'
+                    '| 目标🙂 | 保留 |\r\n| --- | --- |\r\n\r\n'
+                    '[^one]: 第一定义中文🙂。\r\n[^two]: 第二定义中文🙂。\r\n\r\nTAIL\r\n')
+        current = run('snapshot')['AXValue']
+        run('select',0,utf16(current)); run('paste-document',original)
+        assert run('snapshot')['AXValue'] == original
+        ref = original.index('[^one]')
+        run('select',utf16(original[:ref]),utf16('[^one]'))
+        run('key',51)
+        removed = original[:ref]+original[ref+len('[^one]'):]
+        assert run('snapshot')['AXValue'] == removed
+        assert '[^one]: 第一定义中文🙂。' in removed and '[^two]' in removed
+        run('capture',str(out/'footnote-whole-reference-deleted'))
+        run('key',6,'cmd'); assert run('snapshot')['AXValue'] == original
+        run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == removed
+        run('key',6,'cmd'); assert run('snapshot')['AXValue'] == original
+        result['checks'].append('native Backspace deletes one complete table footnote reference; outside definition, other reference and exact undo/redo survive')
+
+        first = original.index('甲引用')
+        last = original.index('乙引用')
+        target = original.index('目标🙂')
+        run('select',0,0)
+        first_rect = stable_bounds(utf16(original[:first]),utf16('甲引用'))
+        last_rect = stable_bounds(utf16(original[:last]),utf16('乙引用'))
+        target_rect = stable_bounds(utf16(original[:target]),utf16('目标🙂'))
+        point = lambda box: (box['x']+box['width']/2,box['y']+box['height']/2)
+        run('drag',*point(first_rect),*point(last_rect),'alt+shift')
+        copied = run('copy-paste',*point(target_rect))
+        payload = json.loads(copied['source_fragments'])
+        assert payload['version'] == 2 and payload['columns'] == 2
+        assert '[^one]' in json.dumps(payload) and '[^two]' in json.dumps(payload)
+        duplicated = run('snapshot')['AXValue']
+        assert duplicated != original and duplicated.count('| --- | --- |') == 2
+        assert '目标🙂' not in duplicated
+        assert duplicated.count('[^one]') >= 3
+        assert duplicated.count('[^two]') >= 3
+        assert duplicated.count('[^one]: 第一定义中文🙂。') == 1
+        assert duplicated.count('[^two]: 第二定义中文🙂。') == 1
+        run('capture',str(out/'footnote-table-duplicated'))
+        run('key',6,'cmd'); assert run('snapshot')['AXValue'] == original
+        run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == duplicated
+        run('key',1,'cmd'); time.sleep(.3)
+        assert fixture.read_bytes() == b'\xef\xbb\xbf'+duplicated.encode()
+        source = duplicated
+        result['checks'].append('real rectangular native two-column copy/paste duplicates references within one document, preserves one copy of each definition, one undo/redo and exact save')
+
+    if args.zoom_combo:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        text = ('# Zoom combo\r\n\r\n'
+                '<table><tr><th colspan="2">Joined header</th><th>Right</th></tr>'
+                '<tr><td rowspan="2">Rowspan 中文🙂</td><td>Cell A</td><td>Cell B</td></tr>'
+                '<tr><td>Cell C</td><td>Cell D</td></tr></table>\r\n\r\n'
+                'Formula $x^2$ and footnote[^z].\r\n\r\n[^z]: 定义中文🙂。\r\n\r\nTAIL\r\n')
+        current = run('snapshot')['AXValue']
+        run('select',0,utf16(current)); run('paste-document',text)
+        audit = group4_followup.Checks(run,stable_bounds,out,fixture,result)
+        observations = []
+        for zoom_index in range(2):
+            if zoom_index:
+                run('key',24,'cmd'); run('key',24,'cmd')
+                time.sleep(.8)
+            run('select',0,0)
+            item, _ = audit.divider()
+            splitter_x = item['AXPosition']['x']+item['AXSize']['width']/2
+            cell_at = text.index('Cell A')
+            cell = stable_bounds(utf16(text[:cell_at]),utf16('Cell A'))
+            y = cell['y']+cell['height']/2
+            run('drag',splitter_x,y,splitter_x+25,y)
+            moved, _ = audit.divider()
+            moved_x = moved['AXPosition']['x']+moved['AXSize']['width']/2
+            assert abs(moved_x-splitter_x-25) <= 2
+            run('drag-cancel',moved_x,y,moved_x-20,y)
+            cancelled, _ = audit.divider()
+            assert abs(cancelled['AXPosition']['x']+cancelled['AXSize']['width']/2-moved_x) <= 1
+            formula_at = text.index('x^2')
+            formula = stable_bounds(utf16(text[:formula_at]),3)
+            run('click',formula['x']+10,formula['y']+formula['height']/2)
+            caret = run('snapshot')['AXSelectedTextRange']
+            assert caret['length'] == 0 and utf16(text[:formula_at])-1 <= caret['location'] <= utf16(text[:formula_at+3])
+            ref_at = text.index('[^z]')
+            ref = stable_bounds(utf16(text[:ref_at]),utf16('[^z]'))
+            run('click',ref['x']+ref['width']/2,ref['y']+ref['height']/2,'cmd')
+            assert run('snapshot')['AXSelectedTextRange']['location'] == utf16(text[:text.index('[^z]:')])
+            first_at = text.index('Formula')
+            last_at = text.index('footnote')
+            first = stable_bounds(utf16(text[:first_at]),utf16('Formula'))
+            last = stable_bounds(utf16(text[:last_at]),utf16('footnote'))
+            def point(box): return (box['x']+box['width']/2,box['y']+box['height']/2)
+            if zoom_index:
+                run('drag',*point(last),*point(first))
+            else:
+                run('drag',*point(first),*point(last))
+            selected = run('snapshot')['AXSelectedTextRange']
+            assert selected['length'] > 0
+            assert run('snapshot')['AXValue'] == text
+            run('capture',str(out/('zoom-combo-'+str(zoom_index))))
+            observations.append({'zoom_index':zoom_index,'splitter_before_x':splitter_x,
+                                 'splitter_after_x':moved_x,'formula_bounds':formula,
+                                 'selected_range':selected,'body_line_height':first['height']})
+        assert observations[1]['body_line_height'] > observations[0]['body_line_height']
+        result['zoom_combo'] = observations
+        run('key',29,'cmd')
+        run('key',1,'cmd'); time.sleep(.3)
+        assert fixture.read_bytes() == b'\xef\xbb\xbf'+text.encode()
+        source = text
+        result['checks'].append('real 1.0 and 1.25 zoom: merged-column drag/cancel, formula hit, footnote Command-click, forward/reverse mouse range, exact source and save')
+
+    if args.long_selection:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        base = (HERE/'Fixtures/group4-smoke.md').read_text(encoding='utf-8')
+        filler = '\n\n# 长页选区\n\n' + ''.join(
+            f'段落 {index:03} 中文🙂 English selection remains editable.\n\n'
+            for index in range(120))
+        text = (base+filler).replace('\r\n','\n').replace('\n','\r\n')
+        current = run('snapshot')['AXValue']
+        run('select',0,utf16(current)); run('paste-document',text)
+        result['long_selection_input'] = {'bytes':len(text.encode()),
+                                          'sha256':hashlib.sha256(text.encode()).hexdigest(),
+                                          'heading_count':len(re.findall(r'^#',text,re.M))}
+        for reverse in (False,True):
+            label = '段落 119' if reverse else '段落 000'
+            at = text.index(label)
+            run('select',utf16(text[:at]),0)
+            rect = stable_bounds(utf16(text[:at]),utf16(label))
+            state = run('snapshot')
+            editor = state['AXPosition'],state['AXSize']
+            end_y = editor[0]['y']-8 if reverse else editor[0]['y']+editor[1]['height']+8
+            run('drag-autoscroll',rect['x']+rect['width']/2,
+                rect['y']+rect['height']/2,rect['x']+rect['width']/2,end_y)
+            selected = run('snapshot')
+            range_before = selected['AXSelectedTextRange']
+            assert range_before['length'] > 500, range_before
+            assert selected['AXValue'] == text
+            run('capture',str(out/('long-selection-'+('reverse' if reverse else 'forward'))))
+            run('scroll',-450 if reverse else 450)
+            scrolled = run('snapshot')
+            assert scrolled['AXSelectedTextRange'] == range_before
+            copied = run('copy-read')
+            assert copied['text'] == selected['AXSelectedText']
+            replacement = '跨屏替换中文🙂'
+            prefix = text.encode('utf-16-le')[:range_before['location']*2].decode('utf-16-le')
+            end = text.encode('utf-16-le')[:(range_before['location']+range_before['length'])*2].decode('utf-16-le')
+            changed = prefix+replacement+text[len(end):]
+            run('paste-text',replacement)
+            assert run('snapshot')['AXValue'] == changed
+            run('key',6,'cmd'); assert run('snapshot')['AXValue'] == text
+            run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == changed
+            run('key',6,'cmd'); assert run('snapshot')['AXValue'] == text
+            result['checks'].append(('reverse' if reverse else 'forward')+
+                ' cross-screen native drag autoscroll, post-scroll range persistence, exact copied text, replacement and undo/redo')
+        run('key',1,'cmd'); time.sleep(.3)
+        assert fixture.read_bytes() == b'\xef\xbb\xbf'+text.encode()
+        source = text
+
     if args.equations:
         captured = run('capture',str(out/'equation-reference-before-jump'))
         locator = out/'locate-native-text'
@@ -804,6 +977,64 @@ try:
             run('key',1,'cmd'); time.sleep(.3)
             assert fixture.read_bytes()==b'\xef\xbb\xbf'+source.encode()
             result['checks'].append('replacing unsupported source restores native preview and undo/redo preserves both source versions')
+
+    if args.fixture_errors:
+        utf16 = lambda text: len(text.encode('utf-16-le'))//2
+        error_cases = [
+            ('central-inactive', 'group4-sequence-central.md', -2,
+             'deactivate B', 'activate B'),
+            ('central-suffix', 'group4-sequence-central.md', -1,
+             'A()->>+B: 消息', 'A()->>B: 消息\nactivate B'),
+            ('gantt-time', 'group4-gantt-calendar.md', -2,
+             '24:00', '23:00'),
+            ('gantt-limit', 'group4-gantt-calendar.md', -1,
+             '2048ms', '20ms'),
+        ]
+        for case_id, name, index, bad_token, good_token in error_cases:
+            diagrams = re.findall(r'```mermaid\n(.*?)\n```',
+                                  (HERE/'Fixtures'/name).read_text(encoding='utf-8'), re.S)
+            invalid = diagrams[index]
+            assert invalid.count(bad_token) == 1, case_id
+            bad = ('# '+case_id+'\n\n```mermaid\n'+invalid+'\n```\n\nTAIL\n').replace('\n','\r\n')
+            current = run('snapshot')['AXValue']
+            run('select',0,utf16(current))
+            run('paste-document',bad)
+            run('select',utf16(bad),0)
+            time.sleep(2)
+            assert run('snapshot')['AXValue'] == bad
+            run('capture',str(out/(case_id+'-invalid')))
+            at = bad.index(bad_token)
+            rect = stable_bounds(utf16(bad[:at]),utf16(bad_token))
+            run('right-click',rect['x']+rect['width']/2,rect['y']+rect['height']/2)
+            run('key',125); run('key',36)
+            deadline = time.monotonic()+3
+            while True:
+                controls = run('controls')['controls']
+                if any(item.get('AXTitle')=='继续编辑' for item in controls): break
+                if time.monotonic()>deadline:
+                    raise AssertionError(case_id+' native diagnostic did not open')
+                time.sleep(.1)
+            assert '原始源码已保留' in json.dumps(controls,ensure_ascii=False)
+            run('capture',str(out/(case_id+'-diagnostic')))
+            button = next(item for item in controls if item.get('AXTitle')=='继续编辑')
+            point,size = button['AXPosition'],button['AXSize']
+            run('click',point['x']+size['width']/2,point['y']+size['height']/2)
+            assert run('snapshot')['AXValue'] == bad
+            run('key',1,'cmd'); time.sleep(.3)
+            assert fixture.read_bytes() == b'\xef\xbb\xbf'+bad.encode()
+            repaired = bad.replace(bad_token,good_token.replace('\n','\r\n'),1)
+            run('select',utf16(bad[:at]),utf16(bad_token))
+            run('paste-text',good_token.replace('\n','\r\n'))
+            assert run('snapshot')['AXValue'] == repaired
+            run('select',utf16(repaired),0)
+            time.sleep(1.5)
+            run('capture',str(out/(case_id+'-repaired')))
+            run('key',6,'cmd'); assert run('snapshot')['AXValue'] == bad
+            run('key',6,'cmd+shift'); assert run('snapshot')['AXValue'] == repaired
+            run('key',1,'cmd'); time.sleep(.3)
+            assert fixture.read_bytes() == b'\xef\xbb\xbf'+repaired.encode()
+            source = repaired
+            result['checks'].append(case_id+': fixture expected error shows native diagnostic, preserves exact bytes, repair restores source and one undo/redo/save transaction')
 
     if args.footnote_errors:
         bad = 'Missing reference[^missing].\r\n\r\n' + source
@@ -1040,6 +1271,7 @@ try:
             ('row-groups-target','row-groups-merged-payload',True),
             ('cross-groups','merged-payload',False),
             ('row-groups-target','row-groups-conflict-payload',False),
+            ('footnote-mixed-target','merged-payload',True),
         ]
         for case_index, (name,payload_name,accept) in enumerate(cases):
             donor = (fixtures/(payload_name+'.md')).read_text(encoding='utf-8').strip()
@@ -1081,6 +1313,10 @@ try:
                     assert 'data-math-style' in after and '>x^2</span>' in after
                 if name == 'footnote-target':
                     assert 'data-yu-footnote' in after and '[^note]: 保留脚注中文🙂。' in after
+                if name == 'footnote-mixed-target':
+                    assert 'data-yu-footnote' in after and 'x^2' in after
+                    for marker in ['[^outside]','[^note]','[^二]']:
+                        assert marker in after, marker
                 if name == 'row-groups-target':
                     for mark in ["<thead id='head'>","<tbody id='body'>",'保留甲','保留乙','保留丙','保留丁',"<span data-math-style='inline'>x^2</span>","<span data-yu-footnote='reference'>[^note]</span>"]:
                         assert mark in after,mark
@@ -1237,9 +1473,9 @@ try:
                 time.sleep(.2)
         assert process.pid != first_pid
         assert reopened['AXValue']==expected, 'Relaunch did not restore exact disk source'
-        if args.html_blocks:
+        if args.html_blocks or args.footnote_edit_suite:
             time.sleep(1)
-            assert not helpers(), 'Reopened HTML document launched heavy helper'
+            assert not helpers(), 'Reopened document without heavy resources launched helper'
         else:
             deadline = time.monotonic()+20
             while not helpers():

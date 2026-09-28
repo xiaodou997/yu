@@ -464,7 +464,7 @@ case "right-click":
         event?.setIntegerValueField(.mouseEventClickState, value: 1)
         post(event)
     }
-case "click", "double-click", "triple-click", "word-drag", "drag", "drag-cancel":
+case "click", "double-click", "triple-click", "word-drag", "drag", "drag-cancel", "drag-autoscroll":
     guard args.count >= 4, let x = Double(args[2]), let y = Double(args[3]) else { fail("mouse requires screen x y") }
     let start = CGPoint(x:x,y:y)
     let isDrag = action.hasPrefix("drag") || action == "word-drag"
@@ -481,6 +481,12 @@ case "click", "double-click", "triple-click", "word-drag", "drag", "drag-cancel"
     if isDrag {
         guard args.count >= 6, let endX = Double(args[4]), let endY = Double(args[5]) else { fail("drag requires x y endX endY") }
         for step in 1...16 { let t = Double(step)/16; mouse(.leftMouseDragged,CGPoint(x:x+(endX-x)*t,y:y+(endY-y)*t)) }
+        if action == "drag-autoscroll" {
+            for _ in 1...40 {
+                mouse(.leftMouseDragged,CGPoint(x:endX,y:endY))
+                RunLoop.current.run(until:Date().addingTimeInterval(0.05))
+            }
+        }
         if action == "drag-cancel" {
             for down in [true,false] { let event=CGEvent(keyboardEventSource:nil,virtualKey:53,keyDown:down); event?.flags=[]; post(event) }
         }
