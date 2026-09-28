@@ -36,6 +36,7 @@ final class NativeFileWatcher {
 }
 final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate {
     private let bridge: StorageBridge
+    private var htmlExport: NativeHTMLExportController?
     let persistence: NativeDocumentPersistence
     var documentURL: URL { URL(fileURLWithPath: bridge.path) }
     var onValidateSaveDestination: ((URL) throws -> Void)?
@@ -921,6 +922,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     }
 
     func detachSurfaceHost() {
+        htmlExport?.cancelAndClose()
         surfaceCoordinator.detach()
     }
 
@@ -983,6 +985,35 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         do { try textView.finishCompositionForFileOperation() }
         catch { show(error); return }
         _ = chooseSaveDestination()
+    }
+
+    @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) {
+        guard htmlExport?.isRunning != true else { return }
+        guard !bridge.composition.active, !textView.hasMarkedText() else {
+            show(NSError(domain: "Yu.Export", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "请先完成或取消输入法组字，再导出。导出不会替您提交或取消组字。"])); return
+        }
+        guard let window = view.window else { return }
+        htmlExport?.cancelAndClose()
+        let options = NativeHTMLExportOptions(untitled: persistence.isUntitled)
+        let panel = NSSavePanel()
+        panel.title = "导出 HTML"
+        panel.prompt = "导出"
+        panel.allowedContentTypes = [.html]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + ".html"
+        if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
+        panel.accessoryView = options.view
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            try onValidateSaveDestination?(destination)
+            let config = options.config(title: destination.deletingPathExtension().lastPathComponent,
+                untitled: persistence.isUntitled, appearance: view.effectiveAppearance)
+            let task = try bridge.beginHTMLExport(to: destination, config: config)
+            htmlExport = NativeHTMLExportController(task: task, destination: destination, owner: window) { [weak self] in
+                self?.htmlExport = nil
+            }
+        } catch { show(error) }
     }
 
     @discardableResult
@@ -2692,6 +2723,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
+        if menuItem.action == #selector(exportHTMLFromMenu(_:)) { return htmlExport?.isRunning != true }
         if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) { return textView.canEditImage() }
         if menuItem.action == #selector(insertImageFromMenu(_:)) { return textView.isEditable }
         let state = bridge.state
@@ -3400,6 +3432,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
+        let exportHTML = NSMenuItem(title: "导出 HTML…", action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
+        exportHTML.target = controller
+        exportHTML.isEnabled = controller != nil
+        fileMenu.addItem(exportHTML)
         let insertImage = NSMenuItem(title: "插入图片…", action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
         insertImage.target = controller
         fileMenu.addItem(insertImage)

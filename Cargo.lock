@@ -3933,9 +3933,14 @@ dependencies = [
 name = "yu-export"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "comrak",
+ "roxmltree 0.21.1",
+ "tempfile",
+ "yu-assets",
  "yu-core",
  "yu-markdown",
+ "yu-syntax",
  "yu-text",
 ]
 

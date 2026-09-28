@@ -19,6 +19,12 @@ if CommandLine.arguments.contains("--presentation-latency-self-check") || Comman
     UserDefaults.standard.setVolatileDomain(["Yu.readingTheme": 0], forName: UserDefaults.argumentDomain)
 }
 NativeTheme.registerFonts()
+if let flag = CommandLine.arguments.firstIndex(of: "--html-export-self-check"),
+   CommandLine.arguments.indices.contains(flag + 2) {
+    MainActor.assumeIsolated {
+        runHTMLExportSelfCheck(input: CommandLine.arguments[flag + 1], output: CommandLine.arguments[flag + 2])
+    }
+}
 if CommandLine.arguments.contains("--calendar-self-check") {
     runCalendarSelfCheck()
     exit(0)

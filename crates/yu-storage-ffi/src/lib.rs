@@ -13,6 +13,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 #[cfg(target_os = "macos")]
+mod html_export;
+#[cfg(target_os = "macos")]
 mod macos_frame_worker;
 #[cfg(target_os = "macos")]
 use macos_frame_worker::LatestWorker;
@@ -1643,6 +1645,149 @@ pub struct YuStorageSession {
     shader_library: Option<Vec<u8>>,
     #[cfg(target_os = "macos")]
     macos_embedded_resources: MacosEmbeddedResourceState,
+}
+
+/// Opaque whole-document task: no mutable editor is retained by its workers.
+pub struct YuStorageHtmlExport {
+    #[cfg(target_os = "macos")]
+    job: std::sync::Arc<html_export::HtmlJob>,
+}
+
+/// Capture committed contents only. IME preedit is neither committed nor cancelled.
+/// # Safety
+/// A live session on its owning thread; readable UTF-8 inputs and writable output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_html_export_start(
+    session: *const YuStorageSession,
+    target: *const u8,
+    target_length: usize,
+    config: *const u8,
+    config_length: usize,
+    output: *mut *mut YuStorageHtmlExport,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe {
+        *output = std::ptr::null_mut();
+    }
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if session.session.document().editor().composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+    if config_length > 8192 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    let target = match read_utf8(target, target_length) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let config = match read_utf8(config, config_length) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let config: serde_json::Value = match serde_json::from_str(config) {
+        Ok(value) => value,
+        Err(_) => return YU_STORAGE_INVALID_COMMAND,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        match html_export::HtmlJob::start(
+            session.session.snapshot(),
+            session.session.path().to_path_buf(),
+            std::path::Path::new(target),
+            &config,
+        ) {
+            Ok(job) => {
+                unsafe {
+                    *output = Box::into_raw(Box::new(YuStorageHtmlExport { job }));
+                }
+                YU_STORAGE_OK
+            }
+            Err(_) => YU_STORAGE_RENDER_BUSY,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (target, config);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Copy a bounded JSON stage/status snapshot. Supports ordinary ABI size query.
+/// # Safety
+/// Task remains alive throughout the call; writable output buffer/count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_copy_status(
+    task: *const YuStorageHtmlExport,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        write_bytes(task.job.status_json().as_bytes(), output, capacity, written)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, output, capacity, written);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Publish only the prepared snapshot; warnings require explicit consent.
+/// # Safety
+/// The task pointer must be live and not destroyed concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_commit(
+    task: *const YuStorageHtmlExport,
+    allow_warnings: u8,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        match task.job.commit(allow_warnings != 0) {
+            Ok(()) => YU_STORAGE_OK,
+            Err(_) => YU_STORAGE_INVALID_STATE,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, allow_warnings);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// # Safety
+/// Task must be live; cancellation never touches the document or another task.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_cancel(task: *const YuStorageHtmlExport) {
+    #[cfg(target_os = "macos")]
+    if let Some(task) = unsafe { task.as_ref() } {
+        task.job.cancel();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = task;
+}
+
+/// # Safety
+/// A live task returned by start, destroyed exactly once on its owner thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_destroy(task: *mut YuStorageHtmlExport) {
+    if task.is_null() {
+        return;
+    }
+    let task = unsafe { Box::from_raw(task) };
+    #[cfg(target_os = "macos")]
+    task.job.cancel();
+    drop(task);
 }
 
 /// Set the compiled library before attaching a native surface. No runtime compiler.

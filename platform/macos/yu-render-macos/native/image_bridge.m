@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /*
  * ImageIO is deliberately kept on the macOS side of the boundary. The Rust
@@ -112,6 +113,54 @@ int yu_macos_image_decode_file(
 
 void yu_macos_image_free_bytes(void *pixels) {
     free(pixels);
+}
+
+/* Export decodes frozen bytes, never reopens a changing path. ImageIO handles
+ * orientation and PNG encoding. Original metadata (GPS, author, filenames) is
+ * not copied. Budget checks precede decoded-image allocation; no downsampling
+ * quietly discards document image detail. */
+int yu_macos_export_image_png(const uint8_t *bytes, size_t length,
+    uint64_t max_pixels, void **out_bytes, size_t *out_length,
+    uint32_t *out_width, uint32_t *out_height) {
+    if (!bytes || !length || !out_bytes || !out_length || !out_width || !out_height) return 0;
+    *out_bytes = NULL; *out_length = 0;
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)bytes length:length freeWhenDone:NO];
+        CGImageSourceRef source = CGImageSourceCreateWithData((CFDataRef)data,
+            (CFDictionaryRef)@{(id)kCGImageSourceShouldCache: @NO});
+        if (!source) return 0;
+        NSDictionary *properties = [(NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, 0, NULL) autorelease];
+        uint64_t width = [properties[(id)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+        uint64_t height = [properties[(id)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+        if (!width || !height || width > UINT32_MAX || height > UINT32_MAX || width > max_pixels / height) {
+            CFRelease(source); return -1;
+        }
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (CFDictionaryRef)@{
+            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+            (id)kCGImageSourceThumbnailMaxPixelSize: @(MAX(width, height)),
+            (id)kCGImageSourceShouldCacheImmediately: @YES
+        });
+        CFRelease(source);
+        if (!image) return 0;
+        size_t actual_width = CGImageGetWidth(image), actual_height = CGImageGetHeight(image);
+        if (!actual_width || !actual_height || actual_width > max_pixels / actual_height) {
+            CGImageRelease(image); return -1;
+        }
+        NSMutableData *png = [NSMutableData data];
+        CGImageDestinationRef destination = CGImageDestinationCreateWithData((CFMutableDataRef)png, CFSTR("public.png"), 1, NULL);
+        if (!destination) { CGImageRelease(image); return 0; }
+        CGImageDestinationAddImage(destination, image, NULL);
+        bool written = CGImageDestinationFinalize(destination);
+        CFRelease(destination); CGImageRelease(image);
+        if (!written || png.length == 0 || png.length > 32 * 1024 * 1024) return -1;
+        void *copy = malloc(png.length);
+        if (!copy) return -1;
+        memcpy(copy, png.bytes, png.length);
+        *out_bytes = copy; *out_length = png.length;
+        *out_width = (uint32_t)actual_width; *out_height = (uint32_t)actual_height;
+        return 1;
+    }
 }
 
 /*

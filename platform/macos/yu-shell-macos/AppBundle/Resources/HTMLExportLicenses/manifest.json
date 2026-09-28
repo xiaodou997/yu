@@ -1,0 +1,746 @@
+{
+  "schema": 1,
+  "date": "2026-09-28",
+  "scope": "Conservative non-dev workspace-resolved closure for comrak 0.55.0, base64 0.22.1, roxmltree 0.21.1 and tempfile 3.27.0, filtered to aarch64-apple-darwin. May include build-time/unified features; not a claim that every package is linked or that the entire Yu distribution has been audited. No code/test/font assets are copied.",
+  "local_patches": [],
+  "packages": [
+    {
+      "package": "base64",
+      "version": "0.22.1",
+      "repository": "https://github.com/marshallpierce/rust-base64",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "base64-0.22.1/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "base64-0.22.1/LICENSE-MIT",
+          "sha256": "0dd882e53de11566d50f8e8e2d5a651bcf3fabee4987d70f306233cf39094ba7"
+        }
+      ]
+    },
+    {
+      "package": "bitflags",
+      "version": "2.13.2",
+      "repository": "https://github.com/bitflags/bitflags",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06",
+      "workspace_resolved_features": [
+        "serde",
+        "serde_core",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "bitflags-2.13.2/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "bitflags-2.13.2/LICENSE-MIT",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        }
+      ]
+    },
+    {
+      "package": "caseless",
+      "version": "0.2.2",
+      "repository": "https://github.com/unicode-rs/rust-caseless",
+      "license_expression": "MIT",
+      "registry_checksum": "8b6fd507454086c8edfd769ca6ada439193cdb209c7681712ef6275cccbfe5d8",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "caseless-0.2.2/LICENSE",
+          "sha256": "9a1284e016a7770f3c033a108662a94490419796001b422f5c6738c9ebf486d7"
+        }
+      ]
+    },
+    {
+      "package": "cfg-if",
+      "version": "1.0.5",
+      "repository": "https://github.com/rust-lang/cfg-if",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "cfg-if-1.0.5/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "cfg-if-1.0.5/LICENSE-MIT",
+          "sha256": "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+        }
+      ]
+    },
+    {
+      "package": "comrak",
+      "version": "0.55.0",
+      "repository": "https://github.com/kivikakk/comrak",
+      "license_expression": "BSD-2-Clause",
+      "registry_checksum": "daa3d1ea6b01ce72405fa3f826768f51c7a44917527c89b37856ffdd17ee57e4",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "comrak-0.55.0/COPYING",
+          "sha256": "27293e2353ce5d83e07331ffc423051908b062787d148193b8927d50d9873bd5"
+        }
+      ]
+    },
+    {
+      "package": "entities",
+      "version": "1.0.1",
+      "repository": "https://github.com/p-jackson/entities",
+      "license_expression": "MIT",
+      "registry_checksum": "b5320ae4c3782150d900b79807611a59a99fc9a1d61d686faafc24b93fc8d7ca",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "entities-1.0.1/LICENSE",
+          "sha256": "21c49267da7a0c465c6d703c6eeebff776b7fe575446a19e3ab57e64fd295f2d"
+        }
+      ]
+    },
+    {
+      "package": "errno",
+      "version": "0.3.14",
+      "repository": "https://github.com/lambda-fairy/rust-errno",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+      "workspace_resolved_features": [
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "errno-0.3.14/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "errno-0.3.14/LICENSE-MIT",
+          "sha256": "8764a597675778ddfd4e25f81b08a05dbcf089ac05662df7613fe67f150e3aa2"
+        }
+      ]
+    },
+    {
+      "package": "fastrand",
+      "version": "2.5.0",
+      "repository": "https://github.com/smol-rs/fastrand",
+      "license_expression": "Apache-2.0 OR MIT",
+      "registry_checksum": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "fastrand-2.5.0/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "fastrand-2.5.0/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "finl_unicode",
+      "version": "1.4.0",
+      "repository": "https://github.com/dahosek/finl_unicode",
+      "license_expression": "(MIT OR Apache-2.0) AND Unicode-DFS-2016",
+      "registry_checksum": "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5",
+      "workspace_resolved_features": [
+        "categories",
+        "default",
+        "grapheme_clusters"
+      ],
+      "license_files": [
+        {
+          "file": "finl_unicode-1.4.0/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "finl_unicode-1.4.0/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "file": "finl_unicode-1.4.0/LICENSE-UNICODE",
+          "sha256": "361d7912957842f2ce61c774b14afba41ae91df84882982e6f7e749e01c07c91"
+        }
+      ]
+    },
+    {
+      "package": "getrandom",
+      "version": "0.4.3",
+      "repository": "https://github.com/rust-random/getrandom",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "getrandom-0.4.3/LICENSE-APACHE",
+          "sha256": "aaff376532ea30a0cd5330b9502ad4a4c8bf769c539c87ffe78819d188a18ebf"
+        },
+        {
+          "file": "getrandom-0.4.3/LICENSE-MIT",
+          "sha256": "523a42c25d245dde9c015f882cec7f4555aad883382a6cf19b4b7d9b2cd5419b"
+        }
+      ]
+    },
+    {
+      "package": "jetscii",
+      "version": "0.5.3",
+      "repository": "https://github.com/shepmaster/jetscii",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "47f142fe24a9c9944451e8349de0a56af5f3e7226dc46f3ed4d4ecc0b85af75e",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "jetscii-0.5.3/LICENSE-APACHE",
+          "sha256": "2c930ab9a93b97108afbfadac010ca55436b3089183ab5f341fe4880b94aca99"
+        },
+        {
+          "file": "jetscii-0.5.3/LICENSE-MIT",
+          "sha256": "54887c871469d5b566bb86d1d9ae0f6962194dae12cb6a2ab41a05086e007843"
+        }
+      ]
+    },
+    {
+      "package": "libc",
+      "version": "0.2.189",
+      "repository": "https://github.com/rust-lang/libc",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+      "workspace_resolved_features": [
+        "default",
+        "extra_traits",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "libc-0.2.189/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "libc-0.2.189/LICENSE-MIT",
+          "sha256": "123a331b5dbf04c30097fa43b8f858bc85df671fe776de498d01f3d6b7c1f69e"
+        }
+      ]
+    },
+    {
+      "package": "memchr",
+      "version": "2.8.3",
+      "repository": "https://github.com/BurntSushi/memchr",
+      "license_expression": "Unlicense OR MIT",
+      "registry_checksum": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "memchr-2.8.3/COPYING",
+          "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f"
+        },
+        {
+          "file": "memchr-2.8.3/LICENSE-MIT",
+          "sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f"
+        },
+        {
+          "file": "memchr-2.8.3/UNLICENSE",
+          "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c"
+        }
+      ]
+    },
+    {
+      "package": "once_cell",
+      "version": "1.21.4",
+      "repository": "https://github.com/matklad/once_cell",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "race",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "once_cell-1.21.4/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "once_cell-1.21.4/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "phf",
+      "version": "0.13.1",
+      "repository": "https://github.com/rust-phf/rust-phf",
+      "license_expression": "MIT",
+      "registry_checksum": "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf",
+      "workspace_resolved_features": [
+        "default",
+        "macros",
+        "phf_macros",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "phf-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38"
+        }
+      ]
+    },
+    {
+      "package": "phf_codegen",
+      "version": "0.13.1",
+      "repository": "https://github.com/rust-phf/rust-phf",
+      "license_expression": "MIT",
+      "registry_checksum": "49aa7f9d80421bca176ca8dbfebe668cc7a2684708594ec9f3c0db0805d5d6e1",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "phf_codegen-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38"
+        }
+      ]
+    },
+    {
+      "package": "phf_generator",
+      "version": "0.13.1",
+      "repository": "https://github.com/rust-phf/rust-phf",
+      "license_expression": "MIT",
+      "registry_checksum": "135ace3a761e564ec88c03a77317a7c6b80bb7f7135ef2544dbe054243b89737",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "phf_generator-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38"
+        }
+      ]
+    },
+    {
+      "package": "phf_macros",
+      "version": "0.13.1",
+      "repository": "https://github.com/rust-phf/rust-phf",
+      "license_expression": "MIT",
+      "registry_checksum": "812f032b54b1e759ccd5f8b6677695d5268c588701effba24601f6932f8269ef",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "phf_macros-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38"
+        }
+      ]
+    },
+    {
+      "package": "phf_shared",
+      "version": "0.13.1",
+      "repository": "https://github.com/rust-phf/rust-phf",
+      "license_expression": "MIT",
+      "registry_checksum": "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266",
+      "workspace_resolved_features": [
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "phf_shared-0.13.1/LICENSE",
+          "sha256": "0ab4d106b6faac07fb6a051815fd1b4d862d730895e2d7d7358c2f13565e7a38"
+        }
+      ]
+    },
+    {
+      "package": "proc-macro2",
+      "version": "1.0.107",
+      "repository": "https://github.com/dtolnay/proc-macro2",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+      "workspace_resolved_features": [
+        "default",
+        "proc-macro"
+      ],
+      "license_files": [
+        {
+          "file": "proc-macro2-1.0.107/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "proc-macro2-1.0.107/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "quote",
+      "version": "1.0.47",
+      "repository": "https://github.com/dtolnay/quote",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+      "workspace_resolved_features": [
+        "default",
+        "proc-macro"
+      ],
+      "license_files": [
+        {
+          "file": "quote-1.0.47/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "quote-1.0.47/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "roxmltree",
+      "version": "0.21.1",
+      "repository": "https://github.com/RazrFalcon/roxmltree",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb",
+      "workspace_resolved_features": [
+        "default",
+        "positions",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "roxmltree-0.21.1/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "roxmltree-0.21.1/LICENSE-MIT",
+          "sha256": "fffe218c1e349e1d482a05677f2ce850502f88298174d77f6ac7c04821db7899"
+        }
+      ]
+    },
+    {
+      "package": "rustc-hash",
+      "version": "2.1.3",
+      "repository": "https://github.com/rust-lang/rustc-hash",
+      "license_expression": "Apache-2.0 OR MIT",
+      "registry_checksum": "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d",
+      "workspace_resolved_features": [
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "rustc-hash-2.1.3/LICENSE-APACHE",
+          "sha256": "95bd3988beee069fa2848f648dab43cc6e0b2add2ad6bcb17360caf749802bcc"
+        },
+        {
+          "file": "rustc-hash-2.1.3/LICENSE-MIT",
+          "sha256": "30fefc3a7d6a0041541858293bcbea2dde4caa4c0a5802f996a7f7e8c0085652"
+        }
+      ]
+    },
+    {
+      "package": "rustix",
+      "version": "1.1.5",
+      "repository": "https://github.com/bytecodealliance/rustix",
+      "license_expression": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "registry_checksum": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "fs",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "rustix-1.1.5/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "rustix-1.1.5/LICENSE-Apache-2.0_WITH_LLVM-exception",
+          "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+        },
+        {
+          "file": "rustix-1.1.5/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "serde",
+      "version": "1.0.229",
+      "repository": "https://github.com/serde-rs/serde",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "derive",
+        "serde_derive",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "serde-1.0.229/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "serde-1.0.229/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "serde_core",
+      "version": "1.0.229",
+      "repository": "https://github.com/serde-rs/serde",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+      "workspace_resolved_features": [
+        "alloc",
+        "default",
+        "result",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "serde_core-1.0.229/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "serde_core-1.0.229/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "serde_derive",
+      "version": "1.0.229",
+      "repository": "https://github.com/serde-rs/serde",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
+      "workspace_resolved_features": [
+        "default"
+      ],
+      "license_files": [
+        {
+          "file": "serde_derive-1.0.229/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "serde_derive-1.0.229/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "siphasher",
+      "version": "1.0.3",
+      "repository": "https://github.com/jedisct1/rust-siphash",
+      "license_expression": "MIT/Apache-2.0",
+      "registry_checksum": "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649",
+      "workspace_resolved_features": [
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "siphasher-1.0.3/COPYING",
+          "sha256": "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365"
+        }
+      ]
+    },
+    {
+      "package": "smallvec",
+      "version": "1.16.1",
+      "repository": "https://github.com/servo/rust-smallvec",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891",
+      "workspace_resolved_features": [
+        "const_generics",
+        "const_new",
+        "union"
+      ],
+      "license_files": [
+        {
+          "file": "smallvec-1.16.1/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "smallvec-1.16.1/LICENSE-MIT",
+          "sha256": "0b28172679e0009b655da42797c03fd163a3379d5cfa67ba1f1655e974a2a1a9"
+        }
+      ]
+    },
+    {
+      "package": "syn",
+      "version": "2.0.119",
+      "repository": "https://github.com/dtolnay/syn",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297",
+      "workspace_resolved_features": [
+        "clone-impls",
+        "default",
+        "derive",
+        "extra-traits",
+        "full",
+        "parsing",
+        "printing",
+        "proc-macro"
+      ],
+      "license_files": [
+        {
+          "file": "syn-2.0.119/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "syn-2.0.119/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "syn",
+      "version": "3.0.6",
+      "repository": "https://github.com/dtolnay/syn",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee",
+      "workspace_resolved_features": [
+        "clone-impls",
+        "default",
+        "derive",
+        "extra-traits",
+        "fold",
+        "full",
+        "parsing",
+        "printing",
+        "proc-macro",
+        "visit",
+        "visit-mut"
+      ],
+      "license_files": [
+        {
+          "file": "syn-3.0.6/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "syn-3.0.6/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        }
+      ]
+    },
+    {
+      "package": "tempfile",
+      "version": "3.27.0",
+      "repository": "https://github.com/Stebalien/tempfile",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd",
+      "workspace_resolved_features": [
+        "default",
+        "getrandom"
+      ],
+      "license_files": [
+        {
+          "file": "tempfile-3.27.0/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "tempfile-3.27.0/LICENSE-MIT",
+          "sha256": "8b427f5bc501764575e52ba4f9d95673cf8f6d80a86d0d06599852e1a9a20a36"
+        }
+      ]
+    },
+    {
+      "package": "tinyvec",
+      "version": "1.13.3",
+      "repository": "https://github.com/Lokathor/tinyvec",
+      "license_expression": "Zlib OR Apache-2.0 OR MIT",
+      "registry_checksum": "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee",
+      "workspace_resolved_features": [
+        "alloc",
+        "default"
+      ],
+      "license_files": [
+        {
+          "file": "tinyvec-1.13.3/LICENSE-APACHE.md",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        {
+          "file": "tinyvec-1.13.3/LICENSE-MIT.md",
+          "sha256": "fd80a26fbb3f644af1fa994134446702932968519797227e07a1368dea80f0bc"
+        },
+        {
+          "file": "tinyvec-1.13.3/LICENSE-ZLIB.md",
+          "sha256": "84b34dd7608f7fb9b17bd588a6bf392bf7de504e2716f024a77d89f1b145a151"
+        }
+      ]
+    },
+    {
+      "package": "typed-arena",
+      "version": "2.0.2",
+      "repository": "https://github.com/SimonSapin/rust-typed-arena",
+      "license_expression": "MIT",
+      "registry_checksum": "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a",
+      "workspace_resolved_features": [
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "typed-arena-2.0.2/LICENSE",
+          "sha256": "9ed5e982274d54d0cf94f0e9f9fd889182b6f1f50a012f0be41ce7c884347ab6"
+        }
+      ]
+    },
+    {
+      "package": "unicode-ident",
+      "version": "1.0.26",
+      "repository": "https://github.com/dtolnay/unicode-ident",
+      "license_expression": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "registry_checksum": "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954",
+      "workspace_resolved_features": [],
+      "license_files": [
+        {
+          "file": "unicode-ident-1.0.26/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "file": "unicode-ident-1.0.26/LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+        },
+        {
+          "file": "unicode-ident-1.0.26/LICENSE-UNICODE",
+          "sha256": "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1"
+        }
+      ]
+    },
+    {
+      "package": "unicode-normalization",
+      "version": "0.1.25",
+      "repository": "https://github.com/unicode-rs/unicode-normalization",
+      "license_expression": "MIT OR Apache-2.0",
+      "registry_checksum": "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8",
+      "workspace_resolved_features": [
+        "default",
+        "std"
+      ],
+      "license_files": [
+        {
+          "file": "unicode-normalization-0.1.25/LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "file": "unicode-normalization-0.1.25/LICENSE-MIT",
+          "sha256": "7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0"
+        }
+      ]
+    }
+  ]
+}
