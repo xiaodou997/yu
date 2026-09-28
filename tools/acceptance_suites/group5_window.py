@@ -271,6 +271,34 @@ class WindowChecks:
         assert before == after
         assert self.event('snapshot')['AXSelectedTextRanges'] == initial_selection
         write_json(self.out / 'reports/menu-output.json', after)
+        # A changed viewport/source-mode presentation must not change the
+        # whole-document snapshot or leak editor chrome into the artifact.
+        self.event('select', len(self.first_source.encode('utf-16-le')) // 2, 0)
+        # Use the existing native key-equivalent route. AXPress can return
+        # success while AppKit is still tracking the menu; that is not proof
+        # that a zoom/source-mode command ran. Verify zoom via its menu state.
+        self.event('raise-window', self.first)
+        for _ in range(2):
+            self.key(24, 'cmd+shift')
+        self.event('menu-open', '显示')
+        self.find(lambda c: c.get('AXTitle') == '实际大小' and c.get('AXEnabled'))
+        self.key(53)
+        self.key(46, 'cmd+shift')
+        self.source(self.first_source)
+        self.capture('presentation-before-export')
+        selection = self.event('snapshot')['AXSelectedTextRanges']
+        second = self.outputs / 'presentation-isolation.html'
+        self.open_export()
+        self.set_export_style(False); self.choose_target(second)
+        result = self.complete(second, self.first_source, 'GROUP5-DOCUMENT-END')
+        assert result['sha256'] == after['sha256'], 'Viewport/source mode changed exported bytes'
+        assert self.event('snapshot')['AXSelectedTextRanges'] == selection
+        write_json(self.out / 'reports/presentation-isolation.json', {
+            'passed': True, 'same_output_sha256': result['sha256'],
+            'source_mode_shortcut': 'Command-Shift-M', 'zoom_in_shortcuts': 2,
+            'end_of_document_selection_preserved': True})
+        self.key(46, 'cmd+shift')
+        self.key(29, 'cmd')
 
     def untitled(self):
         self.key(45, 'cmd')

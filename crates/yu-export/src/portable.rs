@@ -350,8 +350,15 @@ pub fn data_image(bytes: &[u8], mime: &str, width: u32, height: u32) -> ExportIm
 /// active elements, event attributes and external references are not permitted.
 /// This uses the already-locked XML parser, not a handwritten SVG interpreter.
 pub fn validate_svg(markup: &str) -> Result<(), String> {
+    validate_svg_resource(markup).map_err(|error| match error {
+        ResourceError::Fatal(message) | ResourceError::Warning(message) => message,
+    })
+}
+/// Budget exhaustion is fatal; malformed/active user content may be shown as
+/// a diagnostic only after consent. Do not silently turn a quota into a warning.
+pub fn validate_svg_resource(markup: &str) -> Result<(), ResourceError> {
     if markup.len() > yu_assets::EMBEDDED_SVG_MAX_MARKUP_BYTES {
-        return Err("SVG 超过 4 MiB 预算".into());
+        return Err(ResourceError::Fatal("SVG 超过 4 MiB 预算".into()));
     }
     let document = roxmltree::Document::parse_with_options(
         markup,
@@ -361,7 +368,15 @@ pub fn validate_svg(markup: &str) -> Result<(), String> {
             ..Default::default()
         },
     )
-    .map_err(|_| "SVG XML 无效或超过节点预算")?;
+    .map_err(|error| match error {
+        roxmltree::Error::NodesLimitReached => {
+            ResourceError::Fatal("SVG 超过 100000 XML 节点预算".into())
+        }
+        _ => ResourceError::Warning("SVG XML 无效".into()),
+    })?;
+    check_svg_document(&document).map_err(ResourceError::Warning)
+}
+fn check_svg_document(document: &roxmltree::Document<'_>) -> Result<(), String> {
     if document.root_element().tag_name().name() != "svg" {
         return Err("资源不是 SVG".into());
     }

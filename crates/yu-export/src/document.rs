@@ -9,11 +9,57 @@ use yu_markdown::{EmbeddedKind, EmbeddedSpan, MarkdownDocument};
 use yu_syntax::NodeKind;
 
 pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "document_bounds.rs"]
+mod bounds;
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_RESOURCES: usize = 2048;
 /// Encoded resources are counted per occurrence before insertion/expansion.
 /// This also bounds repeated references to one otherwise-small cached image.
 pub const MAX_RESOURCE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+const OUTPUT_LIMIT: &str = "HTML 超过 256 MiB 输出预算";
+
+// All size arithmetic precedes allocation. This adapter bounds comrak's
+// existing formatter; it does not introduce another Markdown renderer.
+fn checked_length(current: usize, extra: usize, limit: usize) -> Result<usize, String> {
+    current
+        .checked_add(extra)
+        .filter(|&size| size <= limit)
+        .ok_or_else(|| "导出内容超过字节预算".into())
+}
+fn append_html(output: &mut String, text: &str) -> Result<(), String> {
+    let size = checked_length(output.len(), text.len(), MAX_OUTPUT_BYTES)
+        .map_err(|_| OUTPUT_LIMIT.to_owned())?;
+    if size > output.capacity() {
+        let capacity = size.next_power_of_two().min(MAX_OUTPUT_BYTES);
+        output
+            .try_reserve_exact(capacity - output.len())
+            .map_err(|_| "无法分配导出缓冲区")?;
+    }
+    output.push_str(text);
+    Ok(())
+}
+struct HtmlSink<'a>(&'a mut String);
+impl std::fmt::Write for HtmlSink<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        append_html(self.0, text).map_err(|_| std::fmt::Error)
+    }
+}
+fn join_html(parts: &[&str]) -> Result<String, String> {
+    let size = parts
+        .iter()
+        .try_fold(0, |n, part| checked_length(n, part.len(), MAX_OUTPUT_BYTES))?;
+    let mut result = String::new();
+    result
+        .try_reserve_exact(size)
+        .map_err(|_| "无法分配导出缓冲区")?;
+    for part in parts {
+        result.push_str(part);
+    }
+    Ok(result)
+}
 
 #[derive(Clone, Debug)]
 pub struct HtmlOptions {
@@ -114,7 +160,29 @@ impl Slots {
         self.values.get(id).map(String::as_str)
     }
     fn expand(&self, input: &str) -> Result<String, String> {
+        // Preflight all replacements, including the literal tail, before the
+        // first output allocation. A repeated TOC can expand a tiny input.
+        let mut size = 0;
+        let mut remaining = input;
+        while let Some(at) = remaining.find(&self.prefix) {
+            size = checked_length(size, at, MAX_OUTPUT_BYTES)?;
+            let tail = &remaining[at + self.prefix.len()..];
+            let end = tail.find('Z').ok_or("导出占位身份损坏")?;
+            let id = tail[..end]
+                .parse::<usize>()
+                .map_err(|_| "导出占位身份损坏")?;
+            size = checked_length(
+                size,
+                self.values.get(id).ok_or("导出占位身份丢失")?.len(),
+                MAX_OUTPUT_BYTES,
+            )?;
+            remaining = &tail[end + 1..];
+        }
+        size = checked_length(size, remaining.len(), MAX_OUTPUT_BYTES)?;
         let mut output = String::new();
+        output
+            .try_reserve_exact(size)
+            .map_err(|_| "无法分配导出缓冲区")?;
         let mut rest = input;
         while let Some(at) = rest.find(&self.prefix) {
             output.push_str(&rest[..at]);
@@ -124,9 +192,6 @@ impl Slots {
                 .parse::<usize>()
                 .map_err(|_| "导出占位身份损坏")?;
             output.push_str(self.values.get(id).ok_or("导出占位身份丢失")?);
-            if output.len() > MAX_OUTPUT_BYTES {
-                return Err("HTML 超过 256 MiB 输出预算".into());
-            }
             rest = &tail[end + 1..];
         }
         output.push_str(rest);
@@ -228,13 +293,12 @@ fn plain_node<'a>(node: &'a comrak::nodes::AstNode<'a>) -> String {
 }
 impl<R: HtmlResources> Writer<'_, R> {
     fn account_resource(&mut self, image: &ExportImage) -> Result<(), String> {
-        self.resource_output_bytes = self
-            .resource_output_bytes
-            .checked_add(image.data_uri.len())
-            .ok_or("导出资源总量溢出")?;
-        if self.resource_output_bytes > MAX_RESOURCE_OUTPUT_BYTES {
-            return Err("按出现次数计算的内嵌资源超过 64 MiB 输出预算".into());
-        }
+        self.resource_output_bytes = checked_length(
+            self.resource_output_bytes,
+            image.data_uri.len(),
+            MAX_RESOURCE_OUTPUT_BYTES,
+        )
+        .map_err(|_| "按出现次数计算的内嵌资源超过 64 MiB 输出预算")?;
         Ok(())
     }
     fn warn(&mut self, message: impl Into<String>) {
@@ -445,18 +509,26 @@ impl<R: HtmlResources> Writer<'_, R> {
             let arena = comrak::Arena::new();
             let root =
                 comrak::parse_document(&arena, raw(source, heading.label), &document_options());
-            toc.push_str(&format!(
-                "<li style=\"margin-left:{}em\"><a href=\"#yu-heading-{index}\">{}</a></li>",
-                heading.level.saturating_sub(1),
-                escape(&plain_node(root))
-            ));
+            append_html(
+                &mut toc,
+                &format!(
+                    "<li style=\"margin-left:{}em\"><a href=\"#yu-heading-{index}\">{}</a></li>",
+                    heading.level.saturating_sub(1),
+                    escape(&plain_node(root))
+                ),
+            )?;
             replacements.push(Replacement {
                 range: TextRange::empty(heading.label.start()),
                 html: format!("<a id=\"yu-heading-{index}\"></a>"),
                 block: false,
             });
         }
-        toc.push_str("</ul></nav>");
+        append_html(&mut toc, "</ul></nav>")?;
+        let toc_bytes = toc
+            .len()
+            .checked_mul(self.document.table_of_contents().markers().len())
+            .ok_or(OUTPUT_LIMIT)?;
+        checked_length(0, toc_bytes, MAX_OUTPUT_BYTES)?;
         for marker in self.document.table_of_contents().markers() {
             replacements.push(Replacement {
                 range: *marker,
@@ -469,7 +541,7 @@ impl<R: HtmlResources> Writer<'_, R> {
             let html = if let Ok(model) = &region.model {
                 let mut html = String::new();
                 for &id in &model.fragment.roots {
-                    html.push_str(&self.finite_node(model, id)?);
+                    append_html(&mut html, &self.finite_node(model, id)?)?;
                 }
                 html
             } else {
@@ -508,7 +580,8 @@ impl<R: HtmlResources> Writer<'_, R> {
             let mut body = String::new();
             if let Some(note) = note {
                 for child in note.children() {
-                    comrak::format_html(child, &options, &mut body).map_err(|_| "脚注输出失败")?;
+                    comrak::format_html(child, &options, &mut HtmlSink(&mut body))
+                        .map_err(|_| OUTPUT_LIMIT)?;
                 }
             } else {
                 body = self.fallback(
@@ -519,9 +592,11 @@ impl<R: HtmlResources> Writer<'_, R> {
             }
             let body = self.slots.expand(&body)?;
             if let Some(number) = definition.number {
-                footer.push_str(&format!(
-                    "<li id=\"yu-note-{number}\" value=\"{number}\">{body}"
-                ));
+                append_html(
+                    &mut footer,
+                    &format!("<li id=\"yu-note-{number}\" value=\"{number}\">"),
+                )?;
+                append_html(&mut footer, &body)?;
                 for (index, reference) in notes
                     .references()
                     .iter()
@@ -529,13 +604,16 @@ impl<R: HtmlResources> Writer<'_, R> {
                     .filter(|(_, reference)| reference.number == Some(number))
                 {
                     let _ = reference;
-                    footer.push_str(&format!(
-                        " <a href=\"#yu-ref-{index}\" aria-label=\"返回引用\">↩</a>"
-                    ));
+                    append_html(
+                        &mut footer,
+                        &format!(" <a href=\"#yu-ref-{index}\" aria-label=\"返回引用\">↩</a>"),
+                    )?;
                 }
-                footer.push_str("</li>");
+                append_html(&mut footer, "</li>")?;
             } else {
-                footer.push_str(&format!("<li class=\"yu-unused-note\">{body}</li>"));
+                append_html(&mut footer, "<li class=\"yu-unused-note\">")?;
+                append_html(&mut footer, &body)?;
+                append_html(&mut footer, "</li>")?;
             }
             replacements.retain(|edit| {
                 !(definition.source.start() <= edit.range.start()
@@ -547,7 +625,7 @@ impl<R: HtmlResources> Writer<'_, R> {
                 block: true,
             });
         }
-        footer.push_str("</ol></section>");
+        append_html(&mut footer, "</ol></section>")?;
         let whole =
             TextRange::new(ByteOffset::ZERO, self.document.source_len()).ok_or("文档范围错误")?;
         let prepared = self.replace_source(whole, &replacements)?;
@@ -556,27 +634,25 @@ impl<R: HtmlResources> Writer<'_, R> {
         let root = comrak::parse_document(&arena, &prepared, &options);
         self.sanitize(root)?;
         let mut body = String::new();
-        comrak::format_html(root, &options, &mut body).map_err(|_| "HTML 输出失败")?;
+        comrak::format_html(root, &options, &mut HtmlSink(&mut body)).map_err(|_| OUTPUT_LIMIT)?;
         let body = self.slots.expand(&body)?;
         self.resources.checkpoint()?;
         let fg = self.options.foreground >> 8;
         let bg = self.options.background >> 8;
         let link = self.options.link >> 8;
         let css = include_str!("document.css");
-        let html = format!(
-            "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>:root{{--fg:#{fg:06x};--bg:#{bg:06x};--link:#{link:06x};--font:{}px;--width:{}px}}\n{css}</style></head><body><main>{body}{}</main></body></html>\n",
+        let header = format!(
+            "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>:root{{--fg:#{fg:06x};--bg:#{bg:06x};--link:#{link:06x};--font:{}px;--width:{}px}}\n{css}</style></head><body><main>",
             escape(&title),
             self.options.font_size,
             self.options.width,
-            if notes.definitions().is_empty() {
-                ""
-            } else {
-                &footer
-            }
         );
-        if html.len() > MAX_OUTPUT_BYTES {
-            return Err("HTML 超过 256 MiB 输出预算".into());
-        }
+        let footer = if notes.definitions().is_empty() {
+            ""
+        } else {
+            &footer
+        };
+        let html = join_html(&[&header, &body, footer, "</main></body></html>\n"])?;
         Ok(HtmlDocument {
             html,
             warnings: std::mem::take(&mut self.warnings),
@@ -673,15 +749,15 @@ impl<R: HtmlResources> Writer<'_, R> {
                         && node.source.start() < heading.source.end()
                         && matches!(element.kind, yu_markdown::html::HtmlElementKind::Heading(_))
                     {
-                        html.push_str(&format!("<a id=\"yu-heading-{index}\"></a>"));
+                        append_html(&mut html, &format!("<a id=\"yu-heading-{index}\"></a>"))?;
                     }
                 }
-                html.push_str(&self.open_tag(opening, &element.attributes));
+                append_html(&mut html, &self.open_tag(opening, &element.attributes))?;
                 for &child in &node.children {
-                    html.push_str(&self.finite_node(model, child)?);
+                    append_html(&mut html, &self.finite_node(model, child)?)?;
                 }
                 if !matches!(opening.name.as_str(), "br" | "img") {
-                    html.push_str(&format!("</{}>", opening.name));
+                    append_html(&mut html, &format!("</{}>", opening.name))?;
                 }
                 Ok(html)
             }
