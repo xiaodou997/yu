@@ -198,6 +198,12 @@ impl MarkdownDocument {
         self.tree.as_ref()
     }
 
+    /// Source-positioned, read-only syntax root for semantic consumers such as
+    /// document export. The constructor cannot invent a nonzero root offset.
+    pub fn syntax_root(&self) -> Option<SyntaxNode<'_>> {
+        self.tree().map(|tree| SyntaxNode::new(tree, 0))
+    }
+
     /// 这一版解析实际重新扫描过的源码字节数。
     ///
     /// 不变量 J1「编辑只重解析受影响范围」的**可断言量**。选它而不是耗时，

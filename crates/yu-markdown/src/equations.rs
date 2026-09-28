@@ -65,6 +65,17 @@ impl MarkdownDocument {
             .get_or_init(|| std::sync::Arc::new(EquationIndex::build(self)))
             .prepare(span)
     }
+
+    /// All source-owned formulas, including HTML leaves and references, without
+    /// consulting the editing focus, collapsed presentation or viewport cache.
+    pub fn equation_spans(&self) -> Vec<EmbeddedSpan> {
+        self.equations
+            .get_or_init(|| std::sync::Arc::new(EquationIndex::build(self)))
+            .equations
+            .iter()
+            .map(|entry| entry.span)
+            .collect()
+    }
 }
 
 impl EquationIndex {

@@ -856,6 +856,26 @@ final class StorageBridge {
         }
     }
 
+    /// Capture on the owner thread. Rust rejects preedit rather than changing it.
+    func beginHTMLExport(to url: URL, config: [String: Any]) throws -> NativeHTMLExportTask {
+        let options = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+        let destination = Array(url.path.utf8)
+        var task: OpaquePointer?
+        let status = destination.withUnsafeBufferPointer { target in
+            options.withUnsafeBytes { bytes in
+                yu_storage_session_html_export_start(handle, target.baseAddress, target.count,
+                    bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, &task)
+            }
+        }
+        guard status == StorageStatus.ok, let task else {
+            let message = status == YU_STORAGE_INVALID_STATE
+                ? "请先完成或取消输入法组字，再导出。导出不会改变组字内容。"
+                : status == YU_STORAGE_RENDER_BUSY ? "已有两个导出任务，请先完成或取消其中一个。" : "无法启动 HTML 导出（\(status)）。"
+            throw NSError(domain: "Yu.Export", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        return NativeHTMLExportTask(handle: task)
+    }
+
     deinit {
         yu_storage_session_destroy(handle)
     }

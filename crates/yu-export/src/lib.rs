@@ -43,6 +43,10 @@ use yu_text::{TextPositionError, TextSnapshot};
 
 mod html_import;
 
+/// Whole-document export is deliberately separate from clipboard contracts.
+pub mod document;
+pub mod portable;
+
 pub use html_import::{HtmlImportError, import_html_fragment};
 
 /// Pasteboard MIME/UTI names shared by native adapters.

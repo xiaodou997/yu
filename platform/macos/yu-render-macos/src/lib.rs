@@ -146,6 +146,15 @@ mod native {
             out_pixel_length: *mut usize,
         ) -> i32;
         pub fn yu_macos_image_free_bytes(pixels: *mut c_void);
+        pub fn yu_macos_export_image_png(
+            bytes: *const u8,
+            length: usize,
+            max_pixels: u64,
+            out_bytes: *mut *mut c_void,
+            out_length: *mut usize,
+            out_width: *mut u32,
+            out_height: *mut u32,
+        ) -> i32;
         pub fn yu_macos_svg_rasterize(
             markup_bytes: *const u8,
             markup_length: usize,
@@ -517,6 +526,49 @@ impl MacosImageDecodeResult {
 /// RGBA8 pixels suitable for `yu-assets::ImageCache::publish_decoded`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MacosImageDecoder;
+
+/// ImageIO normalization of a frozen resource; never reads its original path.
+/// Err(true) denotes a pixel/allocation budget refusal, Err(false) decode error.
+pub fn export_image_png(bytes: &[u8], max_pixels: u64) -> Result<(Vec<u8>, u32, u32), bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut output = std::ptr::null_mut();
+        let mut length = 0;
+        let mut width = 0;
+        let mut height = 0;
+        // SAFETY: input is borrowed for this call, outputs are initialized local
+        // values; the bridge returns its own allocation and the matching free.
+        let status = unsafe {
+            native::yu_macos_export_image_png(
+                bytes.as_ptr(),
+                bytes.len(),
+                max_pixels,
+                &mut output,
+                &mut length,
+                &mut width,
+                &mut height,
+            )
+        };
+        let result = if status == 1 && !output.is_null() {
+            Ok((
+                unsafe { std::slice::from_raw_parts(output.cast::<u8>(), length) }.to_vec(),
+                width,
+                height,
+            ))
+        } else {
+            Err(status < 0)
+        };
+        if !output.is_null() {
+            unsafe { native::yu_macos_image_free_bytes(output) };
+        }
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (bytes, max_pixels);
+        Err(false)
+    }
+}
 
 impl MacosImageDecoder {
     #[must_use]

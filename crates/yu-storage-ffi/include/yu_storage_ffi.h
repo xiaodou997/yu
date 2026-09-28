@@ -231,6 +231,18 @@ enum {
 #define YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK UINT64_MAX
 
 typedef struct YuStorageSession YuStorageSession;
+typedef struct YuStorageHtmlExport YuStorageHtmlExport;
+
+/* Whole-document export; task owns an immutable snapshot and independent helper.
+ * All handle calls remain serialized on the owner thread; conversion is async. */
+int32_t yu_storage_session_html_export_start(const YuStorageSession *session,
+    const uint8_t *target, size_t target_length, const uint8_t *config,
+    size_t config_length, YuStorageHtmlExport **output);
+int32_t yu_storage_html_export_copy_status(const YuStorageHtmlExport *task,
+    uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_html_export_commit(const YuStorageHtmlExport *task, uint8_t allow_warnings);
+void yu_storage_html_export_cancel(const YuStorageHtmlExport *task);
+void yu_storage_html_export_destroy(YuStorageHtmlExport *task);
 
 typedef struct YuStorageState {
     uint64_t revision;
