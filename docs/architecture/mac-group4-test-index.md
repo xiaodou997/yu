@@ -1,5 +1,7 @@
 # 第四组测试文档与执行入口索引
 
+2026-09-28：第四组已按用户调整后的验收范围正式结项；自然跨午夜与多日睡眠转入使用期跟踪，其他未关闭风险见[当前状态](mac-group4-status.md)。以后功能的固定用例使用全局入口 [run_acceptance.py](../../tools/run_acceptance.py)；第四组 suite 为 `group4-fixed`，输出保留核心与真实窗口证据层的区别。
+
 更新：2026-09-27。本页区分可直接在 Yu 打开的样本、验收说明和自动化入口；文档存在或输入生成不等于测试通过。历史冻结候选标签为 `group4-freeze-20260926-rc3`，源码 `6afb7a3dac785d2674236cff1fab65f3546fee39`；旧候选 `70b54992` 因表格公式未接入生产渲染而被拒绝，修复和重跑证据均保留。历史冻结执行结果见 [冻结构建与综合审计](mac-group4-freeze-audit.md)，最新结果以第八／九轮为准。
 
 最新入口：[第八轮完整长回归、接收证据与有限分配栈](mac-group4-followup-08.md)、[第九轮结果收口与闭窗驻留](mac-group4-followup-09.md)。第八轮同构建浅深色完整流程均已完成，深色终图已复核；配对分析与原失败／中断分别保存。第九轮 `run-resource-residency.py` 复用原有原生输入、进程身份和像素门禁；`--allocation-stacks` 为独立诊断，不能混入普通足迹结果。工具单元测试是 `tools/test_group4_residency.py`，不是实窗通过数量。 驻留全文替换使用驱动paste-document的有界消费确认，不重发粘贴；`tools/check-native-paste-lease.py` 是独立延迟消费夹具对照，不是产品验收。
