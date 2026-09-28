@@ -75,3 +75,40 @@ pub fn export_pdf<F: FnMut() -> bool>(packet: &[u8], mut check: F) -> Result<Ren
     }
     Ok(RenderedPdf { bytes, pages })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_page_limit_and_cancellation_use_native_writer() {
+        // Large test text occupies one page per block. This exercises the
+        // production 1000-page guard without giant source/images or disk fills.
+        let block = r#"{"kind":"paragraph","style":"body","align":"left","indent":0,"runs":[{"text":"x","scale":40}]}"#;
+        let packet = |count| {
+            format!(
+                r#"{{"title":"Page budget","width":612,"height":792,"margin":36,"pageNumbers":false,"maxPages":1000,"minFigureScale":0.25,"images":[],"blocks":[{}]}}"#,
+                vec![block; count].join(",")
+            )
+        };
+        let exact = export_pdf(packet(1000).as_bytes(), || true).expect("1000 real pages");
+        assert_eq!(exact.pages, 1000);
+        let error = export_pdf(packet(1001).as_bytes(), || true)
+            .err()
+            .expect("1001 refused");
+        assert!(error.contains("1000"), "{error}");
+        let mut checks = 0;
+        let cancelled = export_pdf(packet(20).as_bytes(), || {
+            checks += 1;
+            checks < 15
+        });
+        assert!(cancelled.is_err());
+        assert!(checks >= 15);
+        assert_eq!(
+            export_pdf(packet(1).as_bytes(), || true)
+                .expect("retry")
+                .pages,
+            1
+        );
+    }
+}

@@ -74,7 +74,7 @@ GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance
 
 `export_write_failure` 的父测试只在自己创建的子进程中降低文件大小限制，并屏蔽该子进程的XFSZ信号，触发真实write_all失败；核对旧输出与临时文件清理。忽略标记的子测试由父测试显式启动并核对成功标记，不是漏跑；不修改宿主、用户shell或其他进程限额，不填满磁盘。
 
-## 第五组 PDF 首批验收
+## 第五组 PDF 验收
 
 ```sh
 # 使用已审计的 Release，真实快照到原生 PDF；正常/纸张/表格/长代码/告警/立即取消。
@@ -82,6 +82,13 @@ python3 tools/run_acceptance.py group5-pdf artifacts/新的PDF原生目录
 
 # 串行桌面检查：真实 PDF 菜单、默认配置、保存取消、中文路径、覆盖取消/确认。
 python3 tools/run_acceptance.py group5-pdf-window artifacts/新的PDF窗口目录
+
+# 真实纸张/页码/基准目录、10次双文档交替、3次运行取消/重试和所属窗口关闭。
+python3 tools/run_acceptance.py group5-pdf-lifecycle artifacts/新的PDF生命周期目录
+
+# 复用生产任务，PDF专属选区/历史/失败安全及尺寸/文件别名边界；目录必须不存在。
+platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu --pdf-export-safety-self-check artifacts/新的PDF安全目录
+platform/macos/yu-shell-macos/.build/Yu.app/Contents/MacOS/Yu --pdf-export-edge-self-check artifacts/新的PDF边界目录
 
 # 可选开发端独立产物检查，需要该检查环境已有 PyMuPDF；不是产品运行依赖。
 python3 tools/check-group5-pdf.py manifest.json 新的PDF检查报告.json
@@ -91,4 +98,8 @@ python3 tools/check-group5-pdf.py manifest.json 新的PDF检查报告.json
 
 独立检查清单的 `files` 数组逐项记录 `file`、`sha256`、`kind`（composite/table/long-code/warnings）、`paper`（A4/Letter）、`landscape` 和 `unsaved`。文件位于清单目录内，检查器拒绝已有报告并核对每份字节身份。当前固定语料均使用36pt或44pt页边距和页码；仅在底部35pt区域验证9pt页码后，才将该页码与跨页正文计数分开，原始文字提取结果仍保留。PDFium/PDFKit/PyMuPDF 的文字、绘制与 GUI 证据分层记录。
 
-这些入口只完成命名子项，5B仍须补齐PDF专属失败/资源变更/预算、真实纸张选项与链接交互、有限重复和运行中取消，以及剩余F01—F06检查；不改变原规划组数。公开系统PDF后端及当前限制见 `docs/architecture/mac-group5-pdf.md`。
+各 suite 只记录本次命名子项，不自动关闭完整验收组。聚合结论及用户调整后的非阻塞细节反馈范围见 `docs/architecture/mac-group5-pdf.md`，不改写旧 suite 的 partial/失败历史。
+
+`tools/inspect-pdf-native.swift` 只读检查页面、文字、链接与页脚。`tools/pdf-preview-driver.swift` 仅向明确PID的系统Preview和精确匹配的测试PDF窗口投递事件；测试文件须位于本项目artifacts，不能针对其他文档、系统剪贴板或全局偏好执行操作。阅读器搜索/拖选、目录/文末注往返及放大与PDF解析证据分别记录；未执行系统复制或外链启动不能填为已通过。
+
+原生页数边界直接调用生产写出器，1000页通过、1001页拒绝；不是1000页逐页视觉验收。共享任务测试依次执行HTML/PDF两个格式，验证两个任务准入、释放和300秒确定时刻边界，不修改时钟或等待五分钟。桌面测试保持串行；报告和截图留本机，不默认向用户发复核附件。

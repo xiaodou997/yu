@@ -2,11 +2,12 @@ import AppKit
 import CryptoKit
 import Darwin
 import YuStorageFFI
+import PDFKit
 
 /// Production task/FFI failure contracts on this invocation's own fixtures.
 /// No window, system clipboard, or global permission setting is involved.
 @MainActor
-func runHTMLExportSafetySelfCheck(directory: String) -> Never {
+func runHTMLExportSafetySelfCheck(directory: String, pdf: Bool = false) -> Never {
     let root = URL(fileURLWithPath: directory, isDirectory: true)
     let fm = FileManager.default
     var rows: [[String: Any]] = []
@@ -31,7 +32,7 @@ func runHTMLExportSafetySelfCheck(directory: String) -> Never {
         ], options: [.sortedKeys])
     }
     func saveReport(_ passed: Bool, _ error: String? = nil) {
-        var result: [String: Any] = ["passed": passed, "evidence_layer": "native", "cases": rows]
+        var result: [String: Any] = ["passed": passed, "evidence_layer": "native", "format": pdf ? "pdf" : "html", "cases": rows]
         if let error { result["error"] = error }
         if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
             if ownsRoot { try? data.write(to: root.appendingPathComponent("report.json"), options: .atomic) }
@@ -49,7 +50,7 @@ func runHTMLExportSafetySelfCheck(directory: String) -> Never {
             let work = root.appendingPathComponent(mode, isDirectory: true)
             try fm.createDirectory(at: work, withIntermediateDirectories: false)
             let path = work.appendingPathComponent("source.md")
-            let target = work.appendingPathComponent("output.html")
+            let target = work.appendingPathComponent(pdf ? "output.pdf" : "output.html")
             let image = work.appendingPathComponent("image.png")
             var source = base
             if ["warning-cancel", "write-denied", "target-changed"].contains(mode) { source += "\n![missing](missing.png)\n" }
@@ -91,7 +92,7 @@ func runHTMLExportSafetySelfCheck(directory: String) -> Never {
             }
             let before = try identity(bridge)
             let task = try bridge.beginHTMLExport(to: target, config: ["title": "Safety", "fontSize": 16,
-                "width": 800, "referenceDay": 20724, "replaceExisting": true])
+                "width": 800, "referenceDay": 20724, "replaceExisting": true, "exportFormat": pdf ? "pdf" : "html"])
             var committed = false, changed = false, final: NativeHTMLExportTask.Status?
             let deadline = Date().addingTimeInterval(90)
             defer { task.cancel(); _ = chmod(work.path, 0o700) }
@@ -127,8 +128,14 @@ func runHTMLExportSafetySelfCheck(directory: String) -> Never {
             try require(try Data(contentsOf: path) == sourceBytes, "\(mode) changed disk source")
             let output = try Data(contentsOf: target)
             if expected == "completed" {
-                let html = String(decoding: output, as: UTF8.self)
-                try require(html.contains("UNSAVED-SAFETY-SNAPSHOT") && !html.contains("REDO-SAFETY-BRANCH"), "Wrong history snapshot exported")
+                let text: String
+                if pdf {
+                    guard let document = PDFDocument(data: output), document.pageCount > 0 else {
+                        throw NSError(domain: "Yu.Export.Safety", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid PDF"])
+                    }
+                    text = document.string ?? ""
+                } else { text = String(decoding: output, as: UTF8.self) }
+                try require(text.contains("UNSAVED-SAFETY-SNAPSHOT") && !text.contains("REDO-SAFETY-BRANCH"), "Wrong history snapshot exported")
             } else {
                 let kept = mode == "target-changed" ? Data("EXTERNAL-OUTPUT".utf8) : original
                 try require(output == kept, "\(mode) did not preserve existing target")
