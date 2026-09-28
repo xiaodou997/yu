@@ -17,6 +17,11 @@ fn wait(job: &HtmlJob) {
 }
 #[test]
 fn html_budget_lifecycle_two_jobs_deadline_and_source_refusal() {
+    for format in ["html", "pdf"] {
+        check_format_budget(format);
+    }
+}
+fn check_format_budget(format: &str) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -33,7 +38,7 @@ fn html_budget_lifecycle_two_jobs_deadline_and_source_refusal() {
     let _cleanup = Cleanup(root.clone());
     let source = root.join("source.md");
     std::fs::write(&source, "# Boundaries\n").expect("source");
-    let config = json!({"referenceDay":20724});
+    let config = json!({"referenceDay":20724, "exportFormat":format});
     let snapshot = TextBuffer::new("# Boundaries\n").snapshot();
     let start =
         |name: &str| HtmlJob::start(snapshot.clone(), source.clone(), &root.join(name), &config);

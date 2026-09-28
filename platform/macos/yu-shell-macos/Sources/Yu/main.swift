@@ -19,6 +19,14 @@ if CommandLine.arguments.contains("--presentation-latency-self-check") || Comman
     UserDefaults.standard.setVolatileDomain(["Yu.readingTheme": 0], forName: UserDefaults.argumentDomain)
 }
 NativeTheme.registerFonts()
+if let flag = CommandLine.arguments.firstIndex(of: "--pdf-export-safety-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    MainActor.assumeIsolated { runHTMLExportSafetySelfCheck(directory: CommandLine.arguments[flag + 1], pdf: true) }
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--pdf-export-edge-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    MainActor.assumeIsolated { runPDFExportEdgeSelfCheck(directory: CommandLine.arguments[flag + 1]) }
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--pdf-export-self-check"),
    CommandLine.arguments.indices.contains(flag + 2) {
     MainActor.assumeIsolated {
