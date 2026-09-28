@@ -35,22 +35,51 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
 @property CGFloat width, height, margin, bottom, y;
 @property NSUInteger pages, maxPages;
 @property BOOL numbers;
+@property BOOL recording;
+@property NSMutableArray *pageCommands;
 @end
 @implementation YuPDFComposer
+// Retain the original shaped CTLines and frozen images, not PDF-page redraws:
+// Quartz/PDFKit page replay can lose ToUnicode mappings on system PDF output.
+- (void)emit:(void (^)(CGContextRef))draw {
+    draw(_context);
+    if (_recording) [_pageCommands.lastObject addObject:[draw copy]];
+}
+- (void)fill:(CGRect)rect r:(CGFloat)r g:(CGFloat)g b:(CGFloat)b {
+    [self emit:^(CGContextRef c){CGContextSetRGBFillColor(c,r,g,b,1);CGContextFillRect(c,rect);}];
+}
+- (void)border:(CGRect)rect {
+    [self emit:^(CGContextRef c){CGContextSetRGBStrokeColor(c,0.65,0.65,0.65,1);CGContextSetLineWidth(c,0.5);CGContextStrokeRect(c,rect);}];
+}
+- (void)strike:(CGRect)box height:(CGFloat)h {
+    [self emit:^(CGContextRef c){CGContextSetRGBStrokeColor(c,0,0,0,1);CGContextSetLineWidth(c,0.6);CGContextMoveToPoint(c,box.origin.x,box.origin.y+h*0.55);CGContextAddLineToPoint(c,CGRectGetMaxX(box),box.origin.y+h*0.55);CGContextStrokePath(c);}];
+}
+- (void)textLine:(CTLineRef)line x:(CGFloat)x y:(CGFloat)y {
+    id retained=(__bridge id)line;
+    [self emit:^(CGContextRef c){CGContextSetTextMatrix(c,CGAffineTransformIdentity);CGContextSetTextPosition(c,x,y);CTLineDraw((__bridge CTLineRef)retained,c);}];
+}
+- (void)picture:(NSImage *)image rect:(CGRect)box {
+    [self emit:^(CGContextRef c){
+        [NSGraphicsContext saveGraphicsState];NSGraphicsContext.currentContext=[NSGraphicsContext graphicsContextWithCGContext:c flipped:NO];
+        @try{[image drawInRect:box fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:NO hints:nil];}
+        @finally{[NSGraphicsContext restoreGraphicsState];}
+    }];
+}
+
 - (BOOL)checkpoint {if (!_check(_owner)) {_failure=@"PDF 已取消或超过准备时间预算";return NO;}return YES;}
 - (BOOL)beginPage {
     if (![self checkpoint]) return NO;
     if (_pages >= _maxPages) {_failure=@"PDF 超过 1000 页预算";return NO;}
     if (_pages) CGPDFContextEndPage(_context);
     CGPDFContextBeginPage(_context,NULL);_pages++;_y=_margin;
-    CGContextSetRGBFillColor(_context,1,1,1,1);CGContextFillRect(_context,CGRectMake(0,0,_width,_height));
+    if(_recording){if(!_pageCommands)_pageCommands=NSMutableArray.array;[_pageCommands addObject:NSMutableArray.array];}
+    [self fill:CGRectMake(0,0,_width,_height) r:1 g:1 b:1];
     if (_numbers) {
         NSAttributedString *text=[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%lu",(unsigned long)_pages]
             attributes:@{NSFontAttributeName:[NSFont systemFontOfSize:9],NSForegroundColorAttributeName:NSColor.grayColor}];
         CTLineRef line=CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)text);
         double width=CTLineGetTypographicBounds(line,NULL,NULL,NULL);
-        CGContextSetTextMatrix(_context,CGAffineTransformIdentity);CGContextSetTextPosition(_context,(_width-width)/2,_margin/2);
-        CTLineDraw(line,_context);CFRelease(line);
+        [self textLine:line x:(_width-width)/2 y:_margin/2];CFRelease(line);
     }
     return YES;
 }
@@ -150,21 +179,19 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     [text enumerateAttributesInRange:range options:0 usingBlock:^(NSDictionary *attrs,NSRange part,BOOL *stop){
         CGFloat start=CTLineGetOffsetForStringIndex(native,part.location,NULL),end=CTLineGetOffsetForStringIndex(native,NSMaxRange(part),NULL);
         CGRect box=CGRectMake(x+MIN(start,end),self.height-y-h,MAX(1,fabs(end-start)),h);
-        if([attrs[@"yu-highlight"] boolValue]){CGContextSetRGBFillColor(self.context,1,0.95,0.65,1);CGContextFillRect(self.context,box);}
-        if([attrs[@"yu-strike"] boolValue]){CGContextSetRGBStrokeColor(self.context,0,0,0,1);CGContextSetLineWidth(self.context,0.6);CGContextMoveToPoint(self.context,box.origin.x,box.origin.y+h*0.55);CGContextAddLineToPoint(self.context,CGRectGetMaxX(box),box.origin.y+h*0.55);CGContextStrokePath(self.context);}
+        if([attrs[@"yu-highlight"] boolValue])[self fill:box r:1 g:0.95 b:0.65];
+        if([attrs[@"yu-strike"] boolValue])[self strike:box height:h];
         NSString *link=attrs[@"yu-link"];
         if([link hasPrefix:@"#"])CGPDFContextSetDestinationForRect(self.context,(__bridge CFStringRef)[link substringFromIndex:1],box);
         else if([link hasPrefix:@"https:"]||[link hasPrefix:@"http:"]||[link hasPrefix:@"mailto:"]){NSURL *url=[NSURL URLWithString:link];if(url)CGPDFContextSetURLForRect(self.context,(__bridge CFURLRef)url,box);}
     }];
     CGFloat baseline=_height-y-ascent;
-    CGContextSetTextMatrix(_context,CGAffineTransformIdentity);CGContextSetTextPosition(_context,x,baseline);CTLineDraw(native,_context);
+    [self textLine:native x:x y:baseline];
     for(NSDictionary *picture in layout[@"pictures"]){NSUInteger index=[picture[@"offset"] unsignedIntegerValue];if(!NSLocationInRange(index,range))continue;
         NSImage *image=[self image:[picture[@"index"] unsignedIntegerValue]];if(!image)return NO;
         CGFloat offset=CTLineGetOffsetForStringIndex(native,index,NULL);
         CGRect box=CGRectMake(x+offset,baseline-[picture[@"descent"] doubleValue],[picture[@"width"] doubleValue],[picture[@"height"] doubleValue]);
-        [NSGraphicsContext saveGraphicsState];NSGraphicsContext.currentContext=[NSGraphicsContext graphicsContextWithCGContext:_context flipped:NO];
-        @try { [image drawInRect:box fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:NO hints:nil]; }
-        @finally { [NSGraphicsContext restoreGraphicsState]; }
+        [self picture:image rect:box];
     }
     for(NSDictionary *anchor in layout[@"anchors"]){NSUInteger offset=[anchor[@"offset"] unsignedIntegerValue];
         if(NSLocationInRange(offset,range)||(offset==text.length&&NSMaxRange(range)==text.length))[self anchor:anchor[@"id"] x:x+CTLineGetOffsetForStringIndex(native,offset,NULL) y:y];
@@ -181,8 +208,8 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     if(_y+before+keep>_bottom && ![self beginPage])return NO;_y+=before;
     if(!lines.count){for(NSDictionary *anchor in layout[@"anchors"])[self anchor:anchor[@"id"] x:x y:_y];return YES;}
     for(NSDictionary *line in lines){CGFloat h=[line[@"height"] doubleValue];if(_y+h>_bottom && ![self beginPage])return NO;
-        if([kind isEqual:@"code"]){CGContextSetRGBFillColor(_context,0.95,0.95,0.95,1);CGContextFillRect(_context,CGRectMake(x-3,_height-_y-h,width+6,h));}
-        if([kind isEqual:@"quote"]){CGContextSetRGBFillColor(_context,0.65,0.65,0.65,1);CGContextFillRect(_context,CGRectMake(x-7,_height-_y-h,2,h));}
+        if([kind isEqual:@"code"])[self fill:CGRectMake(x-3,_height-_y-h,width+6,h) r:0.95 g:0.95 b:0.95];
+        if([kind isEqual:@"quote"])[self fill:CGRectMake(x-7,_height-_y-h,2,h) r:0.65 g:0.65 b:0.65];
         if(![self drawLine:line layout:layout x:x y:_y align:block[@"align"] available:width])return NO;_y+=h;
     }
     _y+=6;return YES;
@@ -209,8 +236,8 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
         for(NSUInteger n=0;n<cells.count;n++){NSDictionary *cell=cells[n];NSUInteger row=[cell[@"row"] unsignedIntegerValue];if(row<first||row>=end)continue;
             CGFloat x=self.margin+[cell[@"column"] unsignedIntegerValue]*columnWidth,w=[cell[@"columns"] unsignedIntegerValue]*columnWidth;
             CGFloat y=[positions[row-first] doubleValue],h=0;for(NSUInteger r=row;r<row+[cell[@"rows"] unsignedIntegerValue];r++)h+=[heights[r] doubleValue];
-            CGRect box=CGRectMake(x,self.height-y-h,w,h);if([cell[@"header"] boolValue]){CGContextSetRGBFillColor(self.context,0.94,0.94,0.94,1);CGContextFillRect(self.context,box);}
-            CGContextSetRGBStrokeColor(self.context,0.65,0.65,0.65,1);CGContextSetLineWidth(self.context,0.5);CGContextStrokeRect(self.context,box);
+            CGRect box=CGRectMake(x,self.height-y-h,w,h);if([cell[@"header"] boolValue])[self fill:box r:0.94 g:0.94 b:0.94];
+            [self border:box];
             CGFloat lineY=y+6;for(NSDictionary *line in layouts[n][@"lines"]){if(![self drawLine:line layout:layouts[n] x:x+6 y:lineY align:cell[@"align"] available:w-12])return NO;lineY+=[line[@"height"] doubleValue];}
         }
         self.y=top;return YES;
@@ -232,15 +259,16 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     for(NSDictionary *block in _packet[@"blocks"]){@autoreleasepool {
         if([block[@"kind"] isEqual:@"paragraph"]){if(![self paragraph:block])return NO;}
         else if([block[@"kind"] isEqual:@"table"]){if(![self table:block])return NO;}
-        else {if(_y+16>_bottom&&![self beginPage])return NO;CGContextSetRGBFillColor(_context,0.6,0.6,0.6,1);CGContextFillRect(_context,CGRectMake(_margin,_height-_y-8,_width-2*_margin,0.5));_y+=16;}
+        else {if(_y+16>_bottom&&![self beginPage])return NO;[self fill:CGRectMake(_margin,_height-_y-8,_width-2*_margin,0.5) r:0.6 g:0.6 b:0.6];_y+=16;}
     }}
     return YES;
 }
 @end
 
-int yu_macos_export_pdf(const uint8_t *json,size_t length,void *owner,YuPDFCheckpoint checkpoint,void **out_bytes,size_t *out_length,uint32_t *out_pages,char *error,size_t error_capacity) {
+int yu_macos_export_pdf(const uint8_t *json,size_t length,void *owner,YuPDFCheckpoint checkpoint,void **out_bytes,size_t *out_length,uint32_t *out_pages,void **out_print_plan,char *error,size_t error_capacity) {
     if(!json||!length||!checkpoint||!out_bytes||!out_length||!out_pages||!error||!error_capacity)return 0;
     *out_bytes=NULL;*out_length=0;*out_pages=0;error[0]=0;
+    if(out_print_plan)*out_print_plan=NULL;
     @autoreleasepool {
         NSDictionary *packet=[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytesNoCopy:(void *)json length:length freeWhenDone:NO] options:0 error:nil];
         if(![packet isKindOfClass:NSDictionary.class])return 0;
@@ -250,7 +278,7 @@ int yu_macos_export_pdf(const uint8_t *json,size_t length,void *owner,YuPDFCheck
         CGDataConsumerRef consumer=CGDataConsumerCreate(&sink,&callbacks);CGRect media=CGRectMake(0,0,w,h);
         CGContextRef context=CGPDFContextCreate(consumer,&media,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGPDFContextTitle:packet[@"title"]?:@"Yu 文档",(__bridge NSString *)kCGPDFContextCreator:@"Yu"});CGDataConsumerRelease(consumer);
         if(!context)return 0;
-        YuPDFComposer *composer=YuPDFComposer.new;composer.packet=packet;composer.context=context;composer.check=checkpoint;composer.owner=owner;
+        YuPDFComposer *composer=YuPDFComposer.new;composer.packet=packet;composer.context=context;composer.check=checkpoint;composer.owner=owner;composer.recording=out_print_plan!=NULL;
         BOOL okay=NO;
         @try {okay=[composer render];} @catch(NSException *exception) {composer.failure=@"原生 PDF 绘制异常；未提交输出";}
         if(composer.pages)CGPDFContextEndPage(context);CGPDFContextClose(context);CGContextRelease(context);
@@ -258,7 +286,16 @@ int yu_macos_export_pdf(const uint8_t *json,size_t length,void *owner,YuPDFCheck
             NSString *message=composer.failure?:@"PDF 输出超限、取消或无法完成";strlcpy(error,message.UTF8String,error_capacity);return 0;
         }
         void *result=malloc(sink.data.length);if(!result){strlcpy(error,"PDF allocation failed",error_capacity);return 0;}
-        memcpy(result,sink.data.bytes,sink.data.length);*out_bytes=result;*out_length=sink.data.length;*out_pages=(uint32_t)composer.pages;return 1;
+        memcpy(result,sink.data.bytes,sink.data.length);*out_bytes=result;*out_length=sink.data.length;*out_pages=(uint32_t)composer.pages;
+        if(out_print_plan)*out_print_plan=(void *)CFBridgingRetain([composer.pageCommands copy]);
+        return 1;
     }
 }
 void yu_macos_export_pdf_free(void *bytes){free(bytes);}
+int yu_macos_print_plan_draw(void *plan,uint32_t page,void *context){
+    if(!plan||!context)return 0;
+    NSArray *pages=(__bridge NSArray *)plan;if(page>=pages.count)return 0;
+    @autoreleasepool{@try{for(void (^draw)(CGContextRef) in pages[page])draw((CGContextRef)context);return 1;}
+        @catch(NSException *e){return 0;}}
+}
+void yu_macos_print_plan_free(void *plan){if(plan)CFRelease(plan);}

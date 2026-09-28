@@ -70,7 +70,7 @@ use yu_workspace::{
 #[cfg(target_os = "macos")]
 mod pdf;
 #[cfg(target_os = "macos")]
-pub use pdf::{RenderedPdf, export_pdf};
+pub use pdf::{PrintPagePlan, RenderedPdf, export_pdf, export_print_pdf};
 
 #[cfg(target_os = "macos")]
 mod core_text;

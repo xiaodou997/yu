@@ -37,6 +37,15 @@ final class NativeHTMLExportTask {
             throw failure("任务未准备完成、已取消，或尚未确认资源警告。")
         }
     }
+    func drawPrintPage(_ page: Int, context: CGContext) -> Bool {
+        guard page >= 0, page < 1000 else { return false }
+        return yu_storage_print_draw_page(handle, UInt32(page), Unmanaged.passUnretained(context).toOpaque()) == YU_STORAGE_OK
+    }
+    func printOutput(_ url: URL, publish: Bool) throws {
+        let bytes = Array(url.path.utf8)
+        let code = bytes.withUnsafeBufferPointer { yu_storage_print_output(handle, $0.baseAddress, $0.count, publish ? 1 : 0) }
+        guard code == YU_STORAGE_OK else { throw failure((try? status().message) ?? "系统打印输出失败。") }
+    }
     func cancel() { yu_storage_html_export_cancel(handle) }
     private func failure(_ message: String) -> Error {
         NSError(domain: "Yu.Export", code: 1, userInfo: [NSLocalizedDescriptionKey: message])

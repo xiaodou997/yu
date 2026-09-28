@@ -37,6 +37,7 @@ final class NativeFileWatcher {
 final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate {
     private let bridge: StorageBridge
     private var htmlExport: NativeHTMLExportController?
+    private var printing: NativePrintController?
     let persistence: NativeDocumentPersistence
     var documentURL: URL { URL(fileURLWithPath: bridge.path) }
     var onValidateSaveDestination: ((URL) throws -> Void)?
@@ -923,6 +924,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     func detachSurfaceHost() {
         htmlExport?.cancelAndClose()
+        printing?.cancelAndClose()
         surfaceCoordinator.detach()
     }
 
@@ -990,8 +992,41 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) { exportDocument(pdf: false) }
     @objc fileprivate func exportPDFFromMenu(_ sender: Any?) { exportDocument(pdf: true) }
 
+    @objc fileprivate func printFromMenu(_ sender: Any?) {
+        guard !NativePrintController.busy, htmlExport?.isRunning != true, let window = view.window else { return }
+        guard !bridge.composition.active, !textView.hasMarkedText() else {
+            let message = "请先完成或取消组字，再打印。"
+            statusLabel.stringValue = message; statusLabel.setAccessibilityValue(message)
+            return
+        }
+        var base: URL?
+        if persistence.isUntitled {
+            let alert = NSAlert(); alert.messageText = "打印未命名文档"
+            alert.informativeText = "如正文包含相对路径图片，请选择图片基准目录；无需先保存 Markdown。"
+            alert.addButton(withTitle: "继续打印")
+            alert.addButton(withTitle: "选择图片基准目录…")
+            alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
+            let response = alert.runModal()
+            if response == .alertSecondButtonReturn {
+                let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+                guard panel.runModal() == .OK, let directory = panel.url else { return }
+                base = directory
+            } else if response != .alertFirstButtonReturn { return }
+        }
+        do {
+            printing = try NativePrintController(bridge: bridge, owner: window,
+                title: persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent,
+                untitled: persistence.isUntitled, resourceBase: base,
+                validateDestination: { [weak self] url in try self?.onValidateSaveDestination?(url) },
+                onFinish: { [weak self] message in
+                    self?.printing = nil; self?.statusLabel.stringValue = message
+                    self?.statusLabel.setAccessibilityValue(message)
+                })
+        } catch { show(error) }
+    }
+
     private func exportDocument(pdf: Bool) {
-        guard htmlExport?.isRunning != true else { return }
+        guard htmlExport?.isRunning != true, printing?.isRunning != true else { return }
         guard !bridge.composition.active, !textView.hasMarkedText() else {
             // Do not add a modal focus transition while composition is alive.
             // Refusal only updates existing chrome; it never enters a file panel,
@@ -2739,7 +2774,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
-        if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) { return htmlExport?.isRunning != true }
+        if menuItem.action == #selector(printFromMenu(_:)) { return !NativePrintController.busy && htmlExport?.isRunning != true }
+        if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) { return htmlExport?.isRunning != true && printing?.isRunning != true }
         if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) { return textView.canEditImage() }
         if menuItem.action == #selector(insertImageFromMenu(_:)) { return textView.isEditable }
         let state = bridge.state
@@ -3456,6 +3492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         exportPDF.target = controller
         exportPDF.isEnabled = controller != nil
         fileMenu.addItem(exportPDF)
+        let printItem = NSMenuItem(title: "打印…", action: #selector(DocumentViewController.printFromMenu(_:)), keyEquivalent: "p")
+        printItem.target = controller; printItem.isEnabled = controller != nil
+        fileMenu.addItem(printItem)
         let insertImage = NSMenuItem(title: "插入图片…", action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
         insertImage.target = controller
         fileMenu.addItem(insertImage)
