@@ -167,8 +167,11 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
         let alert = NSAlert(); alert.alertStyle = .warning
         alert.messageText = "部分内容需要占位或诊断，是否继续？"
         alert.informativeText = status.warnings.prefix(8).joined(separator: "\n") + (status.warnings.count > 8 ? "\n另有 \(status.warnings.count - 8) 项警告。" : "") + "\n取消将保留已有输出文件。"
-        alert.addButton(withTitle: "取消导出")
-        alert.addButton(withTitle: "带占位或诊断继续导出")
+        let cancel = alert.addButton(withTitle: "取消导出")
+        cancel.keyEquivalent = "\u{1b}"
+        cancel.setAccessibilityIdentifier("yu-html-warning-cancel")
+        let proceed = alert.addButton(withTitle: "带占位或诊断继续导出")
+        proceed.setAccessibilityIdentifier("yu-html-warning-proceed")
         alert.beginSheetModal(for: owner) { [weak self] response in
             guard let self, !self.closed, self.isRunning, let task = self.task else { return }
             if response == .alertSecondButtonReturn {

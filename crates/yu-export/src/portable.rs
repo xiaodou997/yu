@@ -11,6 +11,7 @@ use std::time::SystemTime;
 pub const MAX_RESOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESOURCE_TOTAL: usize = 128 * 1024 * 1024;
 pub const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp {
     length: u64,
@@ -186,6 +187,21 @@ impl Destination {
         Ok(())
     }
 }
+// Check aggregate quota before opening/allocating the next file. The remaining
+// quota also bounds reads if a file grows after the metadata observation.
+fn resource_read_limit(total: usize, length: u64) -> Result<usize, &'static str> {
+    if length > MAX_RESOURCE_BYTES as u64 {
+        return Err("图片超过 32 MiB 资源预算");
+    }
+    let remaining = MAX_RESOURCE_TOTAL
+        .checked_sub(total)
+        .ok_or("图片总量超过 128 MiB 预算")?;
+    if length > remaining as u64 {
+        return Err("图片总量超过 128 MiB 预算");
+    }
+    Ok(remaining.min(MAX_RESOURCE_BYTES))
+}
+
 struct FrozenImage {
     path: PathBuf,
     stamp: Stamp,
@@ -209,6 +225,11 @@ impl FrozenImages {
     pub fn capture(&mut self, destination: &str) -> Result<(), ResourceError> {
         if self.files.contains_key(destination) {
             return Ok(());
+        }
+        // Bound the preparation cache too, not only the later HTML writer.
+        // Missing/remote entries still own strings and therefore consume slots.
+        if self.files.len() >= crate::document::MAX_RESOURCES {
+            return Err(ResourceError::Fatal("文档超过 2048 项资源预算".into()));
         }
         let lower = destination.trim().to_ascii_lowercase();
         if lower.starts_with("//")
@@ -245,18 +266,21 @@ impl FrozenImages {
             if !meta.is_file() {
                 return Err("图片不是普通文件");
             }
-            if meta.len() > MAX_RESOURCE_BYTES as u64 {
-                return Err("图片超过 32 MiB 资源预算");
-            }
+            let read_limit = resource_read_limit(self.total, meta.len())?;
             let mut file = File::open(&path).map_err(|_| "图片无法读取")?;
             let before = Stamp::from(&file.metadata().map_err(|_| "图片身份不可读取")?);
-            let mut bytes = Vec::new();
-            Read::by_ref(&mut file)
-                .take(MAX_RESOURCE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| "图片读取失败")?;
+            if before != Stamp::from(&meta) {
+                return Err("图片在准备过程中改变或超限");
+            }
+            // Allocate only the preflighted length. read_to_end could double a
+            // Vec's capacity when a file grows at the exact quota boundary.
+            let mut bytes = vec![0; (meta.len() as usize).min(read_limit)];
+            file.read_exact(&mut bytes)
+                .map_err(|_| "图片读取失败或读取期间改变")?;
+            let mut extra = [0_u8; 1];
+            let grew = file.read(&mut extra).map_err(|_| "图片读取失败")? != 0;
             let after = Stamp::from(&file.metadata().map_err(|_| "图片身份不可读取")?);
-            if before != after || before != Stamp::from(&meta) || bytes.len() > MAX_RESOURCE_BYTES {
+            if before != after || grew {
                 return Err("图片在准备过程中改变或超限");
             }
             Ok(FrozenImage {
@@ -397,4 +421,21 @@ fn check_svg_css(value: &str) -> Result<(), String> {
         rest = &rest[end + 1..];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    #[test]
+    fn aggregate_quota_is_checked_before_resource_allocation() {
+        assert_eq!(
+            resource_read_limit(0, MAX_RESOURCE_BYTES as u64),
+            Ok(MAX_RESOURCE_BYTES)
+        );
+        assert_eq!(resource_read_limit(MAX_RESOURCE_TOTAL - 1, 1), Ok(1));
+        assert_eq!(resource_read_limit(MAX_RESOURCE_TOTAL, 0), Ok(0));
+        assert!(resource_read_limit(MAX_RESOURCE_TOTAL - 1, 2).is_err());
+        assert!(resource_read_limit(MAX_RESOURCE_TOTAL + 1, 0).is_err());
+        assert!(resource_read_limit(0, MAX_RESOURCE_BYTES as u64 + 1).is_err());
+    }
 }
