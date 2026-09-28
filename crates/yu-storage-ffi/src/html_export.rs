@@ -41,6 +41,9 @@ struct State {
     embedded: usize,
     pages: u32,
     ready: Option<Ready>,
+    print_target: Option<Destination>,
+    print_protected: Vec<ProtectedFile>,
+    print_plan: Option<yu_render_macos::PrintPagePlan>,
 }
 pub struct HtmlJob {
     control: RenderControl,
@@ -49,6 +52,7 @@ pub struct HtmlJob {
     pdf_settings: Option<yu_export::paged::PageSettings>,
     state: Mutex<State>,
     counted: bool,
+    printing: bool,
 }
 impl Drop for HtmlJob {
     fn drop(&mut self) {
@@ -85,6 +89,8 @@ impl HtmlJob {
             preparation_deadline: Instant::now() + TASK_TIMEOUT,
             pdf_settings,
             counted: true,
+            printing: pdf_settings.is_some()
+                && config.get("printPreparation").and_then(Value::as_bool) == Some(true),
             state: Mutex::new(State {
                 phase: "preparing",
                 message: "准备文档快照".into(),
@@ -93,6 +99,9 @@ impl HtmlJob {
                 embedded: 0,
                 pages: 0,
                 ready: None,
+                print_target: None,
+                print_protected: Vec::new(),
+                print_plan: None,
             }),
         });
         let setup = (|| {
@@ -170,7 +179,7 @@ impl HtmlJob {
                     worker.prepare(snapshot, source_path, basis, destination, options)
                 }));
                 match result {
-                    Ok(Ok(ready)) => {
+                    Ok(Ok(mut ready)) => {
                         let mut state = worker
                             .state
                             .lock()
@@ -190,6 +199,11 @@ impl HtmlJob {
                         state.images = ready.document.image_count;
                         state.embedded = ready.document.embedded_count;
                         state.pages = ready.pdf.as_ref().map_or(0, |pdf| pdf.pages);
+                        if worker.printing {
+                            state.print_protected = ready.protected.clone();
+                            state.print_plan =
+                                ready.pdf.as_mut().and_then(|pdf| pdf.print_plan.take());
+                        }
                         state.ready = Some(ready);
                     }
                     Ok(Err(error)) => worker.fail(error),
@@ -249,9 +263,12 @@ impl HtmlJob {
             let packet = yu_export::paged::prepare_pdf_packet(&result, settings)?;
             resources.checkpoint()?;
             self.stage("分页并绘制 PDF");
-            let rendered = yu_render_macos::export_pdf(&packet, || {
-                self.prepare_checkpoint_at(Instant::now()).is_ok()
-            });
+            let checkpoint = || self.prepare_checkpoint_at(Instant::now()).is_ok();
+            let rendered = if self.printing {
+                yu_render_macos::export_print_pdf(&packet, checkpoint)
+            } else {
+                yu_render_macos::export_pdf(&packet, checkpoint)
+            };
             resources.checkpoint()?;
             result.html.clear();
             Some(rendered?)
@@ -303,7 +320,130 @@ impl HtmlJob {
         self.control.close();
         state.ready = None;
         state.phase = "cancelled";
+        state.print_target = None;
         state.message = "已取消导出".into();
+    }
+    /// # Safety
+    /// Context is a live native printing context; calls are serialized by its owner.
+    pub unsafe fn draw_print_page(&self, page: u32, context: *mut std::ffi::c_void) -> bool {
+        if !self.control.is_current(self.revision) || context.is_null() {
+            return false;
+        }
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .print_plan
+            .as_ref()
+            .is_some_and(|plan| unsafe { plan.draw(page, context) })
+    }
+    /// Capture a system-panel destination before its potentially long output.
+    /// System PDF bytes are staged privately and then use the ordinary atomic
+    /// publication guard, including the original snapshot's resource identities.
+    pub fn print_output(self: &Arc<Self>, path: &Path, publish: bool) -> Result<(), String> {
+        let result = self.print_output_inner(path, publish);
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
+    fn print_output_inner(self: &Arc<Self>, path: &Path, publish: bool) -> Result<(), String> {
+        if !self.printing {
+            return Err("不是打印准备任务".into());
+        }
+        if !publish {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !matches!(state.phase, "completed" | "completed_with_warnings")
+                || !self.control.is_current(self.revision)
+            {
+                return Err("打印内容尚未完成或已经取消".into());
+            }
+            // NSSavePanel in NSPrintPanel already obtained overwrite consent.
+            let target = Destination::capture(path, true)?;
+            target.validate(&state.print_protected)?;
+            state.print_target = Some(target);
+            state.phase = "print_ready";
+            state.message = "等待系统打印输出".into();
+            return Ok(());
+        }
+        let (destination, protected) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.phase != "print_ready" || !self.control.is_current(self.revision) {
+                return Err("打印目的地未确认或已取消".into());
+            }
+            let target = state.print_target.take().ok_or("打印目的地丢失")?;
+            state.phase = "writing";
+            state.message = "检查并保存系统打印文件".into();
+            (target, state.print_protected.clone())
+        };
+        let spool = path.to_path_buf();
+        let worker = self.clone();
+        std::thread::Builder::new()
+            .name("yu-print-publish".into())
+            .spawn(move || {
+                let result = (|| -> Result<(), String> {
+                    use std::io::Read;
+                    let mut file =
+                        std::fs::File::open(&spool).map_err(|_| "系统打印文件不可读取")?;
+                    let length = file.metadata().map_err(|_| "不能检查系统打印文件")?.len();
+                    if length == 0 || length > yu_export::document::MAX_OUTPUT_BYTES as u64 {
+                        return Err("系统打印文件超过 256 MiB 预算或为空".into());
+                    }
+                    let mut bytes = vec![0; length as usize];
+                    for part in bytes.chunks_mut(1024 * 1024) {
+                        if !worker.control.is_current(worker.revision) {
+                            return Err("已取消打印".into());
+                        }
+                        file.read_exact(part)
+                            .map_err(|_| "系统打印文件读取失败或长度改变")?;
+                    }
+                    if file
+                        .read(&mut [0u8; 1])
+                        .map_err(|_| "系统打印文件读取失败")?
+                        != 0
+                        || !bytes.starts_with(b"%PDF-")
+                    {
+                        return Err("系统打印文件无效或长度改变".into());
+                    }
+                    destination.publish_guarded(
+                        &bytes,
+                        &protected,
+                        || {
+                            if worker.control.is_current(worker.revision) {
+                                Ok(())
+                            } else {
+                                Err("已取消打印".into())
+                            }
+                        },
+                        || {
+                            let mut state = worker
+                                .state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            if !worker.control.is_current(worker.revision) {
+                                return Err("已取消打印".into());
+                            }
+                            state.phase = "committing";
+                            Ok(state)
+                        },
+                    )
+                })();
+                match result {
+                    Ok(()) => {
+                        let mut state = worker
+                            .state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        state.phase = if state.warnings.is_empty() {
+                            "completed"
+                        } else {
+                            "completed_with_warnings"
+                        };
+                        state.message = "系统打印文件已保存".into();
+                    }
+                    Err(error) => worker.fail(error),
+                }
+            })
+            .map_err(|_| "无法启动打印文件保存线程".to_owned())?;
+        Ok(())
     }
     pub fn status_json(&self) -> String {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());

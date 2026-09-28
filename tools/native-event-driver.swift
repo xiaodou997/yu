@@ -238,7 +238,7 @@ case "controls":
     func collect(_ element: AXUIElement, depth: Int = 0) {
         guard depth < 18, count < 2000 else { return }; count += 1
         if let role = attribute(element, "AXRole") as? String,
-           ["AXWindow", "AXStaticText", "AXTextField", "AXComboBox", "AXPopUpButton", "AXCheckBox", "AXButton", "AXMenuItem", "AXMenuBarItem"].contains(role) {
+           ["AXWindow", "AXStaticText", "AXTextField", "AXComboBox", "AXPopUpButton", "AXCheckBox", "AXRadioButton", "AXButton", "AXMenuItem", "AXMenuBarItem"].contains(role) {
             controls.append(Dictionary(uniqueKeysWithValues:
                 ["AXRole", "AXTitle", "AXDescription", "AXIdentifier", "AXValue", "AXPosition", "AXSize", "AXEnabled"].map { ($0, describe(attribute(element, $0))) }))
         }
@@ -248,8 +248,102 @@ case "controls":
             collect(unsafeBitCast(shown, to: AXUIElement.self), depth: depth+1)
         }
     }
+    // Closed AppKit panels can remain in AXChildren during teardown. Prefer
+    // the actual focused window, not an earlier sheet with reused identifiers.
+    if let focused = attribute(application, "AXFocusedWindow"), CFGetTypeID(focused) == AXUIElementGetTypeID() {
+        collect(unsafeBitCast(focused, to: AXUIElement.self))
+    }
     collect(application)
     json(["controls": controls])
+case "save-name":
+    // Focus the exact visible save field before one real keyboard sequence.
+    // This never writes a file, changes the clipboard, or presses Print/Save.
+    guard args.count == 3, !args[2].isEmpty, args[2].utf16.count <= 200,
+          !args[2].contains("/"), let focused = attribute(application, "AXFocusedWindow"),
+          CFGetTypeID(focused) == AXUIElementGetTypeID() else { fail("Expected a bounded save filename") }
+    let window = unsafeBitCast(focused, to: AXUIElement.self)
+    var count = 0
+    func saveField(_ e: AXUIElement, depth: Int = 0) -> AXUIElement? {
+        guard depth < 18, count < 2000 else { return nil }; count += 1
+        if attribute(e,"AXIdentifier") as? String == "saveAsNameTextField",
+           attribute(e,"AXRole") as? String == "AXTextField", attribute(e,"AXEnabled") as? Bool == true { return e }
+        for c in attribute(e,"AXChildren") as? [AXUIElement] ?? [] { if let r = saveField(c,depth:depth+1) { return r } }
+        return nil
+    }
+    guard let field = saveField(window) else { fail("No visible save filename field") }
+    let focusResult = AXUIElementSetAttributeValue(field,kAXFocusedAttribute as CFString,kCFBooleanTrue)
+    RunLoop.current.run(until:Date().addingTimeInterval(0.3))
+    guard attribute(field,"AXFocused") as? Bool == true else { fail("Save filename did not receive focus") }
+    for down in [true,false] { let e=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:down); e?.flags=down ? .maskCommand : []; post(e) }
+    let units=Array(args[2].utf16)
+    for down in [true,false] {
+        let e=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:down)
+        units.withUnsafeBufferPointer { e?.keyboardSetUnicodeString(stringLength:$0.count,unicodeString:$0.baseAddress) }; e?.flags=[]; post(e)
+    }
+    let deadline=Date().addingTimeInterval(5)
+    while attribute(field,"AXValue") as? String != args[2] && Date()<deadline { RunLoop.current.run(until:Date().addingTimeInterval(0.05)) }
+    let actual=attribute(field,"AXValue") as? String ?? ""
+    json(["expected":args[2],"actual":actual,"focus_status":focusResult.rawValue,"interaction":"focused_real_keys"])
+    guard actual == args[2] else { fail("Focused save filename did not accept keyboard input") }
+case "print-resource-base", "discard-test-document":
+    // Only the benign directory-choice action of Yu's untitled-print alert.
+    // Never admit its default print action or arbitrary buttons by title.
+    guard args.count == 2, let focused = attribute(application, "AXFocusedWindow"),
+          CFGetTypeID(focused) == AXUIElementGetTypeID() else { fail("Expected the untitled print alert") }
+    let window = unsafeBitCast(focused, to: AXUIElement.self)
+    var count = 0
+    func baseChoice(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+        guard depth < 12, count < 300 else { return nil }; count += 1
+        if attribute(element, "AXRole") as? String == "AXButton",
+           attribute(element, "AXTitle") as? String == (action == "print-resource-base" ? "选择图片基准目录…" : "不保存"),
+           attribute(element, "AXEnabled") as? Bool == true { return element }
+        for child in attribute(element, "AXChildren") as? [AXUIElement] ?? [] {
+            if let result = baseChoice(child, depth: depth + 1) { return result }
+        }
+        return nil
+    }
+    guard let button = baseChoice(window) else { fail("Expected the exact resource directory action") }
+    let result = AXUIElementPerformAction(button, kAXPressAction as CFString)
+    // The suite must observe the resulting NSOpenPanel; an AX status alone
+    // cannot prove success, and this action is not repeated on a timeout.
+    json(["action": "resource_directory", "ax_status": result.rawValue])
+case "print-option", "print-field":
+    // Exercise only standard print settings via public accessibility actions.
+    // Dispatch/Save/Print controls are intentionally excluded from this route.
+    let field = action == "print-field"
+    guard args.count == (field ? 4 : 3), (field ? ["PRStart", "PREnd"] : ["PR", "PRAll", "PortraitButton", "LandscapeButton"]).contains(args[2]),
+          let focused = attribute(application, "AXFocusedWindow"), CFGetTypeID(focused) == AXUIElementGetTypeID() else { fail("Expected a standard print option") }
+    let window = unsafeBitCast(focused, to: AXUIElement.self)
+    guard attribute(window, "AXIdentifier") as? String == "PDPrintPanel" else { fail("Current window is not the system print panel") }
+    var count = 0
+    func option(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
+        guard depth < 18, count < 2000 else { return nil }; count += 1
+        if attribute(element, "AXIdentifier") as? String == args[2],
+           attribute(element, "AXRole") as? String == (field ? "AXTextField" : "AXRadioButton"),
+           attribute(element, "AXEnabled") as? Bool == true { return element }
+        for child in attribute(element, "AXChildren") as? [AXUIElement] ?? [] {
+            if let result = option(child, depth: depth + 1) { return result }
+        }
+        return nil
+    }
+    guard let item = option(window) else { fail("Cannot find the print option") }
+    if field {
+        guard let value = Int(args[3]), (1...1000).contains(value) else { fail("Expected a bounded page number") }
+        let result = AXUIElementSetAttributeValue(item, kAXValueAttribute as CFString, String(value) as CFString)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        guard attribute(item, "AXValue") as? String == String(value) else { fail("Print page field did not change; AX status \(result.rawValue)") }
+        json(["field": args[2], "value": value, "ax_status": result.rawValue, "interaction": "system_accessibility_set_value"])
+        break
+    }
+    let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
+    // A modal AppKit option may take effect even when AX reports cannotComplete.
+    // Observe its real selected state without ever repeating the press.
+    let deadline = Date().addingTimeInterval(5)
+    while attribute(item, "AXValue") as? Int != 1 && Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+    guard attribute(item, "AXValue") as? Int == 1 else { fail("Print option was not selected; AX status \(result.rawValue)") }
+    json(["option": args[2], "value": 1, "ax_status": result.rawValue, "interaction": "system_accessibility_press_then_observe"])
 case "menu-open":
     guard args.count == 3 else { fail("menu-open requires a native menu title") }
     var count = 0

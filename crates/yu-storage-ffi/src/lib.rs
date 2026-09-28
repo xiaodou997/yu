@@ -1765,6 +1765,71 @@ pub unsafe extern "C" fn yu_storage_html_export_commit(
     }
 }
 
+/// Replay an immutable shaped page into a system printing context.
+/// # Safety
+/// Task and CGContext must be live; all calls occur on the context's owner thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_print_draw_page(
+    task: *const YuStorageHtmlExport,
+    page: u32,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { task.job.draw_print_page(page, context) } {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_INVALID_STATE
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, page, context);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// System print output: action 0 captures an approved destination, action 1
+/// asynchronously publishes the privately staged PDF. Errors live in task status.
+/// # Safety
+/// A live task on its owner thread; readable UTF-8 path for length bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_print_output(
+    task: *const YuStorageHtmlExport,
+    path: *const u8,
+    length: usize,
+    action: u8,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if action > 1 || length > 8192 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    let path = match read_utf8(path, length) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        match task
+            .job
+            .print_output(std::path::Path::new(path), action == 1)
+        {
+            Ok(()) => YU_STORAGE_OK,
+            Err(_) => YU_STORAGE_INVALID_STATE,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, path);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
 /// # Safety
 /// Task must be live; cancellation never touches the document or another task.
 #[unsafe(no_mangle)]

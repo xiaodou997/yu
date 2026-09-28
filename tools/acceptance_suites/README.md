@@ -103,3 +103,25 @@ python3 tools/check-group5-pdf.py manifest.json 新的PDF检查报告.json
 `tools/inspect-pdf-native.swift` 只读检查页面、文字、链接与页脚。`tools/pdf-preview-driver.swift` 仅向明确PID的系统Preview和精确匹配的测试PDF窗口投递事件；测试文件须位于本项目artifacts，不能针对其他文档、系统剪贴板或全局偏好执行操作。阅读器搜索/拖选、目录/文末注往返及放大与PDF解析证据分别记录；未执行系统复制或外链启动不能填为已通过。
 
 原生页数边界直接调用生产写出器，1000页通过、1001页拒绝；不是1000页逐页视觉验收。共享任务测试依次执行HTML/PDF两个格式，验证两个任务准入、释放和300秒确定时刻边界，不修改时钟或等待五分钟。桌面测试保持串行；报告和截图留本机，不默认向用户发复核附件。
+
+## 第五组系统打印验收
+
+```sh
+# 已审计 Release 上的8条原生文件打印/安全路径；强制NSPrintSaveJob，绝不发实体纸张。
+python3 tools/run_acceptance.py group5-print artifacts/新的打印原生目录
+
+# 真实菜单/Cmd-P、系统面板取消、全页/2-3页/横向另存PDF、源文件硬链接保护。
+GROUP5_PRINT_PHASE=window python3 tools/run_acceptance.py group5-print-window artifacts/新的打印窗口目录
+
+# 10次两文档交替、3次准备中取消/重试、关闭所属文档、继续编辑与资源观察。
+GROUP5_PRINT_PHASE=lifecycle python3 tools/run_acceptance.py group5-print-window artifacts/新的打印生命周期目录
+
+# 警告取消/明确确认，以及未命名文档选择图片基准目录。
+GROUP5_PRINT_PHASE=resources python3 tools/run_acceptance.py group5-print-window artifacts/新的打印资源目录
+```
+
+`--printing-self-check INPUT NEW_DIRECTORY` 使用真实NSPrintOperation文件输出，不显示面板；不能替代窗口证据。原生检查包含未保存快照/后续编辑隔离、undo/redo、原文件及图片别名、目标变化、写权限失败、发布取消；无打印机准入使用受控空列表，不删除或更改用户打印机。实际无设备、实体出纸、不同驱动均须另记，不自动算通过。
+
+窗口套件拒绝按下物理Print按钮，只使用系统PDF保存入口，比较打印前后的队列、逐页文字与同任务冻结页。系统面板的范围/方向通过公开辅助功能控件操作并检查实际值和最终页数；`print-option`/`print-field`白名单不能提交Print/Save。AX无法完成的返回不能自行算通过：只在同一次操作后的真实控件达到期望值时记录成功，不重复投递动作。保存位置、取消和菜单仍有原生事件操作。警告与失败的首次日志保留，套件不自动关闭整组。
+
+Foundation临时目录与CUPS的TMPDIR可能不同。只观察本次新增的`yu-print-*`目录，不读取、删除已有任务目录或用户输出。复核资料只留本机；使用方式和软件链路/实体设备边界见`docs/architecture/mac-group5-printing.md`。

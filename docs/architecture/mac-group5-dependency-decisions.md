@@ -41,4 +41,17 @@ Cargo.lock 仅增加 yu-export 对上述已有包及 yu-assets/yu-syntax 的依�
 
 采用原生路线不代表字体嵌入和所有阅读器行为自动通过。系统/用户字体文件不单独分发；实际PDF字形、复制、链接、图片和逐页复核继续随5B验证，完整发行target/features、资源/字体义务在5E核对。测试端PDFKit、PDFium及可选PyMuPDF只形成相应测试证据，不引入产品转换依赖。
 
-原始材料位于 `artifacts/group5-5b-20260928-r01/third-party/`，公开依据为Apple Quartz PDF guide、Core Text Programming Guide和上述Krilla固定commit的NOTICE/源文件；具体产物、哈希与后续边界见 `mac-group5-pdf.md`。系统打印和PNG未实现，继续按5C/5D顺序推进。
+原始材料位于 `artifacts/group5-5b-20260928-r01/third-party/`，公开依据为Apple Quartz PDF guide、Core Text Programming Guide和上述Krilla固定commit的NOTICE/源文件；具体产物、哈希与后续边界见 `mac-group5-pdf.md`。本段为5B首批选型记录；5C系统打印见下文，PNG仍待5D实现。
+
+## 5C 系统打印
+
+| 能力 | 采用方式与边界 |
+| --- | --- |
+| 打印面板、纸张、方向及队列 | 使用AppKit NSPrintOperation、NSPrintPanel、NSPrintInfo和公开分页回调；不复制系统打印机管理或自行绘制纸张设置。独立printInfo不修改全局打印配置。 |
+| 页面与矢量文字 | 扩展既有5B绘制器，在首次分页时保存已整形CTLine、静态图像与绘制命令；系统打印选择这些页并执行相同命令，不重新整形/分页，不将PDF页或屏幕截图重绘成位图。普通PDF导出不保存此打印专用计划。 |
+| 可打印区域 | 按imageablePageBounds与实际纸张交集作一次整页等比缩小，不放大；低于25%拒绝。面板明确展示固定分页/适配说明，不暗中第二次排版。 |
+| 系统另存PDF | 系统面板完成时先验证并记录目标身份，重定向到任务私有目录；生成后用PDFKit去除系统自动填入的作者等环境元数据，再由既有Rust原子提交路径发布。不能覆盖Markdown、引用图片或其别名；检查/发布在后台执行。 |
+
+本批未新增外部包、命令行转换器或许可材料；仍复用系统AppKit/CoreText/CoreGraphics/PDFKit和既有Rust依赖。原先试用PDF页面重放时出现文字映射问题，最终保留原始CTLine进行系统绘制，未另造PDF编码器或Markdown排版。用例与实际系统输出见`mac-group5-printing.md`。
+
+接口依据：Apple `NSPrintPanel.runModal(with:)`、`NSView.knowsPageRange(_:)`、`rectForPage(_:)`、`locationOfPrintRect(_:)`、`NSPrintInfo.imageablePageBounds`。按实际SDK编译及运行核对；仅公开API，最低部署目标保持26.0。实体设备出纸另记，系统预览或PDF保存不视为实体打印成功。

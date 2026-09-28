@@ -241,6 +241,11 @@ int32_t yu_storage_session_html_export_start(const YuStorageSession *session,
 int32_t yu_storage_html_export_copy_status(const YuStorageHtmlExport *task,
     uint8_t *output, size_t capacity, size_t *written);
 int32_t yu_storage_html_export_commit(const YuStorageHtmlExport *task, uint8_t allow_warnings);
+/* Replay a zero-based frozen page into the caller-owned live CGContext. */
+int32_t yu_storage_print_draw_page(const YuStorageHtmlExport *task, uint32_t page, void *context);
+/* Print-preparation tasks only: 0 = capture approved target, 1 = publish private spool. */
+int32_t yu_storage_print_output(const YuStorageHtmlExport *task, const uint8_t *path,
+    size_t length, uint8_t action);
 void yu_storage_html_export_cancel(const YuStorageHtmlExport *task);
 void yu_storage_html_export_destroy(YuStorageHtmlExport *task);
 
