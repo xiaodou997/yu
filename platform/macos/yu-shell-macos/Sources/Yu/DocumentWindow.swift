@@ -987,7 +987,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         _ = chooseSaveDestination()
     }
 
-    @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) {
+    @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) { exportDocument(pdf: false) }
+    @objc fileprivate func exportPDFFromMenu(_ sender: Any?) { exportDocument(pdf: true) }
+
+    private func exportDocument(pdf: Bool) {
         guard htmlExport?.isRunning != true else { return }
         guard !bridge.composition.active, !textView.hasMarkedText() else {
             // Do not add a modal focus transition while composition is alive.
@@ -1002,22 +1005,28 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
         guard let window = view.window else { return }
         htmlExport?.cancelAndClose()
-        let options = NativeHTMLExportOptions(untitled: persistence.isUntitled)
+        let htmlOptions = pdf ? nil : NativeHTMLExportOptions(untitled: persistence.isUntitled)
+        let pdfOptions = pdf ? NativePDFExportOptions(untitled: persistence.isUntitled) : nil
         let panel = NSSavePanel()
-        panel.title = "导出 HTML"
+        panel.title = pdf ? "导出 PDF" : "导出 HTML"
         panel.prompt = "导出"
-        panel.allowedContentTypes = [.html]
+        panel.allowedContentTypes = pdf ? [.pdf] : [.html]
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + ".html"
+        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + (pdf ? ".pdf" : ".html")
         if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
-        panel.accessoryView = options.view
+        panel.accessoryView = pdfOptions?.view ?? htmlOptions?.view
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         do {
             try onValidateSaveDestination?(destination)
-            let config = options.config(title: destination.deletingPathExtension().lastPathComponent,
-                untitled: persistence.isUntitled, appearance: view.effectiveAppearance)
+            let title = destination.deletingPathExtension().lastPathComponent
+            let config: [String: Any]
+            if let pdfOptions {
+                config = try pdfOptions.config(title: title, untitled: persistence.isUntitled)
+            } else if let htmlOptions {
+                config = htmlOptions.config(title: title, untitled: persistence.isUntitled, appearance: view.effectiveAppearance)
+            } else { return }
             let task = try bridge.beginHTMLExport(to: destination, config: config)
-            htmlExport = NativeHTMLExportController(task: task, destination: destination, owner: window) { [weak self] in
+            htmlExport = NativeHTMLExportController(task: task, destination: destination, owner: window, formatName: pdf ? "PDF" : "HTML") { [weak self] in
                 self?.htmlExport = nil
             }
         } catch { show(error) }
@@ -2730,7 +2739,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
-        if menuItem.action == #selector(exportHTMLFromMenu(_:)) { return htmlExport?.isRunning != true }
+        if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) { return htmlExport?.isRunning != true }
         if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) { return textView.canEditImage() }
         if menuItem.action == #selector(insertImageFromMenu(_:)) { return textView.isEditable }
         let state = bridge.state
@@ -3443,6 +3452,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         exportHTML.target = controller
         exportHTML.isEnabled = controller != nil
         fileMenu.addItem(exportHTML)
+        let exportPDF = NSMenuItem(title: "导出 PDF…", action: #selector(DocumentViewController.exportPDFFromMenu(_:)), keyEquivalent: "")
+        exportPDF.target = controller
+        exportPDF.isEnabled = controller != nil
+        fileMenu.addItem(exportPDF)
         let insertImage = NSMenuItem(title: "插入图片…", action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
         insertImage.target = controller
         fileMenu.addItem(insertImage)

@@ -276,6 +276,7 @@ fn document_options() -> comrak::Options<'static> {
     options.extension.superscript = true;
     options.extension.subscript = true;
     options.extension.highlight = true;
+    options.extension.strikethrough = true;
     options.extension.footnotes = true;
     options
 }

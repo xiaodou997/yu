@@ -45,13 +45,14 @@ fn render(source: &str) -> (HtmlDocument, Resources) {
 }
 #[test]
 fn html_whole_semantics_and_clipboard_contract_remain_separate() {
-    let source = "# 中文 🙂\n\n**粗体** *斜体* ==高亮== H~2~O x^2^\n\n- [x] 完成\n\n```rust\n<&>\n```\n\n| A | B |\n| - | - |\n| one | two |\n";
+    let source = "# 中文 🙂\n\n**粗体** *斜体* ~~删除~~ ==高亮== H~2~O x^2^\n\n- [x] 完成\n\n```rust\n<&>\n```\n\n| A | B |\n| - | - |\n| one | two |\n";
     let (result, _) = render(source);
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     for expected in [
         "<!doctype html>",
         "<strong>粗体</strong>",
         "<em>斜体</em>",
+        "<del>删除</del>",
         "<mark>高亮</mark>",
         "<sub>2</sub>",
         "<sup>2</sup>",
