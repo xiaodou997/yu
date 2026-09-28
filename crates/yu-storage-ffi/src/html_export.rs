@@ -29,6 +29,7 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 struct Ready {
     document: HtmlDocument,
+    pdf: Option<yu_render_macos::RenderedPdf>,
     destination: Destination,
     protected: Vec<ProtectedFile>,
 }
@@ -38,12 +39,14 @@ struct State {
     warnings: Vec<String>,
     images: usize,
     embedded: usize,
+    pages: u32,
     ready: Option<Ready>,
 }
 pub struct HtmlJob {
     control: RenderControl,
     revision: u64,
     preparation_deadline: Instant,
+    pdf_settings: Option<yu_export::paged::PageSettings>,
     state: Mutex<State>,
     counted: bool,
 }
@@ -62,6 +65,11 @@ impl HtmlJob {
         target: &Path,
         config: &Value,
     ) -> Result<Arc<Self>, String> {
+        let pdf_settings = match config.get("exportFormat").and_then(Value::as_str) {
+            None | Some("html") => None,
+            Some("pdf") => Some(yu_export::paged::PageSettings::from_config(config)?),
+            _ => return Err("未知导出格式".into()),
+        };
         let revision = snapshot.revision().get();
         let control = RenderControl::default();
         control.set_revision(revision);
@@ -75,6 +83,7 @@ impl HtmlJob {
             revision,
             control,
             preparation_deadline: Instant::now() + TASK_TIMEOUT,
+            pdf_settings,
             counted: true,
             state: Mutex::new(State {
                 phase: "preparing",
@@ -82,6 +91,7 @@ impl HtmlJob {
                 warnings: Vec::new(),
                 images: 0,
                 embedded: 0,
+                pages: 0,
                 ready: None,
             }),
         });
@@ -99,7 +109,7 @@ impl HtmlJob {
                 }
             };
             let defaults = HtmlOptions::default();
-            let options = HtmlOptions {
+            let mut options = HtmlOptions {
                 title: config
                     .get("title")
                     .and_then(Value::as_str)
@@ -120,6 +130,13 @@ impl HtmlJob {
                     .ok_or("缺少固定日期上下文")?,
                 dark: config.get("dark").and_then(Value::as_bool).unwrap_or(false),
             };
+            if pdf_settings.is_some() {
+                options.foreground = 0x24292fff;
+                options.background = 0xffffffff;
+                options.link = 0x1f4794ff;
+                options.font_size = 16.0;
+                options.dark = false;
+            }
             let basis = if config.get("untitled").and_then(Value::as_bool) == Some(true) {
                 config
                     .get("resourceBase")
@@ -172,6 +189,7 @@ impl HtmlJob {
                         state.warnings = ready.document.warnings.clone();
                         state.images = ready.document.image_count;
                         state.embedded = ready.document.embedded_count;
+                        state.pages = ready.pdf.as_ref().map_or(0, |pdf| pdf.pages);
                         state.ready = Some(ready);
                     }
                     Ok(Err(error)) => worker.fail(error),
@@ -225,12 +243,27 @@ impl HtmlJob {
                     })?;
             }
         }
-        let result = export_html_document(&document, &options, &mut resources)?;
+        let mut result = export_html_document(&document, &options, &mut resources)?;
+        let pdf = if let Some(settings) = self.pdf_settings {
+            self.stage("准备 PDF 页面内容");
+            let packet = yu_export::paged::prepare_pdf_packet(&result, settings)?;
+            resources.checkpoint()?;
+            self.stage("分页并绘制 PDF");
+            let rendered = yu_render_macos::export_pdf(&packet, || {
+                self.prepare_checkpoint_at(Instant::now()).is_ok()
+            });
+            resources.checkpoint()?;
+            result.html.clear();
+            Some(rendered?)
+        } else {
+            None
+        };
         resources.images.verify()?;
         resources.checkpoint()?;
         destination.validate(&resources.images.protected)?;
         Ok(Ready {
             document: result,
+            pdf,
             destination,
             protected: resources.images.protected.clone(),
         })
@@ -275,7 +308,8 @@ impl HtmlJob {
     pub fn status_json(&self) -> String {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         json!({"phase": state.phase, "message": state.message, "revision": self.revision,
-            "warnings": state.warnings, "images": state.images, "embedded": state.embedded})
+            "warnings": state.warnings, "images": state.images, "embedded": state.embedded,
+            "pages": state.pages, "format": if self.pdf_settings.is_some() { "pdf" } else { "html" }})
         .to_string()
     }
     pub fn commit(self: &Arc<Self>, allow_warnings: bool) -> Result<(), String> {
@@ -300,7 +334,10 @@ impl HtmlJob {
             .name("yu-html-publish".into())
             .spawn(move || {
                 let result = ready.destination.publish_guarded(
-                    ready.document.html.as_bytes(),
+                    ready
+                        .pdf
+                        .as_ref()
+                        .map_or(ready.document.html.as_bytes(), |pdf| pdf.bytes.as_slice()),
                     &ready.protected,
                     || {
                         if worker.control.is_current(worker.revision) {
@@ -334,7 +371,11 @@ impl HtmlJob {
                             "completed_with_warnings"
                         };
                         state.message = if state.warnings.is_empty() {
-                            "HTML 导出完成".into()
+                            if worker.pdf_settings.is_some() {
+                                "PDF 导出完成".into()
+                            } else {
+                                "HTML 导出完成".into()
+                            }
                         } else {
                             "已带占位或诊断导出，请检查警告".into()
                         };

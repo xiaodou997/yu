@@ -1,6 +1,6 @@
 # 第五组依赖与系统能力决策
 
-日期：2026-09-28；当前仅落地 5A。依据用户 v1.2，先复用已有代码；系统 API 与成熟开源同按职责评估，不追求全部原生/全部 Rust。Windows 后置。本记录不等于第五组完整分发许可审计。
+日期：2026-09-28；5A已结项，5B已接通首批PDF链路、尚未结项。依据用户 v1.2，先复用已有代码；系统 API 与成熟开源同按职责评估，不追求全部原生/全部 Rust。Windows 后置。本记录不等于第五组完整分发许可审计。
 
 ## 5A 采用的组合
 
@@ -27,6 +27,18 @@ Cargo.lock 仅增加 yu-export 对上述已有包及 yu-assets/yu-syntax 的依�
 
 沿用 helper 现有资源与声明；新导出使用其静态结果。字体显示、轮廓化、嵌入与重新分发不可混为一谈，完整产物/发行包的字体与资源核对仍列为 5E 检查；本批不向用户提供字体文件。上游 AI 贡献、CLA/DCO 另行遵守，本轮不向 comrak 自动提交 PR。
 
-## 后续选型边界
+## 5B 选型与首批结果
 
-5B 做一次有界的 CoreGraphics / 最相关 Rust PDF-SVG 候选比较；可以同时评估，不要求先让系统实现失败。krilla/krilla-svg 的选定版本 NOTICE/MPL 来源必须先核实再引入；resvg/usvg 按真实缺口复用，不将栅格化冒充 PDF 矢量。svg2pdf 不作为新依赖首选。尚未引入这些候选，也未实现 PDF/打印/PNG 产品入口。
+| 能力 | 本批决定与实际边界 |
+| --- | --- |
+| 文字与PDF编码 | 采用公开 CoreText/CTTypesetter/CTLine 与 CoreGraphics PDF context。系统负责字体回退、整形和PDF编码；Yu只补纸张、按行分页与内容关系。普通正文保持文字层，没有整个页面栅格化。 |
+| 静态SVG | 复用已冻结且安全验证后的helper资源；公开 NSImage 绘制进非屏幕 Quartz context，关闭其显示缓存。原生6页探针中4个SVG页分别含8/8/21/19条路径且无位图；不能由这些样本推定任意SVG无损转换。未使用私有CoreSVG API。 |
+| 语义与表格 | 使用5A整文档writer的已解析、安全结构，通过既有HtmlFragment/HtmlTableGrid形成短流程数据；不导入浏览器、不新增Markdown解析器。行内字体与图形由系统度量，完整跨行合并组的分页为Yu特有约束。 |
+| Rust候选 | 核对 krilla 0.8.2、krilla-svg 0.8.1 包及源码commit `3ffdf0588cf98050aad6edba51ca70162e1fb5b5`；存档包校验与根LICENSE/NOTICE。NOTICE中的resvg/MPL来源尚未完成文件级授权沿革核对，未复制其代码、未链接进Yu，也未构建Rust候选PDF。原生能力已通过本阶段实际探针，按v1.2 3.3不为凑对照重做第二后端；这不是双后端同语料性能比较或候选完整许可放行。 |
+| 界面与文件安全 | 原生NSSavePanel及PDF纸张配置；复用5A固定任务、资源准备、取消、告警同意和目的地事务，不添加PDF专用的不安全直接覆盖。 |
+
+新增直接使用的是工作区已锁定的 `serde_json 1.0.151`，用于Rust到原生的有界流程数据；Cargo.lock只增加一条yu-export依赖边，没有新增package/version。`AppBundle/Resources/PDFExportLicenses` 保存其保守非dev/工作区feature统一闭包的15个包、28份原始许可，加manifest/README共30份文件；可能包含非当前最终链接组件。没有上游补丁、第三方代码或字体复制。该目录实际随Release应用复制并逐字节核对；HTML/helper既有声明继续保留。
+
+采用原生路线不代表字体嵌入和所有阅读器行为自动通过。系统/用户字体文件不单独分发；实际PDF字形、复制、链接、图片和逐页复核继续随5B验证，完整发行target/features、资源/字体义务在5E核对。测试端PDFKit、PDFium及可选PyMuPDF只形成相应测试证据，不引入产品转换依赖。
+
+原始材料位于 `artifacts/group5-5b-20260928-r01/third-party/`，公开依据为Apple Quartz PDF guide、Core Text Programming Guide和上述Krilla固定commit的NOTICE/源文件；具体产物、哈希与后续边界见 `mac-group5-pdf.md`。系统打印和PNG未实现，继续按5C/5D顺序推进。

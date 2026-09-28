@@ -73,3 +73,22 @@ GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance
 现有窗口菜单子项还会在移动到文末、两次放大、切换源码模式后重新导出，比较HTML字节和选区不变；另存 `reports/presentation-isolation.json`，不增加验收组数量。缩放/源码模式使用已有原生快捷键，缩放以菜单状态核实，源码模式另看截图；不把AXPress返回成功当作动作生效。
 
 `export_write_failure` 的父测试只在自己创建的子进程中降低文件大小限制，并屏蔽该子进程的XFSZ信号，触发真实write_all失败；核对旧输出与临时文件清理。忽略标记的子测试由父测试显式启动并核对成功标记，不是漏跑；不修改宿主、用户shell或其他进程限额，不填满磁盘。
+
+## 第五组 PDF 首批验收
+
+```sh
+# 使用已审计的 Release，真实快照到原生 PDF；正常/纸张/表格/长代码/告警/立即取消。
+python3 tools/run_acceptance.py group5-pdf artifacts/新的PDF原生目录
+
+# 串行桌面检查：真实 PDF 菜单、默认配置、保存取消、中文路径、覆盖取消/确认。
+python3 tools/run_acceptance.py group5-pdf-window artifacts/新的PDF窗口目录
+
+# 可选开发端独立产物检查，需要该检查环境已有 PyMuPDF；不是产品运行依赖。
+python3 tools/check-group5-pdf.py manifest.json 新的PDF检查报告.json
+```
+
+`--pdf-export-self-check INPUT OUTPUT` 为原生入口；`--pdf-letter`、`--pdf-landscape`、`--pdf-warnings`、`--pdf-cancel` 只控制该测试。正常快照包含未保存标记而排除后续编辑，检查原文/选区/版本与继续编辑撤销。表格输入40个两行合并组、长代码140行；源内容完整检查不能取代逐页视觉或阅读器交互。取消用例目前是启动后立即取消，不冒充三次运行中取消/重试。
+
+独立检查清单的 `files` 数组逐项记录 `file`、`sha256`、`kind`（composite/table/long-code/warnings）、`paper`（A4/Letter）、`landscape` 和 `unsaved`。文件位于清单目录内，检查器拒绝已有报告并核对每份字节身份。当前固定语料均使用36pt或44pt页边距和页码；仅在底部35pt区域验证9pt页码后，才将该页码与跨页正文计数分开，原始文字提取结果仍保留。PDFium/PDFKit/PyMuPDF 的文字、绘制与 GUI 证据分层记录。
+
+这些入口只完成命名子项，5B仍须补齐PDF专属失败/资源变更/预算、真实纸张选项与链接交互、有限重复和运行中取消，以及剩余F01—F06检查；不改变原规划组数。公开系统PDF后端及当前限制见 `docs/architecture/mac-group5-pdf.md`。

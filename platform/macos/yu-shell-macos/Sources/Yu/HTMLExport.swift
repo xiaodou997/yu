@@ -13,6 +13,7 @@ final class NativeHTMLExportTask {
         let warnings: [String]
         let images: Int
         let embedded: Int
+        let pages: Int?
     }
     private let handle: OpaquePointer
     init(handle: OpaquePointer) { self.handle = handle }
@@ -113,12 +114,12 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private(set) var isRunning = true
     private(set) var lastStatus: NativeHTMLExportTask.Status?
 
-    init(task: NativeHTMLExportTask, destination: URL, owner: NSWindow, onClose: @escaping () -> Void) {
+    init(task: NativeHTMLExportTask, destination: URL, owner: NSWindow, formatName: String = "HTML", onClose: @escaping () -> Void) {
         self.task = task; self.destination = destination; self.owner = owner; self.onClose = onClose
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 185),
             styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
-        panel.title = "导出 HTML"; panel.isReleasedWhenClosed = false; panel.delegate = self
+        panel.title = "导出 \(formatName)"; panel.isReleasedWhenClosed = false; panel.delegate = self
         panel.becomesKeyOnlyIfNeeded = true
         stage.font = .boldSystemFont(ofSize: 14)
         indicator.style = .bar; indicator.isIndeterminate = true; indicator.startAnimation(nil)
@@ -153,7 +154,7 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
             case "completed", "completed_with_warnings":
                 isRunning = false; timer?.invalidate(); timer = nil
                 indicator.stopAnimation(nil); indicator.isHidden = true
-                detail.stringValue = "\(destination.lastPathComponent) · \(status.images) 张图片 · \(status.embedded) 项公式/图表" + (status.warnings.isEmpty ? "" : "\n含 \(status.warnings.count) 项警告，不是完整成功。")
+                detail.stringValue = "\(destination.lastPathComponent)" + ((status.pages ?? 0) > 0 ? " · \(status.pages ?? 0) 页" : "") + " · \(status.images) 张图片 · \(status.embedded) 项公式/图表" + (status.warnings.isEmpty ? "" : "\n含 \(status.warnings.count) 项警告，不是完整成功。")
                 revealButton.isHidden = false; cancelButton.title = "关闭"
                 self.task = nil
             case "failed", "cancelled":

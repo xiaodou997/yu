@@ -68,6 +68,11 @@ use yu_workspace::{
 };
 
 #[cfg(target_os = "macos")]
+mod pdf;
+#[cfg(target_os = "macos")]
+pub use pdf::{RenderedPdf, export_pdf};
+
+#[cfg(target_os = "macos")]
 mod core_text;
 
 #[cfg(target_os = "macos")]
