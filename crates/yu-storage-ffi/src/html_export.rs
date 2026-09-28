@@ -15,11 +15,15 @@ use yu_export::document::{
 };
 use yu_export::portable::{
     Destination, FrozenImages, MAX_IMAGE_PIXELS, ProtectedFile, data_image, validate_svg,
+    validate_svg_resource,
 };
 use yu_markdown::{EmbeddedKind, EmbeddedSpan};
 use yu_text::TextSnapshot;
 
 const MAX_TASKS: usize = 2;
+#[cfg(test)]
+#[path = "html_export_bounds.rs"]
+mod bounds;
 const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -39,6 +43,7 @@ struct State {
 pub struct HtmlJob {
     control: RenderControl,
     revision: u64,
+    preparation_deadline: Instant,
     state: Mutex<State>,
     counted: bool,
 }
@@ -69,6 +74,7 @@ impl HtmlJob {
         let job = Arc::new(Self {
             revision,
             control,
+            preparation_deadline: Instant::now() + TASK_TIMEOUT,
             counted: true,
             state: Mutex::new(State {
                 phase: "preparing",
@@ -185,7 +191,9 @@ impl HtmlJob {
         destination: Destination,
         options: HtmlOptions,
     ) -> Result<Ready, String> {
+        self.prepare_checkpoint_at(Instant::now())?;
         let document = yu_markdown::parse(&snapshot);
+        self.prepare_checkpoint_at(Instant::now())?;
         let helper = std::env::current_exe()
             .ok()
             .and_then(|exe| {
@@ -198,7 +206,6 @@ impl HtmlJob {
             images: FrozenImages::new(basis, Some(&path)),
             normalized: HashMap::new(),
             renderer: NativeRendererClient::new(helper, NEXT_ID.fetch_add(1, Ordering::Relaxed)),
-            deadline: Instant::now() + TASK_TIMEOUT,
             ordinal: 0,
             revision: snapshot.revision(),
         };
@@ -227,6 +234,15 @@ impl HtmlJob {
             destination,
             protected: resources.images.protected.clone(),
         })
+    }
+    fn prepare_checkpoint_at(&self, now: Instant) -> Result<(), String> {
+        if !self.control.is_current(self.revision) {
+            return Err("已取消导出".into());
+        }
+        if now >= self.preparation_deadline {
+            return Err("导出超过 300 秒任务预算".into());
+        }
+        Ok(())
     }
     fn stage(&self, message: &str) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -338,19 +354,12 @@ struct Resources {
     images: FrozenImages,
     normalized: HashMap<String, ExportImage>,
     renderer: NativeRendererClient,
-    deadline: Instant,
     ordinal: usize,
     revision: yu_core::Revision,
 }
 impl HtmlResources for Resources {
     fn checkpoint(&mut self) -> Result<(), String> {
-        if !self.task.control.is_current(self.task.revision) {
-            return Err("已取消导出".into());
-        }
-        if Instant::now() >= self.deadline {
-            return Err("导出超过 300 秒任务预算".into());
-        }
-        Ok(())
+        self.task.prepare_checkpoint_at(Instant::now())
     }
     fn image(&mut self, destination: &str) -> Result<ExportImage, ResourceError> {
         if let Some(image) = self.normalized.get(destination) {
@@ -365,7 +374,7 @@ impl HtmlResources for Resources {
                 .starts_with('<')
         });
         let image = if let Some(svg) = svg {
-            validate_svg(svg).map_err(ResourceError::Warning)?;
+            validate_svg_resource(svg)?;
             data_image(bytes, "image/svg+xml", 1, 1)
         } else {
             let (png, width, height) = yu_render_macos::export_image_png(bytes, MAX_IMAGE_PIXELS)

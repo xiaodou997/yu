@@ -51,6 +51,9 @@ python3 tools/run_acceptance.py group5-safety-window artifacts/新的告警目�
 # 资源预算/文件安全核心检查；8个原生成功/失败/取消场景验证完整选区和真实redo/undo。
 python3 tools/run_acceptance.py group5-safety artifacts/新的安全目录
 
+# 已公布的正文/SVG/出现次数、输出预分配、任务并发/截止时刻和真实ImageIO像素边界。
+python3 tools/run_acceptance.py group5-bounds artifacts/新的预算目录
+
 # 对上述窗口目录中的实际输出制作移动副本，确认生产者已退出，离线直接 file:// 打开。
 GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance.py group5-browser artifacts/新的浏览器目录
 ```
@@ -64,3 +67,9 @@ GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance
 安全套件只对本次新建的隔离图片和输出目录暂时撤销读写权限，并在finally/defer中恢复；不修改系统或用户目录权限，不通过填满磁盘制造错误。原生安全自检在新目录创建自己的fixture，拒绝复用已有目录，记录成功/取消/失败时的源文、版本、脏状态、多选区/方向或表格矩形及历史能力，并实际执行原有redo/undo和继续编辑。辅助入口 `--html-export-safety-self-check NEW_DIRECTORY` 不是实窗证据。
 
 `tools/ime-menu-reference.swift` 是无自定义输入行为的AppKit NSTextView最小对照，不进入Yu产品；用于区分系统/驱动的菜单行为与Yu特有导出缺陷。对照复现不自动成为候选恢复验收通过，也不等同于用户接受风险。
+
+预算套件不抬高生产限额：8MiB源码和4MiB/100000节点SVG实际进入解析，32Mi像素图通过生产ImageIO归一和HTML任务。64/128/256MiB的累计/拼接边界用生产预检函数及低内存重复片段验证，不冒充满载解码/256MiB成品压力。双任务用真实HtmlJob准入与释放；300秒用确定Instant检查前一纳秒/到期分界，不修改系统时钟、不等待五分钟，也不宣称是强制抢占被阻塞的系统调用。新增原生入口 `--html-export-budget-self-check INPUT_DIRECTORY NEW_OUTPUT_DIRECTORY` 拒绝复用已有输出目录。
+
+现有窗口菜单子项还会在移动到文末、两次放大、切换源码模式后重新导出，比较HTML字节和选区不变；另存 `reports/presentation-isolation.json`，不增加验收组数量。缩放/源码模式使用已有原生快捷键，缩放以菜单状态核实，源码模式另看截图；不把AXPress返回成功当作动作生效。
+
+`export_write_failure` 的父测试只在自己创建的子进程中降低文件大小限制，并屏蔽该子进程的XFSZ信号，触发真实write_all失败；核对旧输出与临时文件清理。忽略标记的子测试由父测试显式启动并核对成功标记，不是漏跑；不修改宿主、用户shell或其他进程限额，不填满磁盘。
