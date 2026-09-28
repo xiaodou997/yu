@@ -45,6 +45,12 @@ python3 tools/run_acceptance.py group5-window artifacts/新的窗口目录
 # 单独的固定1000公式输入，使取消发生在任务运行中；3次取消/重试及所属窗口关闭。
 GROUP5_WINDOW_PHASE=cancellation python3 tools/run_acceptance.py group5-window artifacts/新的取消目录
 
+# 剩余告警确认/Escape取消、未选择图片基准、图片不可读和写目录失去权限。
+python3 tools/run_acceptance.py group5-safety-window artifacts/新的告警目录
+
+# 资源预算/文件安全核心检查；8个原生成功/失败/取消场景验证完整选区和真实redo/undo。
+python3 tools/run_acceptance.py group5-safety artifacts/新的安全目录
+
 # 对上述窗口目录中的实际输出制作移动副本，确认生产者已退出，离线直接 file:// 打开。
 GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance.py group5-browser artifacts/新的浏览器目录
 ```
@@ -54,3 +60,7 @@ GROUP5_WINDOW_EVIDENCE=artifacts/新的窗口目录 python3 tools/run_acceptance
 浏览器阶段只使用测试机已有的 Chrome 和带内置 WebSocket 的 Node.js；两者不是产品依赖，也不进入 Yu 生产导出链路。新建隔离浏览器配置、关闭缓存并模拟该页面离线，不改系统网络或用户浏览器配置。只复制并移动产物副本，原始证据文件保持不动。自动检查不自动完成 `visual` 层；必须记录实际查看过的截图、哈希及范围。
 
 `tools/test_group5_window.py` 验证阶段路由与失败证据保留，不是GUI证据。所有这些入口只完成台账中的命名子项，不能自动关闭全部24组。最新结果和仍未解决的原生菜单/候选状态观察见 `docs/architecture/mac-group5-status.md`。
+
+安全套件只对本次新建的隔离图片和输出目录暂时撤销读写权限，并在finally/defer中恢复；不修改系统或用户目录权限，不通过填满磁盘制造错误。原生安全自检在新目录创建自己的fixture，拒绝复用已有目录，记录成功/取消/失败时的源文、版本、脏状态、多选区/方向或表格矩形及历史能力，并实际执行原有redo/undo和继续编辑。辅助入口 `--html-export-safety-self-check NEW_DIRECTORY` 不是实窗证据。
+
+`tools/ime-menu-reference.swift` 是无自定义输入行为的AppKit NSTextView最小对照，不进入Yu产品；用于区分系统/驱动的菜单行为与Yu特有导出缺陷。对照复现不自动成为候选恢复验收通过，也不等同于用户接受风险。
