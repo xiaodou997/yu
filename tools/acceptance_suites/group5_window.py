@@ -138,8 +138,13 @@ class WindowChecks:
         self.find(lambda c: c.get('AXIdentifier') == 'OKButton')
         self.go(path)
         self.click(self.identifier('OKButton'))
-        self.source(source)
+        # Wait for the document window to exist before asking the driver for
+        # its text area. Otherwise AX can still expose the previous document
+        # while the open panel is tearing down.
+        self.find(lambda c: c.get('AXRole') == 'AXWindow'
+                  and c.get('AXIdentifier') == str(path))
         self.event('raise-window', path)
+        self.source(source)
 
     def sample(self, phase):
         sample = self.command([self.out / 'process-footprint', self.process.pid])

@@ -22,10 +22,13 @@ cargo build --locked --manifest-path "$shell_dir/../../../Cargo.toml" \
 cp "$shell_dir/../../../target/aarch64-apple-darwin/$profile/yu-document-renderer" "$contents_dir/Helpers/.yu-document-renderer.next"
 mv -f "$contents_dir/Helpers/.yu-document-renderer.next" "$contents_dir/Helpers/yu-document-renderer"
 codesign --force --sign - "$contents_dir/Helpers/yu-document-renderer" >&2
+rm -rf "$contents_dir/Resources/NativeRendererLicenses"
 mkdir -p "$contents_dir/Resources/NativeRendererLicenses"
 cp "$shell_dir/../../../tools/yu-document-renderer/licenses/"*.txt "$contents_dir/Resources/NativeRendererLicenses/"
 cp "$shell_dir/../../../tools/yu-document-renderer/vendor/mitex/LICENSE" "$contents_dir/Resources/NativeRendererLicenses/MiTeX.txt"
 cp "$shell_dir/../../../tools/yu-document-renderer/vendor/xarrow/LICENSE" "$contents_dir/Resources/NativeRendererLicenses/xarrow.txt"
+python3 "$shell_dir/../../../tools/generate-native-renderer-licenses.py" \
+    "$contents_dir/Resources/NativeRendererLicenses" >&2
 
 swift build --package-path "$shell_dir" --triple arm64-apple-macosx26.0 -c "$profile" >&2
 binary_dir="$(swift build --package-path "$shell_dir" --triple arm64-apple-macosx26.0 -c "$profile" --show-bin-path)"
