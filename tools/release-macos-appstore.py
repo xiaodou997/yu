@@ -109,6 +109,8 @@ class StoreRelease:
         info = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())
         if info['CFBundleIdentifier'] != BUNDLE_ID or info['LSMinimumSystemVersion'] != '26.0':
             raise ValueError('Unexpected bundle identity or minimum macOS version')
+        if info.get('LSApplicationCategoryType') != 'public.app-category.productivity':
+            raise ValueError('Mac App Store category must match Productivity')
         if not re.fullmatch(r'\d+(?:\.\d+){1,2}', info['CFBundleShortVersionString']):
             raise ValueError('Invalid App Store version string')
         if not re.fullmatch(r'[1-9]\d*', info['CFBundleVersion']):

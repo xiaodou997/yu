@@ -97,7 +97,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
 
     override init() {
         super.init()
-        field.placeholderString = "搜索"
+        field.placeholderString = L10n.tr("Search")
         field.delegate = self
         field.translatesAutoresizingMaskIntoConstraints = false
         field.sendsWholeSearchString = false
@@ -121,7 +121,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.setAccessibilityLabel("搜索结果")
+        tableView.setAccessibilityLabel(L10n.tr("Search Results"))
         // 单列表格：列宽必须跟着表走，否则 cell 再怎么约束也被一个默认宽度的
         // 列框住。
         tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
@@ -134,9 +134,9 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         view.translatesAutoresizingMaskIntoConstraints = false
-        let previous = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "上一个")!, target: self, action: #selector(previousMatch(_:)))
-        let next = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "下一个")!, target: self, action: #selector(nextMatch(_:)))
-        let close = NSButton(title: "完成", target: self, action: #selector(closeFind(_:)))
+        let previous = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: L10n.tr("Previous"))!, target: self, action: #selector(previousMatch(_:)))
+        let next = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: L10n.tr("Next"))!, target: self, action: #selector(nextMatch(_:)))
+        let close = NSButton(title: L10n.tr("Done"), target: self, action: #selector(closeFind(_:)))
         for button in [previous, next, close] { button.bezelStyle = .rounded; button.controlSize = .small }
         let stack = NSStackView(views: [field, countLabel, previous, next, close])
         stack.orientation = .horizontal
@@ -195,8 +195,8 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         self.rows = rows
         tableView.reloadData()
         countLabel.stringValue = rows.isEmpty
-            ? (query.isEmpty ? "" : "没有匹配")
-            : "\(rows.count) 处匹配"
+            ? (query.isEmpty ? "" : L10n.tr("No matches"))
+            : L10n.format(rows.count == 1 ? "%d match" : "%d matches", rows.count)
     }
 
     /// 把「当前命中」那一行选中，不触发导航回调。

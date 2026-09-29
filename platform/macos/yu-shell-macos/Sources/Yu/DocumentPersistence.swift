@@ -74,7 +74,7 @@ final class NativeDocumentPersistence {
             ?? (CommandLine.arguments.contains("--document-lifecycle-self-check")
                 || (!CommandLine.arguments.contains(where: { $0.hasSuffix("-self-check") })
                     && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil))
-        if recovered { notice = "已恢复未保存内容；确认后请保存" }
+        if recovered { notice = L10n.tr("Recovered unsaved content; save after reviewing.") }
     }
 
     deinit { scheduled?.cancel() }
@@ -112,7 +112,7 @@ final class NativeDocumentPersistence {
         do { try flushRecovery() } catch { recoveryError = error }
         guard allowAutosave, !isUntitled, !needsRecoveryReview, !bridge.composition.active,
               bridge.state.dirty else {
-            if let recoveryError { notice = "恢复副本写入失败：\(recoveryError.localizedDescription)" }
+            if let recoveryError { notice = L10n.format("Could not write recovery copy: %@", recoveryError.localizedDescription) }
             onChange?()
             return
         }
@@ -121,8 +121,10 @@ final class NativeDocumentPersistence {
             try bridge.clearRecovery(in: locations.recovery)
             notice = nil
         } catch {
-            let protected = recoveryError == nil ? "更改已保留在恢复副本" : "更改仍在当前窗口，请尽快另存为"
-            notice = "自动保存未完成；\(protected)"
+            let protected = recoveryError == nil
+                ? L10n.tr("Changes preserved in recovery copy")
+                : L10n.tr("Changes remain in this window; use Save As soon")
+            notice = L10n.format("Autosave did not finish; %@", protected)
         }
         onChange?()
     }
@@ -146,17 +148,17 @@ final class NativeDocumentPersistence {
         notice = nil
         if let oldRecord {
             do { try removeRecordIfPresent(oldRecord) }
-            catch { notice = "文件已保存，但旧恢复副本清理失败：\(error.localizedDescription)" }
+            catch { notice = L10n.format("File saved, but the old recovery copy could not be removed: %@", error.localizedDescription) }
         }
         do { try bridge.persistTableWidths() }
-        catch { notice = "文件已保存，但列宽设置写入失败：\(error.localizedDescription)" }
+        catch { notice = L10n.format("File saved, but column width settings could not be written: %@", error.localizedDescription) }
         onChange?()
     }
 
     private func clearSavedRecovery() {
         notice = nil
         do { try bridge.clearRecovery(in: locations.recovery) }
-        catch { notice = "文件已保存，但恢复副本清理失败：\(error.localizedDescription)" }
+        catch { notice = L10n.format("File saved, but the recovery copy could not be removed: %@", error.localizedDescription) }
         onChange?()
     }
 

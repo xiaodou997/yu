@@ -56,7 +56,11 @@ class BridgeResourceChecks(unittest.TestCase):
             if missing_source:
                 self.assertFalse(source.exists())
             else:
-                self.assertIn('应用缺少 yu_shaders.metallib', result.stderr)
+                # This check verifies that bridge initialization fails cleanly
+                # after the Rust handle exists. The wording is localized by
+                # the native shell, so assert the stable missing resource
+                # identity instead of one UI language.
+                self.assertIn('yu_shaders.metallib', result.stderr)
                 self.assertEqual(source.read_bytes(), data)
 
     def test_missing_shader_after_handle_creation_exits_normally(self):

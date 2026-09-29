@@ -139,7 +139,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         registerForDraggedTypes([.fileURL, .png, .tiff])
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
-        setAccessibilityLabel("Yu Markdown 文档")
+        setAccessibilityLabel(L10n.tr("Yu Markdown Document"))
         setAccessibilityIdentifier("yu-document-text")
         headingRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .heading)
         linkRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .link)
@@ -650,7 +650,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     }
 
     func makeDisclosureMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "展开／折叠当前摘要", action: #selector(toggleDisclosureFromMenu(_:)), keyEquivalent: "")
+        let item = NSMenuItem(title: L10n.tr("Expand/Collapse Current Details"), action: #selector(toggleDisclosureFromMenu(_:)), keyEquivalent: "")
         item.target = self
         return item
     }
@@ -667,24 +667,24 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     }
 
     func makeTableMenu() -> NSMenu {
-        let menu = NSMenu(title: "表格")
+        let menu = NSMenu(title: L10n.tr("Table"))
         let items: [(String, Int)] = [
-            ("在上方插入正文行", Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE)),
-            ("在下方插入正文行", Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER)),
-            ("删除正文行", Int(YU_STORAGE_COMMAND_TABLE_DELETE_ROW)),
-            ("在左侧插入列", Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE)),
-            ("在右侧插入列", Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER)),
-            ("删除列", Int(YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN)),
-            ("列左对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT)),
-            ("列居中", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER)),
-            ("列右对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT)),
-            ("列默认对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT)),
+            (L10n.tr("Insert Body Row Above"), Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE)),
+            (L10n.tr("Insert Body Row Below"), Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER)),
+            (L10n.tr("Delete Body Row"), Int(YU_STORAGE_COMMAND_TABLE_DELETE_ROW)),
+            (L10n.tr("Insert Column Left"), Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE)),
+            (L10n.tr("Insert Column Right"), Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER)),
+            (L10n.tr("Delete Column"), Int(YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN)),
+            (L10n.tr("Align Column Left"), Int(YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT)),
+            (L10n.tr("Center Column"), Int(YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER)),
+            (L10n.tr("Align Column Right"), Int(YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT)),
+            (L10n.tr("Use Default Column Alignment"), Int(YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT)),
         ]
         for (index, entry) in items.enumerated() {
             if index == 3 || index == 6 { menu.addItem(.separator()) }
             let item = NSMenuItem(title: entry.0, action: #selector(editTableFromMenu(_:)), keyEquivalent: "")
             item.tag = entry.1
-            item.toolTip = "按住 ⇧⌥ 拖动，可选择矩形单元格区域。"
+            item.toolTip = L10n.tr("Hold ⇧⌥ while dragging to select a rectangular cell region.")
             item.target = self
             menu.addItem(item)
         }
@@ -776,7 +776,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         // Keep disabled boundary actions while editing a table, but do not
         // fill image/prose context menus with unrelated table commands.
         let menu = tableMenu.items.contains(where: { validateMenuItem($0) }) ? tableMenu : NSMenu()
-        for (title, command) in [("增加列表缩进", Command.indentList), ("减少列表缩进", Command.outdentList)] {
+        for (title, command) in [(L10n.tr("Increase List Indent"), Command.indentList), (L10n.tr("Decrease List Indent"), Command.outdentList)] {
             let item = NSMenuItem(title: title, action: #selector(editListFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.tag = Int(command)
@@ -803,24 +803,24 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         let documentLinkItems = linkMenuItems(at: diagnosticSource)
         for item in documentLinkItems.reversed() { menu.insertItem(item, at: 0) }
         if let target = initialHit?.target {
-            let item = NSMenuItem(title: "跳转到标题", action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: L10n.tr("Jump to Heading"), action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = DocumentNavigationTarget(revision: bridge.revision, range: target)
             menu.insertItem(item, at: 0)
         } else if documentLinkItems.isEmpty, (try? bridge.documentReferenceTarget(at: diagnosticSource)) != nil {
-            let item = NSMenuItem(title: "跳转到引用位置", action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: L10n.tr("Jump to Reference"), action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = NSNumber(value: diagnosticSource)
             menu.insertItem(item, at: 0)
         }
         if let diagnostic = try? bridge.documentDiagnostic(at: diagnosticSource), !diagnostic.isEmpty {
-            let item = NSMenuItem(title: "查看文档诊断…", action: #selector(showDocumentDiagnostic(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: L10n.tr("View Document Diagnostics…"), action: #selector(showDocumentDiagnostic(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = NSNumber(value: diagnosticSource)
             menu.insertItem(item, at: 0)
         }
         if let imageSource, canEditImage(at: imageSource) {
-            let item = NSMenuItem(title: "图片属性…", action: #selector(editImagePropertiesFromMenu(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: L10n.tr("Image Properties…"), action: #selector(editImagePropertiesFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = NSNumber(value: imageSource)
             menu.insertItem(item, at: 0)
@@ -843,8 +843,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         guard !bridge.sourceMode, !bridge.composition.active,
               (try? bridge.linkDestination(at: source, expectedRevision: bridge.revision)) != nil else { return [] }
         let target = DocumentLinkMenuTarget(revision: bridge.revision, source: source)
-        return [("打开链接", #selector(openDocumentLinkFromMenu(_:))),
-                ("复制链接地址", #selector(copyDocumentLinkFromMenu(_:)))].map { title, action in
+        return [(L10n.tr("Open Link"), #selector(openDocumentLinkFromMenu(_:))),
+                (L10n.tr("Copy Link Address"), #selector(copyDocumentLinkFromMenu(_:)))].map { title, action in
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
             item.representedObject = target
@@ -925,9 +925,10 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
               let message = try? bridge.documentDiagnostic(at: source), !message.isEmpty,
               let window else { return }
         let alert = NSAlert()
-        alert.messageText = "文档内容需要修正"
-        alert.informativeText = message + "\n\n原始源码已保留，可直接修改。"
-        alert.addButton(withTitle: "继续编辑")
+        alert.messageText = L10n.tr("Document Content Needs Attention")
+        fputs("Yu document diagnostic: \(message)\n", stderr)
+        alert.informativeText = L10n.tr("The document contains a diagnostic at this position. The original source is preserved and can be edited directly.")
+        alert.addButton(withTitle: L10n.tr("Continue Editing"))
         alert.beginSheetModal(for: window) { [weak self] _ in
             guard let self else { return }
             self.window?.makeFirstResponder(self)
@@ -938,13 +939,13 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         guard let properties = try? bridge.imageProperties(at: source),
               let status = try? bridge.imageResourceStatus(properties) else { return nil }
         if status == UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED) {
-            let retry = NSMenuItem(title: "图片加载失败，重试", action: #selector(retryImageFromMenu(_:)), keyEquivalent: "")
+            let retry = NSMenuItem(title: L10n.tr("Image failed to load — Retry"), action: #selector(retryImageFromMenu(_:)), keyEquivalent: "")
             retry.target = self
             retry.representedObject = properties
             return retry
         }
         if status == UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING) {
-            return NSMenuItem(title: "图片加载中…", action: nil, keyEquivalent: "")
+            return NSMenuItem(title: L10n.tr("Loading image…"), action: nil, keyEquivalent: "")
         }
         return nil
     }

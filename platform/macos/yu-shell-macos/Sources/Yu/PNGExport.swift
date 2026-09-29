@@ -21,8 +21,8 @@ final class NativePNGExportOptions {
         scale.setAccessibilityIdentifier("yu-png-scale")
         view.orientation = .vertical; view.alignment = .leading; view.spacing = 9
         view.addArrangedSubview(common.view)
-        view.addArrangedSubview(NSStackView(views: [NSTextField(labelWithString: "宽度（320–2048）："), width, scale]))
-        let note = NSTextField(wrappingLabelWithString: "单图最多 16 Mi 像素、边长 32768；超限后先确认分段，输出到新的“名称-images”目录。整组最多 128 Mi 像素／64 段，不覆盖已有目录。")
+        view.addArrangedSubview(NSStackView(views: [NSTextField(labelWithString: L10n.tr("Width (320–2048):")), width, scale]))
+        let note = NSTextField(wrappingLabelWithString: L10n.tr("A single image is limited to 16 Mi pixels and a 32768-pixel edge. Oversized documents can be confirmed for segmented export to a new “name-images” directory. The complete export is limited to 128 Mi pixels / 64 segments and never overwrites an existing directory."))
         note.preferredMaxLayoutWidth = 340
         note.widthAnchor.constraint(equalToConstant: 340).isActive = true
         view.addArrangedSubview(note)
@@ -31,7 +31,7 @@ final class NativePNGExportOptions {
     }
     func config(title: String, untitled: Bool, appearance: NSAppearance) throws -> [String: Any] {
         guard let logical = Int(width.stringValue), (320...2048).contains(logical) else {
-            throw NSError(domain: "Yu.Export.PNG", code: 1, userInfo: [NSLocalizedDescriptionKey: "PNG 宽度必须为 320–2048。"])
+            throw NSError(domain: "Yu.Export.PNG", code: 1, userInfo: [NSLocalizedDescriptionKey: L10n.tr("PNG width must be between 320 and 2048.")])
         }
         let multiplier = scale.indexOfSelectedItem == 1 ? 2 : 1
         var config = common.config(title: title, untitled: untitled, appearance: appearance)

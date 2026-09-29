@@ -80,7 +80,7 @@ final class YuSidebarSectionHeader: NSView {
     private let countLabel = NSTextField(labelWithString: "")
 
     var count: Int = 0 {
-        didSet { countLabel.stringValue = "\(count) 项" }
+        didSet { countLabel.stringValue = L10n.format(count == 1 ? "%d item" : "%d items", count) }
     }
 
     init(title: String) {
