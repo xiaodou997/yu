@@ -1084,6 +1084,37 @@ final class StorageBridge {
         return NativeBlockCaret(value)
     }
 
+    /// One Rust geometry query covers every shaped line and table cell in the
+    /// requested source range. AX must not infer a multi-line frame from its
+    /// two endpoint carets.
+    func sourceRangeBounds(
+        revision: UInt64,
+        startUTF16: UInt64,
+        endUTF16: UInt64,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NSRect {
+        var value = YuStorageSourceBounds()
+        let status = yu_storage_session_source_range_bounds(
+            handle,
+            revision,
+            startUTF16,
+            endUTF16,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok, value.revision == revision else {
+            throw BridgeError.operation(status)
+        }
+        return NSRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+    }
+
     func tableResizeAccessibilityDividers(
         revision: UInt64,
         size: Float,

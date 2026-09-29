@@ -32,7 +32,7 @@ enum SemanticAccessibilityFlag {
 /// A lightweight AppKit AX element backed by one Rust semantic node. It owns
 /// no Markdown text: labels and range queries always use the node's Revision
 /// and ask `StorageBridge` for the current source bytes.
-final class YuAccessibilitySemanticElement: NSObject,
+final class YuAccessibilitySemanticElement: NSAccessibilityElement,
     NSAccessibilityElementProtocol
 {
     let node: NativeAccessibilitySemanticNode
@@ -52,13 +52,13 @@ final class YuAccessibilitySemanticElement: NSObject,
         super.init()
     }
 
-    @objc func accessibilityFrame() -> NSRect {
+    override func accessibilityFrame() -> NSRect {
         frameOwner?.accessibilityFrameForSemanticRange(node.sourceRange) ?? .zero
     }
 
-    @objc func accessibilityParent() -> Any? { parentObject }
+    override func accessibilityParent() -> Any? { parentObject }
 
-    @objc var accessibilityRole: NSAccessibility.Role {
+    override func accessibilityRole() -> NSAccessibility.Role {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .disclosure:
             return .disclosureTriangle
@@ -75,7 +75,7 @@ final class YuAccessibilitySemanticElement: NSObject,
         }
     }
 
-    @objc var accessibilityRoleDescription: String? {
+    override func accessibilityRoleDescription() -> String? {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .disclosure:
             return "折叠内容"
@@ -102,19 +102,19 @@ final class YuAccessibilitySemanticElement: NSObject,
         }
     }
 
-    @objc var accessibilityLabel: String? {
+    override func accessibilityLabel() -> String? {
         guard let label = bridge.copyAccessibilityLabel(node.labelRange, revision: node.revision) else { return nil }
         return label.isEmpty && SemanticAccessibilityKind(rawValue: node.kind) == .disclosure ? "Details" : label
     }
 
-    @objc var accessibilityTitle: String? { accessibilityLabel }
+    override func accessibilityTitle() -> String? { accessibilityLabel() }
 
-    @objc var accessibilityValue: Any? {
+    override func accessibilityValue() -> Any? {
         if SemanticAccessibilityKind(rawValue: node.kind) == .disclosure {
             return NSNumber(value: node.flags & SemanticAccessibilityFlag.expanded != 0)
         }
         guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
-            return accessibilityLabel
+            return accessibilityLabel()
         }
         return NSNumber(value: node.flags & SemanticAccessibilityFlag.taskDone != 0)
     }
@@ -122,7 +122,7 @@ final class YuAccessibilitySemanticElement: NSObject,
     /// Link destinations are parser-resolved source ranges. The native child
     /// exposes only a Foundation URL value; it never reparses Markdown or
     /// retains a destination string outside the current Revision.
-    @objc var accessibilityURL: URL? {
+    override func accessibilityURL() -> URL? {
         guard let kind = SemanticAccessibilityKind(rawValue: node.kind),
               kind == .link || kind == .autolink || kind == .referenceLink else { return nil }
         return frameOwner?.documentLinkURL(at: node.labelRange.location, revision: node.revision)
@@ -130,7 +130,7 @@ final class YuAccessibilitySemanticElement: NSObject,
 
     /// Both actions use revision-bound Rust source queries; stale AX elements
     /// cannot open a destination from a newer document revision.
-    @objc func accessibilityPerformPress() -> Bool {
+    override func accessibilityPerformPress() -> Bool {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .disclosure:
             return frameOwner?.toggleDisclosure(at: node.sourceRange.location, revision: node.revision) ?? false
@@ -143,21 +143,24 @@ final class YuAccessibilitySemanticElement: NSObject,
         }
     }
 
-    @objc func accessibilityIdentifier() -> String {
+    override func accessibilityIdentifier() -> String {
         "yu-document-semantic-\(node.revision)-\(node.index)"
     }
 
-    @objc var accessibilityChildren: [Any]? { semanticChildren }
+    override func accessibilityChildren() -> [Any]? { semanticChildren }
 
-    @objc var accessibilityChildrenInNavigationOrder: [Any]? {
-        semanticChildren
+    override func accessibilityChildrenInNavigationOrder() -> [NSAccessibilityElementProtocol]? {
+        semanticChildren.compactMap { $0 as? NSAccessibilityElementProtocol }
     }
 
     @objc(accessibilityStringForRange:)
-    func accessibilityString(for range: NSRange) -> String? {
-        guard range.location >= 0,
+    override func accessibilityString(for range: NSRange) -> String? {
+        guard range.location != NSNotFound,
+              range.location >= 0,
               range.length >= 0,
-              NSMaxRange(range) <= node.sourceRange.length else {
+              range.location <= node.sourceRange.length,
+              range.length <= node.sourceRange.length - range.location,
+              node.sourceRange.location <= Int.max - range.location else {
             return nil
         }
         let absolute = NSRange(
@@ -168,7 +171,7 @@ final class YuAccessibilitySemanticElement: NSObject,
     }
 
     @objc(accessibilityAttributedStringForRange:)
-    func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
         guard let text = accessibilityString(for: range) else { return nil }
         return NSAttributedString(string: text)
     }

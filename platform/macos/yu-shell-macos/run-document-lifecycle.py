@@ -37,11 +37,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--case', choices=['all', 'lifecycle', 'crash'], default='all')
+    parser.add_argument('--app', type=Path, default=HERE / '.build/Yu.app')
+    parser.add_argument('--build-manifest', type=Path, default=HERE / '.build/build-manifest.json')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    source = HERE / '.build/Yu.app'
-    build = json.loads((HERE / '.build/build-manifest.json').read_text())
+    source = args.app.resolve()
+    build = json.loads(args.build_manifest.read_text())
     binary = source / 'Contents/MacOS/Yu'
     if build['configuration'] != 'release' or digest(binary) != build['app_sha256']:
         raise RuntimeError('A matching audited release build is required')

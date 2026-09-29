@@ -50,7 +50,7 @@ elif [[ "${1:-}" == "--build" ]]; then
     ./build-app.sh >/dev/null
 fi
 
-binary="$host_dir/.build/Yu.app/Contents/MacOS/Yu"
+binary="${YU_SELF_CHECK_BINARY:-$host_dir/.build/Yu.app/Contents/MacOS/Yu}"
 if [[ ! -x "$binary" ]]; then
     print -r -- "未找到可执行文件 $binary，请先运行 $0 --build" >&2
     exit 1
