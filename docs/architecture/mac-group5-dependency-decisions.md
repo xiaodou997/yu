@@ -55,3 +55,17 @@ Cargo.lock 仅增加 yu-export 对上述已有包及 yu-assets/yu-syntax 的依�
 本批未新增外部包、命令行转换器或许可材料；仍复用系统AppKit/CoreText/CoreGraphics/PDFKit和既有Rust依赖。原先试用PDF页面重放时出现文字映射问题，最终保留原始CTLine进行系统绘制，未另造PDF编码器或Markdown排版。用例与实际系统输出见`mac-group5-printing.md`。
 
 接口依据：Apple `NSPrintPanel.runModal(with:)`、`NSView.knowsPageRange(_:)`、`rectForPage(_:)`、`locationOfPrintRect(_:)`、`NSPrintInfo.imageablePageBounds`。按实际SDK编译及运行核对；仅公开API，最低部署目标保持26.0。实体设备出纸另记，系统预览或PDF保存不视为实体打印成功。
+
+## 5D PNG 首批实现
+
+| 能力 | 已有实现与本批选择 |
+| --- | --- |
+| 全文语义及资源 | 继续复用5A整文档writer、Yu引用/表格模型、已冻结图片和helper静态资源。既有flow adapter增加PNG设置，不重建Markdown/脚注语义。 |
+| 离屏文字与图形 | 复用5B/5C的CoreText整形及原生绘制命令，增加连续长图布局与按完整行/合并组的预算分段。不是把PDF页面截图串接，也不读取编辑器视口或Metal纹理。 |
+| PNG编码 | 采用系统CoreGraphics位图与ImageIO的CGImageDestination数据消费者；生产按段编码、校验预算并释放位图。现有NSImage继续绘制已验证的静态SVG。 |
+| 文件发布 | Rust复用tempfile暂存与既有源文件/资源身份保护；分段目录使用macOS公开renamex_np/RENAME_EXCL原子排他发布，拒绝包括空目录在内的已有目标，无覆盖降级。 |
+| 原生配置 | 复用NSSavePanel、已有主题与图片基准选项，新增320–2048逻辑宽度和1×/2×，保存独立PNG偏好；首版不提供透明背景。 |
+
+没有新增Cargo包或版本、没有复制第三方源码/字体、没有引入浏览器或外部转换程序。现有系统能力已生成实际浅色/深色整图及编号分段，因此没有为凑选型而额外引入resvg/usvg等第二套SVG绘制器。不是声称任意SVG在任意平台都完全等价。系统ImageIO/Quartz接口依据沿用规划[A4]/[A8]及实际SDK构建，Windows继续后置；既有声明随包和完整发行/字体义务仍在5E核对。
+
+实际范围及仍未签收的PNG专项见`mac-group5-png.md`；本段记录技术选择，不代替验收通过结论。
