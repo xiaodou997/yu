@@ -2068,7 +2068,10 @@ func runSearchPanelSelfCheck(path: String) -> Never {
             sameLine[0].range != sameLine[1].range,
             "两行结果指向了同一处命中"
         )
-        precondition(panel.countTextForSelfCheck == "6 处匹配", panel.countTextForSelfCheck)
+        precondition(
+            panel.countTextForSelfCheck == L10n.format("%d matches", 6),
+            panel.countTextForSelfCheck
+        )
 
         // 2. 点第 N 行 → 选区落在第 N 处命中。判据来自 bridge.selection，
         //    与面板走的是两条路。选中而不是只放光标：Rust 侧的「当前命中」
@@ -2131,7 +2134,7 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         let none = try rowsFor("这四个字一定不在里面")
         precondition(none.isEmpty, "不该有匹配")
         precondition(panel.rowCountForSelfCheck == 0, "面板没有清空")
-        precondition(panel.countTextForSelfCheck == "没有匹配", panel.countTextForSelfCheck)
+        precondition(panel.countTextForSelfCheck == L10n.tr("No matches"), panel.countTextForSelfCheck)
 
         print(
             "Yu Search Panel self-check: matches=\(rows.count) "

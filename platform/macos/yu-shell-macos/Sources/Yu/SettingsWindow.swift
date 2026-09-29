@@ -10,44 +10,44 @@ final class NativeSettingsWindowController: NSWindowController, NSWindowDelegate
     private let columnWidths: [Double] = [0, 480, 600, 760, 900, 1100]
     private let imagePolicy = NSPopUpButton()
     private let imageDirectory = NSTextField(string: "")
-    private let autosave = NSButton(checkboxWithTitle: "自动保存已命名文档", target: nil, action: nil)
-    private let spelling = NSButton(checkboxWithTitle: "系统拼写检查", target: nil, action: nil)
-    private let focusMode = NSButton(checkboxWithTitle: "专注模式（突出当前段落）", target: nil, action: nil)
-    private let typewriter = NSButton(checkboxWithTitle: "打字机模式（输入时保持活动行居中）", target: nil, action: nil)
+    private let autosave = NSButton(checkboxWithTitle: L10n.tr("Automatically save named documents"), target: nil, action: nil)
+    private let spelling = NSButton(checkboxWithTitle: L10n.tr("System spelling check"), target: nil, action: nil)
+    private let focusMode = NSButton(checkboxWithTitle: L10n.tr("Focus Mode (highlight current paragraph)"), target: nil, action: nil)
+    private let typewriter = NSButton(checkboxWithTitle: L10n.tr("Typewriter Mode (keep active line centered while typing)"), target: nil, action: nil)
     private var themeObserver: NSObjectProtocol?
 
     init() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 520),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init(window: window)
-        window.title = "Yu 设置"
+        window.title = L10n.tr("Yu Settings")
         window.identifier = NSUserInterfaceItemIdentifier("yu-settings")
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
-        theme.addItems(withTitles: ["Yu（跟随系统）", "Github", "Night"])
+        theme.addItems(withTitles: [L10n.tr("Yu (Follow System)"), "Github", "Night"])
         fontSize.addItems(withTitles: fontSizes.map { "\(Int($0)) pt" })
-        columnWidth.addItems(withTitles: columnWidths.map { $0 == 0 ? "随主题" : "\(Int($0)) pt" })
-        fontSize.setAccessibilityLabel("正文字号")
-        columnWidth.setAccessibilityLabel("正文行宽")
+        columnWidth.addItems(withTitles: columnWidths.map { $0 == 0 ? L10n.tr("Follow Theme") : "\(Int($0)) pt" })
+        fontSize.setAccessibilityLabel(L10n.tr("Body Font Size"))
+        columnWidth.setAccessibilityLabel(L10n.tr("Reading Column Width"))
         fontSize.identifier = NSUserInterfaceItemIdentifier("yu-body-font-size")
         columnWidth.identifier = NSUserInterfaceItemIdentifier("yu-reading-column-width")
-        imagePolicy.addItems(withTitles: ["复制到文档资源目录", "引用原文件（绝对路径）"])
+        imagePolicy.addItems(withTitles: [L10n.tr("Copy to document assets directory"), L10n.tr("Reference original file (absolute path)")])
         imageDirectory.placeholderString = "assets"
-        imageDirectory.setAccessibilityLabel("图片资源目录")
+        imageDirectory.setAccessibilityLabel(L10n.tr("Image Assets Directory"))
         imageDirectory.identifier = NSUserInterfaceItemIdentifier("yu-image-directory")
-        theme.setAccessibilityLabel("正文主题")
-        imagePolicy.setAccessibilityLabel("图片导入方式")
+        theme.setAccessibilityLabel(L10n.tr("Body Theme"))
+        imagePolicy.setAccessibilityLabel(L10n.tr("Image Import Method"))
         for control in [theme, fontSize, columnWidth, imagePolicy, imageDirectory, autosave, typewriter, focusMode, spelling] as [NSControl] {
             control.target = self
             control.action = #selector(applyChanges(_:))
         }
         let grid = NSGridView(views: [
-            [NSTextField(labelWithString: "正文主题"), theme],
-            [NSTextField(labelWithString: "正文字号"), fontSize],
-            [NSTextField(labelWithString: "正文行宽"), columnWidth],
-            [NSTextField(labelWithString: "图片导入"), imagePolicy],
-            [NSTextField(labelWithString: "图片目录"), imageDirectory],
+            [NSTextField(labelWithString: L10n.tr("Body Theme")), theme],
+            [NSTextField(labelWithString: L10n.tr("Body Font Size")), fontSize],
+            [NSTextField(labelWithString: L10n.tr("Reading Column Width")), columnWidth],
+            [NSTextField(labelWithString: L10n.tr("Image Import")), imagePolicy],
+            [NSTextField(labelWithString: L10n.tr("Image Directory")), imageDirectory],
             [NSView(), autosave],
             [NSView(), typewriter],
             [NSView(), focusMode],
@@ -62,9 +62,9 @@ final class NativeSettingsWindowController: NSWindowController, NSWindowDelegate
         grid.cell(atColumnIndex: 1, rowIndex: 6).xPlacement = .leading
         grid.cell(atColumnIndex: 1, rowIndex: 7).xPlacement = .leading
         grid.cell(atColumnIndex: 1, rowIndex: 8).xPlacement = .leading
-        let note = NSTextField(wrappingLabelWithString: "图片目录相对于 Markdown 文件。剪贴板图片始终保存为资源文件；引用原文件时，请保留原图的位置。")
+        let note = NSTextField(wrappingLabelWithString: L10n.tr("The image directory is relative to the Markdown file. Clipboard images are always saved as asset files; when referencing the original file, keep the original image in place."))
         note.textColor = .secondaryLabelColor
-        let reset = NSButton(title: "恢复默认设置", target: self, action: #selector(resetPreferences(_:)))
+        let reset = NSButton(title: L10n.tr("Restore Defaults"), target: self, action: #selector(resetPreferences(_:)))
         let stack = NSStackView(views: [grid, note, reset])
         stack.orientation = .vertical
         stack.alignment = .leading

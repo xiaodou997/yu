@@ -32,10 +32,10 @@ final class FilePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate 
         outline.delegate = self
         outline.target = self
         outline.doubleAction = #selector(openSelected(_:))
-        outline.setAccessibilityLabel("文件")
+        outline.setAccessibilityLabel(L10n.tr("Files"))
         let menu = NSMenu()
-        menu.addItem(withTitle: "打开", action: #selector(openSelected(_:)), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "在 Finder 中显示", action: #selector(revealSelected(_:)), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L10n.tr("Open"), action: #selector(openSelected(_:)), keyEquivalent: "").target = self
+        menu.addItem(withTitle: L10n.tr("Show in Finder"), action: #selector(revealSelected(_:)), keyEquivalent: "").target = self
         outline.menu = menu
         view.documentView = outline
         view.hasVerticalScroller = true

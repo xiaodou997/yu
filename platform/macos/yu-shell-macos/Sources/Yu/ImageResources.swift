@@ -51,7 +51,7 @@ struct NativeImageResources {
                     let image = try reference ? referenceFile(url) : importFile(url, document: document, directory: directory)
                     prepared.append(Prepared(image: image, alternative: url.deletingPathExtension().lastPathComponent))
                 case .data(let data):
-                    prepared.append(Prepared(image: try importData(data, document: document, directory: directory), alternative: "图片"))
+                    prepared.append(Prepared(image: try importData(data, document: document, directory: directory), alternative: L10n.tr("Image")))
                 }
             }
             try publish(prepared)
@@ -85,17 +85,17 @@ struct NativeImageResources {
     struct FileFailure: LocalizedError {
         let name: String
         let reason: String
-        var errorDescription: String? { "未插入图片“\(name)”：\(reason)" }
+        var errorDescription: String? { L10n.format("Image “%@” was not inserted: %@", name, reason) }
     }
 
     enum Failure: LocalizedError {
         case invalidImage, tooLarge, invalidDirectory, unsupportedFile
         var errorDescription: String? {
             switch self {
-            case .invalidImage: return "无法读取这张图片，请检查文件是否完整。"
-            case .tooLarge: return "图片超过导入限制（128 MiB 或 2 亿像素）。"
-            case .invalidDirectory: return "图片目录必须是文档目录中的相对文件夹。"
-            case .unsupportedFile: return "请选择本地图片文件。"
+            case .invalidImage: return L10n.tr("Could not read this image. Check that the file is complete.")
+            case .tooLarge: return L10n.tr("Image exceeds import limits (128 MiB or 200 million pixels).")
+            case .invalidDirectory: return L10n.tr("Image directory must be a relative folder inside the document directory.")
+            case .unsupportedFile: return L10n.tr("Choose a local image file.")
             }
         }
     }

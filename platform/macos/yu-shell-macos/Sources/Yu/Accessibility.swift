@@ -78,25 +78,25 @@ final class YuAccessibilitySemanticElement: NSAccessibilityElement,
     override func accessibilityRoleDescription() -> String? {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .disclosure:
-            return "折叠内容"
+            return L10n.tr("Collapsed Content")
         case .heading:
-            return "标题（级别 \(node.level)）"
+            return L10n.format("Heading (Level %d)", Int(node.level))
         case .codeBlock, .codeSpan:
-            return "代码"
+            return L10n.tr("Code")
         case .blockQuote:
-            return "引用"
+            return L10n.tr("Quote")
         case .listItem:
-            return "列表项"
+            return L10n.tr("List Item")
         case .taskListItem:
-            return "任务列表项"
+            return L10n.tr("Task List Item")
         case .emphasis:
-            return "强调文本"
+            return L10n.tr("Emphasized Text")
         case .strong:
-            return "粗体文本"
+            return L10n.tr("Bold Text")
         case .link, .autolink, .referenceLink:
-            return "链接"
+            return L10n.tr("Link")
         case .image, .referenceImage:
-            return "图像"
+            return L10n.tr("Image")
         case .document, .paragraph, .none:
             return nil
         }
@@ -207,12 +207,12 @@ final class YuAccessibilityTableResizeElement: NSObject,
 
     @objc var accessibilityRole: NSAccessibility.Role { .splitter }
 
-    @objc var accessibilityRoleDescription: String? { "表格列分隔线" }
+    @objc var accessibilityRoleDescription: String? { L10n.tr("Table Column Separator") }
 
     @objc(accessibilityLabel) func accessibilityLabel() -> String? {
         let left = descriptor.index + 1
         let right = left + 1
-        return "表格第 \(left) 列与第 \(right) 列之间的分隔线"
+        return L10n.format("Separator between table columns %d and %d", left, right)
     }
 
     @objc var accessibilityTitle: String? { accessibilityLabel() }
@@ -221,7 +221,7 @@ final class YuAccessibilityTableResizeElement: NSObject,
     /// model. It gives VoiceOver context while the effective x coordinate
     /// remains owned by the Revision-bound Rust layout query.
     @objc(accessibilityValue) func accessibilityValue() -> Any? {
-        "第 \(descriptor.index + 1) / \(descriptor.columnCount) 列分隔线"
+        L10n.format("Column separator %d of %d", descriptor.index + 1, descriptor.columnCount)
     }
 
     @objc func accessibilityPerformIncrement() -> Bool {
