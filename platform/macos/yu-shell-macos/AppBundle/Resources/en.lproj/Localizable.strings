@@ -296,3 +296,10 @@
 "Choose File Sidebar Folder…" = "Choose File Sidebar Folder…";
 "Document Saved" = "Document Saved";
 "The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu.";
+"Allow Folder Access" = "Allow Folder Access";
+"Allow Access" = "Allow Access";
+"Select the requested folder or a folder containing it." = "Select the requested folder or a folder containing it.";
+"Allow access to this folder to load the document’s local images. Cancelling keeps the document open without those images." = "Allow access to this folder to load the document’s local images. Cancelling keeps the document open without those images.";
+"Allow access to the document folder to save image files beside the Markdown document." = "Allow access to the document folder to save image files beside the Markdown document.";
+"Allow access to the destination folder to copy the document’s local images." = "Allow access to the destination folder to copy the document’s local images.";
+"Allow access to the output folder to create the numbered PNG images." = "Allow access to the output folder to create the numbered PNG images.";

@@ -974,6 +974,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // A cancelled first save consumes the clipboard command but does not
         // publish source, copy resources or report a successful drag.
         if persistence.isUntitled, !saveDocument() { return false }
+        let access = SandboxDocumentAccess.shared
+        for input in inputs {
+            if case .file(let url) = input { try access.rememberSelection(url) }
+        }
+        let copiesFiles = NativeWritingPreferences.shared.imagePolicy != .reference || inputs.contains {
+            if case .data = $0 { return true }; return false
+        }
+        if copiesFiles, try !access.ensureDirectoryAccess(documentURL.deletingLastPathComponent(), writing: true,
+            message: L10n.tr("Allow access to the document folder to save image files beside the Markdown document.")) { return false }
         try NativeImageResources.withImports(inputs, document: documentURL,
             directory: NativeWritingPreferences.shared.imageDirectory,
             reference: NativeWritingPreferences.shared.imagePolicy == .reference) { images in
@@ -1032,6 +1041,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             } else if response != .alertFirstButtonReturn { return }
         }
         do {
+            if !persistence.isUntitled, try !SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) { return }
             printing = try NativePrintController(bridge: bridge, owner: window,
                 title: persistence.isUntitled ? L10n.tr("Untitled") : documentURL.deletingPathExtension().lastPathComponent,
                 untitled: persistence.isUntitled, resourceBase: base,
@@ -1057,6 +1067,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             return
         }
         guard let window = view.window else { return }
+        do {
+            if !persistence.isUntitled, try !SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) { return }
+        } catch { show(error); return }
         htmlExport?.cancelAndClose()
         let htmlOptions = pdf || png ? nil : NativeHTMLExportOptions(untitled: persistence.isUntitled)
         let pngOptions = png ? NativePNGExportOptions(untitled: persistence.isUntitled) : nil
@@ -1112,6 +1125,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
                 alert.runModal()
             }
             return true
+        } catch let error as CocoaError where error.code == .userCancelled {
+            return false
         } catch { show(error); return false }
     }
 
@@ -1120,6 +1135,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     func saveDocumentAs(to url: URL, replaceExisting: Bool) throws {
         try onValidateSaveDestination?(url)
         try textView.finishCompositionForFileOperation()
+        if SandboxDocumentAccess.shared.enabled {
+            let images = try bridge.localImageAccess()
+            guard try SandboxDocumentAccess.shared.ensureImageAccess(images.paths) else { throw CocoaError(.userCancelled) }
+            if images.relative, url.deletingLastPathComponent().standardizedFileURL != documentURL.deletingLastPathComponent().standardizedFileURL {
+                guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(url.deletingLastPathComponent(), writing: true,
+                    message: L10n.tr("Allow access to the destination folder to copy the document’s local images.")) else { throw CocoaError(.userCancelled) }
+            }
+        }
         surfaceCoordinator.detach()
         defer { scheduleVisualSubmit() }
         try persistence.saveAs(url, replaceExisting: replaceExisting)
@@ -3262,6 +3285,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @discardableResult
     private func presentDocument(bridge: StorageBridge, recovered: Bool = false) -> NSWindow {
+        if SandboxDocumentAccess.shared.enabled {
+            do { _ = try SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) }
+            catch { NSAlert(error: error).runModal() }
+        }
         let controller = DocumentViewController(bridge: bridge, recovered: recovered)
         configureDocumentForCheck?(controller)
         let window = NSWindow(contentViewController: controller)

@@ -903,6 +903,18 @@ final class StorageBridge {
         }
     }
 
+    struct LocalImageAccess: Decodable {
+        let paths: [String]
+        let relative: Bool
+    }
+
+    func localImageAccess() throws -> LocalImageAccess {
+        let json = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_local_image_access(handle, output, capacity, written)
+        }
+        return try JSONDecoder().decode(LocalImageAccess.self, from: Data(json.utf8))
+    }
+
     /// Capture on the owner thread. Rust rejects preedit rather than changing it.
     func beginHTMLExport(to url: URL, config: [String: Any]) throws -> NativeHTMLExportTask {
         let options = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])

@@ -890,6 +890,9 @@ typedef struct {
 } YuStorageImageProperties;
 int32_t yu_storage_session_image_properties(const YuStorageSession *session,
     uint64_t expected_revision, uint64_t source_utf16, YuStorageImageProperties *output);
+/* Canonical local image catalog as JSON: {paths: [absolute paths], relative: bool}. */
+int32_t yu_storage_session_copy_local_image_access(const YuStorageSession *session,
+    uint8_t *output, size_t capacity, size_t *written);
 /* Query YU_STORAGE_IMAGE_RESOURCE_* for the exact revision-bound image. */
 int32_t yu_storage_session_image_resource_status(const YuStorageSession *session,
     const YuStorageImageProperties *info, uint8_t *output);

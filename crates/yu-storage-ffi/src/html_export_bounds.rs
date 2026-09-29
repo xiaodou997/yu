@@ -307,28 +307,28 @@ fn png_task_warning_and_file_failure_contracts() {
 
 #[test]
 fn native_publisher_is_used_by_export_job_and_cannot_be_changed_after_commit() {
-    let _serial = EXPORT_TEST_SERIAL.lock().unwrap();
+    let _serial = EXPORT_TEST_SERIAL.lock().expect("host publication fixture");
     let root = std::env::temp_dir().join(format!(
         "yu-host-export-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("host publication fixture")
             .as_nanos()
     ));
-    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&root).expect("host publication fixture");
     let staging = root.join("staging");
-    std::fs::create_dir(&staging).unwrap();
+    std::fs::create_dir(&staging).expect("host publication fixture");
     let source = root.join("source.md");
     let output = root.join("output.html");
-    std::fs::write(&source, "# Host publication\n").unwrap();
+    std::fs::write(&source, "# Host publication\n").expect("host publication fixture");
     let job = HtmlJob::start(
         TextBuffer::new("# Host publication\n").snapshot(),
         source.clone(),
         &output,
         &json!({"referenceDay":20724}),
     )
-    .unwrap();
+    .expect("host publication fixture");
     wait(&job);
     let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = called.clone();
@@ -340,11 +340,12 @@ fn native_publisher_is_used_by_export_job_and_cannot_be_changed_after_commit() {
             std::fs::rename(from, to).map_err(|error| error.to_string())
         }),
     })
-    .unwrap();
-    job.commit(false).unwrap();
+    .expect("host publication fixture");
+    job.commit(false).expect("host publication fixture");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let status: Value = serde_json::from_str(&job.status_json()).unwrap();
+        let status: Value =
+            serde_json::from_str(&job.status_json()).expect("host publication fixture");
         if status["phase"] == "completed" {
             break;
         }
@@ -355,11 +356,11 @@ fn native_publisher_is_used_by_export_job_and_cannot_be_changed_after_commit() {
     assert!(called.load(Ordering::SeqCst));
     assert!(
         std::fs::read_to_string(output)
-            .unwrap()
+            .expect("host publication fixture")
             .contains("Host publication")
     );
     assert_eq!(
-        std::fs::read_to_string(source).unwrap(),
+        std::fs::read_to_string(source).expect("host publication fixture"),
         "# Host publication\n"
     );
     assert!(
@@ -370,5 +371,5 @@ fn native_publisher_is_used_by_export_job_and_cannot_be_changed_after_commit() {
         .is_err()
     );
     drop(job);
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root).expect("host publication fixture");
 }

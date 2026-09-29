@@ -106,3 +106,58 @@ final signed release from its committed source before upload.
 Segmented PNG directories, external relative-image access/import, and real
 system printing remain separate sandbox acceptance items. These successes do
 not close those items. No new system permissions or settings were enabled.
+
+
+## Sandbox resource and release-gate follow-up (September 30)
+
+The external resource fixture contains a table, inline/block math, Mermaid,
+relative PNG, footnote, Chinese, English and bidirectional text. Candidate
+`artifacts/appstore-resources-v1/Yu.app` passed these real-panel checks:
+
+- Opening the Markdown requests its image folder through NSOpenPanel. Only the
+  disposable `Public/YuAppStoreFinalAcceptance` folder was selected.
+- HTML output embeds the local PNG and no longer contains the unreadable-image
+  diagnostic. The output is 26,095 bytes. PDF output is 91,048 bytes.
+- A 700-paragraph document exported as five numbered PNGs at 2x. Their dimensions
+  are 1600 x 10448, 1600 x 10462 (three files), and 1600 x 8888.
+- Quit/relaunch and Recent Open restore the folder bookmark alongside the file
+  bookmark. The local feather image renders without another permission prompt.
+- Save As into a new directory copies the relative image; both Markdown and image
+  bytes match the source. Inserting another image copies it into `assets`; undo,
+  redo, and a second save work. The original 579-byte fixture remains unchanged.
+
+The resource catalog comes from canonical Markdown references. Code examples and
+remote URLs do not trigger local folder requests. PNG directory destination
+capture now waits until split confirmation, permitting a narrowly scoped folder
+grant before publication. Cancellation and existing-output protection remain
+required gates.
+
+Real system printing exposed a missing `com.apple.security.print` entitlement.
+It has been added only to the main app; the helper keeps sandbox inheritance.
+This is the documented Apple sandbox permission for document printing:
+https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.print
+Signed candidate `artifacts/appstore-resources-v3/Yu.app` passed all eight
+native system-print checks (whole/range/landscape, source/image aliases, write
+denial, target change, cancellation), with zero physical jobs submitted. The
+actual print panel retest is pending because the Mac locked during UI acceptance.
+
+Rust workspace tests passed: 1,615 passed and 7 ignored. All-target clippy passes
+with warnings denied after replacing unchecked test unwraps with assertions.
+The dependency audit now records the existing shared syntax/resource dependencies
+of yu-export, and the geometry audit records the existing C ABI document-space
+source-range bounds. The macOS export module states its platform cfg internally
+as well as at its declaration so the static dependency audit recognizes it.
+All dependency/FFI/geometry checks and 19 clean-build native self-checks passed.
+These fixes do not disable or bypass a check.
+
+Signed candidate v3 also passed all ten native PNG cases: light 1x/2x, dark,
+split cancel/confirm/table, oversized indivisible table, existing directory,
+source alias, and cancellation. Existing outputs and source/history were
+preserved in all refusal cases. Native checks restore only previously selected
+Powerbox grants; the sandbox stays enabled. Reports are retained in
+`artifacts/appstore-proof/sandbox-png-v3-report.json` and
+`artifacts/appstore-proof/sandbox-print-v3-report.json`.
+
+Generate the formal package from a clean commit after this entry. Store
+screenshots, build upload, review submission, and the locked-screen UI print
+retest are separate remaining items; do not label the app submitted or published.

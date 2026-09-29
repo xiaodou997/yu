@@ -100,7 +100,9 @@ ALLOWED: dict[str, set[str]] = {
         "yu-syntax",
         "yu-text",
     },
-    "yu-export": {"yu-core", "yu-markdown", "yu-text"},
+    # Export reads shared syntax nodes and resource paths/budgets; these lower
+    # layers do not depend on export, so the E2 dependency direction is preserved.
+    "yu-export": {"yu-assets", "yu-core", "yu-markdown", "yu-syntax", "yu-text"},
     # Resource path decoding is shared with the renderer for portable Save As.
     "yu-storage": {"yu-assets", "yu-core", "yu-editor", "yu-text"},
     "yu-workspace": {

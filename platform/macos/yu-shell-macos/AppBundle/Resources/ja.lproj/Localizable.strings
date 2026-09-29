@@ -296,3 +296,10 @@
 "Choose File Sidebar Folder…" = "ファイルサイドバーのフォルダを選択…";
 "Document Saved" = "書類を保存しました";
 "The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "書類は保存されましたが、アクセス権を記憶できませんでした。Yu を再起動した後、ファイルを再度選択する必要がある場合があります。";
+"Allow Folder Access" = "フォルダへのアクセスを許可";
+"Allow Access" = "アクセスを許可";
+"Select the requested folder or a folder containing it." = "指定されたフォルダ、またはその親フォルダを選択してください。";
+"Allow access to this folder to load the document’s local images. Cancelling keeps the document open without those images." = "書類のローカル画像を読み込むため、このフォルダへのアクセスを許可してください。キャンセルしても書類は開きますが、これらの画像は読み込まれません。";
+"Allow access to the document folder to save image files beside the Markdown document." = "Markdown 書類と同じフォルダに画像を保存するため、書類のフォルダへのアクセスを許可してください。";
+"Allow access to the destination folder to copy the document’s local images." = "書類のローカル画像をコピーするため、保存先フォルダへのアクセスを許可してください。";
+"Allow access to the output folder to create the numbered PNG images." = "連番の PNG 画像を作成するため、出力先フォルダへのアクセスを許可してください。";

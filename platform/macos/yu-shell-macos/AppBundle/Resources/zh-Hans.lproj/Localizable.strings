@@ -296,3 +296,10 @@
 "Choose File Sidebar Folder…" = "选择文件侧栏文件夹…";
 "Document Saved" = "文档已保存";
 "The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "文档已保存，但未能记住访问权限。重新启动 Yu 后，可能需要重新选择该文件。";
+"Allow Folder Access" = "允许访问文件夹";
+"Allow Access" = "允许访问";
+"Select the requested folder or a folder containing it." = "请选择指定文件夹或包含它的上级文件夹。";
+"Allow access to this folder to load the document’s local images. Cancelling keeps the document open without those images." = "允许访问此文件夹以加载文档中的本地图片。取消后仍可打开文档，但这些图片不会加载。";
+"Allow access to the document folder to save image files beside the Markdown document." = "允许访问文档文件夹，以在 Markdown 文档旁保存图片文件。";
+"Allow access to the destination folder to copy the document’s local images." = "允许访问目标文件夹，以复制文档使用的本地图片。";
+"Allow access to the output folder to create the numbered PNG images." = "允许访问输出文件夹，以创建按顺序编号的 PNG 图片。";

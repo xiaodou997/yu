@@ -4045,6 +4045,39 @@ pub unsafe extern "C" fn yu_storage_session_image_properties(
     YU_STORAGE_OK
 }
 
+/// Local image paths come from the canonical Markdown model, including reference
+/// and HTML images. Hosts use them to request sandbox access without parsing text.
+/// # Safety
+/// Live session; writable output buffer/count following the size-query protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_local_image_access(
+    session: *const YuStorageSession,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let images = match session.session.document().editor().image_references() {
+        Ok(images) => images,
+        Err(error) => return status_from_editor_error(error),
+    };
+    let mut paths = std::collections::BTreeSet::new();
+    let mut relative = false;
+    for image in images {
+        if let Ok(location) =
+            yu_assets::ImageLocation::resolve(session.session.path(), &image.destination_text)
+        {
+            paths.insert(location.path().to_string_lossy().into_owned());
+            relative |= yu_assets::ImageLocation::resolve("document.md", &image.destination_text)
+                .is_ok_and(|path| !path.path().is_absolute());
+        }
+    }
+    let json = serde_json::json!({"paths":paths,"relative":relative}).to_string();
+    write_bytes(json.as_bytes(), output, capacity, written)
+}
+
 /// Query the resource state of an exact, revision-bound image identity.
 /// # Safety
 /// Session and info must be live; output must be writable.
@@ -17185,6 +17218,49 @@ mod tests {
         );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn local_image_access_catalog_uses_canonical_references_and_ignores_code_and_remote() {
+        let path = std::env::temp_dir().join(format!("yu-image-access-{}.md", temp_id()));
+        let source = "![one](assets/a%20b.png)\n\n![ref][p]\n\n[p]: photo.png\n\n<img src=\"html.png\">\n\n![remote](https://example.com/a.png)\n\n`![code](ignored.png)`\n";
+        fs::write(&path, source).expect("valid image access fixture");
+        let session = new_storage_session(
+            DocumentEditorSession::open(&path).expect("valid image access fixture"),
+        );
+        let mut size = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_local_image_access(&*session, ptr::null_mut(), 0, &mut size)
+            },
+            YU_STORAGE_OK
+        );
+        let mut bytes = vec![0; size];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_local_image_access(
+                    &*session,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut size,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let data: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("valid image access fixture");
+        let paths = data["paths"]
+            .as_array()
+            .expect("valid image access fixture");
+        assert_eq!(paths.len(), 3);
+        for name in ["assets/a b.png", "photo.png", "html.png"] {
+            assert!(paths.contains(&serde_json::json!(
+                path.parent().expect("valid image access fixture").join(name).to_string_lossy()
+            )));
+        }
+        assert_eq!(data["relative"], true);
+        assert_eq!(session.session.snapshot().as_str(), source);
+        fs::remove_file(path).expect("valid image access fixture");
     }
 
     #[test]

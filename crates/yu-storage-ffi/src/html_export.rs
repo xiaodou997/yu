@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! macOS HTML export task. No mutable editor/session crosses this boundary.
 //! Every task owns its snapshot, resource bytes, helper and destination lease.
 use serde_json::{Value, json};
@@ -31,7 +33,7 @@ struct Ready {
     document: HtmlDocument,
     pdf: Option<yu_render_macos::RenderedPdf>,
     png: Option<yu_render_macos::PngPlan>,
-    segments_destination: Option<Destination>,
+    segments_destination: Option<PathBuf>,
     destination: Destination,
     protected: Vec<ProtectedFile>,
 }
@@ -240,10 +242,8 @@ impl HtmlJob {
                             state.output_path = Some(
                                 ready
                                     .segments_destination
-                                    .as_ref()
-                                    .unwrap_or(&ready.destination)
-                                    .path()
-                                    .to_path_buf(),
+                                    .clone()
+                                    .unwrap_or_else(|| ready.destination.path().to_path_buf()),
                             );
                             if png.sizes.len() > 1 {
                                 state.phase = "split";
@@ -346,9 +346,10 @@ impl HtmlJob {
                 .ok_or("PNG文件名无效")?
                 .to_string_lossy();
             let path = self.target_path.with_file_name(format!("{name}-images"));
-            let target = Destination::capture(&path, false)?;
-            target.validate(&resources.images.protected)?;
-            Some(target)
+            // The host may need directory consent for this sibling output.
+            // Capture it after split confirmation, while still validating the
+            // original parent identity and protected files before publication.
+            Some(path)
         } else {
             None
         };
@@ -541,7 +542,9 @@ impl HtmlJob {
             state.phase = "committing";
             Ok(state)
         };
-        if let Some(directory) = ready.segments_destination {
+        if let Some(path) = ready.segments_destination {
+            ready.destination.validate(&ready.protected)?;
+            let directory = Destination::capture(&path, false)?;
             directory.publish_png_directory(
                 count,
                 &ready.protected,

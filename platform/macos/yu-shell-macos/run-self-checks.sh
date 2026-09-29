@@ -40,7 +40,7 @@ swiftc Sources/Yu/NativeSpelling.swift Tests/NativeSpellingChecks.swift -o /tmp/
 swiftc Sources/Yu/Localization.swift Sources/Yu/ImageResources.swift Sources/Yu/WritingPreferences.swift Tests/ImageResourceChecks.swift -o /tmp/yu-image-resource-checks
 /tmp/yu-image-resource-checks
 
-swiftc Sources/Yu/SandboxDocumentAccess.swift Tests/SandboxDocumentAccessChecks.swift -o /tmp/yu-sandbox-access-checks
+swiftc Sources/Yu/Localization.swift Sources/Yu/SandboxDocumentAccess.swift Tests/SandboxDocumentAccessChecks.swift -o /tmp/yu-sandbox-access-checks
 /tmp/yu-sandbox-access-checks
 
 # --build 是增量构建。删除一个 C 类型或 FFI 函数后，SwiftPM 可能不会重编引用
