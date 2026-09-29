@@ -162,15 +162,30 @@ class StoreRelease:
         self.record_app()
 
     def package(self, identity):
-        self.load('signed')
-        self.data.update(stage='packaging', installer_signing_identity=identity)
-        self.save()
-        self.run('package', 'productbuild', '--component', self.app, '/Applications',
-                 '--sign', identity, '--timestamp', self.pkg)
+        self.data = json.loads(self.manifest.read_text())
+        stage = self.data['stage']
+        if stage not in {'signed', 'packaging'}:
+            raise ValueError(f'Expected stage signed or packaging, found {stage}')
+        self.load(stage)
+        if stage == 'signed':
+            self.data.update(stage='packaging', installer_signing_identity=identity)
+            self.save()
+            self.run('package', 'productbuild', '--component', self.app, '/Applications',
+                     '--sign', identity, '--timestamp', self.pkg)
+        elif self.data.get('installer_signing_identity') != identity or not self.pkg.is_file():
+            raise ValueError('Cannot resume packaging with a different identity or missing package')
         self.run('verify-package', 'pkgutil', '--check-signature', self.pkg)
         details = (self.directory / 'verify-package.log').read_text()
-        if 'Status: signed by a certificate trusted by Mac OS X' not in details:
-            raise ValueError('Installer signature was not trusted')
+        trusted_statuses = (
+            'Status: signed by a certificate trusted by Mac OS X',
+            'Status: signed by a developer certificate issued by Apple (Development)',
+        )
+        if not any(status in details for status in trusted_statuses):
+            raise ValueError('Installer signature was not Apple-trusted')
+        if 'Signed with a trusted timestamp on:' not in details:
+            raise ValueError('Installer signature has no trusted timestamp')
+        if 'Apple Root CA' not in details:
+            raise ValueError('Installer signature has no Apple root')
         if self.data['team_id'] not in details:
             raise ValueError('Installer signature belongs to the wrong team')
         self.data.update(stage='packaged', package_sha256=digest(self.pkg),
