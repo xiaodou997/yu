@@ -1,6 +1,6 @@
 # 第五组依赖与系统能力决策
 
-日期：2026-09-28；5A已结项，5B已接通首批PDF链路、尚未结项。依据用户 v1.2，先复用已有代码；系统 API 与成熟开源同按职责评估，不追求全部原生/全部 Rust。Windows 后置。本记录不等于第五组完整分发许可审计。
+日期：2026-09-28 起，2026-09-29 完成 5E。依据用户 v1.2，优先复用已有代码；系统 API 与成熟开源按职责评估，不追求全部原生或全部 Rust。Windows 后置。5E 已完成工程级最终分发依赖/许可/字体资源核对；这仍不是法律意见。
 
 ## 5A 采用的组合
 
@@ -69,3 +69,12 @@ Cargo.lock 仅增加 yu-export 对上述已有包及 yu-assets/yu-syntax 的依�
 没有新增Cargo包或版本、没有复制第三方源码/字体、没有引入浏览器或外部转换程序。现有系统能力已生成实际浅色/深色整图及编号分段，因此没有为凑选型而额外引入resvg/usvg等第二套SVG绘制器。不是声称任意SVG在任意平台都完全等价。系统ImageIO/Quartz接口依据沿用规划[A4]/[A8]及实际SDK构建，Windows继续后置；既有声明随包和完整发行/字体义务仍在5E核对。
 
 实际范围及仍未签收的PNG专项见`mac-group5-png.md`；本段记录技术选择，不代替验收通过结论。
+## 5E 最终发行资源核对
+
+冻结 Release 的主程序 SHA256 为 `e26de688cdf3c16d511ae4d9a2ab3c264574056a48272c3327e7c31b0ea800ae`。最终 `verify-macos-app.py` 除原有架构、最低系统、签名和浏览器运行时拒绝外，还逐树核对 `Fonts`、`HTMLExportLicenses`、`PDFExportLicenses`，并验证 NativeRenderer 的精选声明、锁定 Cargo 闭包清单和汇编许可文本。
+
+5E 发现 helper 通过 `typst-assets 0.15.1` 的 `fonts` feature 内嵌字体，但此前没有把该包完整 NOTICE 随应用分发。最终补入原始 `TypstAssets-Apache-2.0.txt` 与 `TypstAssets-NOTICE.txt`；NOTICE 中的 Libertinus、DejaVu/Arev、Foxit、NewComputerModern/GPL3+Font Exception+Distribution Exception 等条款保持上游原文。
+
+`tools/generate-native-renderer-licenses.py` 从 `Cargo.lock` 和 aarch64-apple-darwin metadata 生成实际 `yu-document-renderer` 依赖闭包：324 个外部 package 全部具有 Cargo license expression；31 个发布包根目录没有独立许可文本，清单显式记录而不伪造文件。可获得的 516 份 LICENSE/COPYING/NOTICE 类文件汇编成 2,754,345 字节的 `RustDependencyLicenses.txt`，`RustDependencies.json` 同时记录版本、source、features、许可表达式和文件哈希。
+
+应用直接分发的 Open Sans 六个静态字体仍固定来源 commit、逐文件 SHA256 与 SIL OFL 1.1。HTML/PDF 的既有许可资源目录与源码资源逐字节一致。最终构建审计实际通过；第五组工程分发核对据此关闭。公共发布前如需法律合规意见，仍应由对应发行流程处理。
