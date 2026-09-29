@@ -1729,6 +1729,62 @@ pub unsafe extern "C" fn yu_storage_session_html_export_start(
     }
 }
 
+/// Configure native sandbox publication before commit. The callback may run on
+/// a worker thread and must remain callable for the task lifetime. It must move
+/// the staged file, obey the captured overwrite flag, and retain no pointers.
+/// # Safety
+/// Live task; readable UTF-8 staging path; a thread-safe callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_set_publisher(
+    task: *const YuStorageHtmlExport,
+    staging: *const u8,
+    staging_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize, u8) -> i32>,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let staging = match read_utf8(staging, staging_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let publication = yu_export::portable::HostPublication {
+            staging_directory: staging,
+            replace: Box::new(move |source, target, overwrite| {
+                let source = source.to_str().ok_or("Invalid staging path")?;
+                let target = target.to_str().ok_or("Invalid destination path")?;
+                let result = replace(
+                    source.as_ptr(),
+                    source.len(),
+                    target.as_ptr(),
+                    target.len(),
+                    u8::from(overwrite),
+                );
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("Native export publication failed ({result})"))
+                }
+            }),
+        };
+        match task.job.set_publication(publication) {
+            Ok(()) => YU_STORAGE_OK,
+            Err(_) => YU_STORAGE_INVALID_STATE,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, staging, replace);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
 /// Copy a bounded JSON stage/status snapshot. Supports ordinary ABI size query.
 /// # Safety
 /// Task remains alive throughout the call; writable output buffer/count.

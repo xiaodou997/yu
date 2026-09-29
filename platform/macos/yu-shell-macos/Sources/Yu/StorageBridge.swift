@@ -4,6 +4,34 @@ import Foundation
 import UniformTypeIdentifiers
 import YuStorageFFI
 
+private let sandboxExportReplacement: YuStorageExportReplaceCallback = { stagedBytes, stagedLength, targetBytes, targetLength, overwrite in
+    guard let stagedBytes, let targetBytes, overwrite <= 1 else { return EINVAL }
+    return autoreleasepool {
+        let staged = URL(fileURLWithPath: String(decoding: UnsafeBufferPointer(start: stagedBytes, count: stagedLength), as: UTF8.self))
+        let target = URL(fileURLWithPath: String(decoding: UnsafeBufferPointer(start: targetBytes, count: targetLength), as: UTF8.self))
+        do {
+            if overwrite == 1 {
+                var coordinationError: NSError?
+                var result: Result<Void, Error>?
+                NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: target,
+                    options: .forReplacing, error: &coordinationError) { coordinated in
+                    result = Result { _ = try FileManager.default.replaceItemAt(coordinated, withItemAt: staged) }
+                }
+                if let coordinationError { throw coordinationError }
+                guard let result else { throw CocoaError(.fileWriteUnknown) }
+                try result.get()
+            } else {
+                // moveItem refuses a destination that appeared after Rust's last check.
+                try FileManager.default.moveItem(at: staged, to: target)
+            }
+            return 0
+        } catch {
+            NSLog("Yu sandbox export publication failed: %@", String(describing: error))
+            return EIO
+        }
+    }
+}
+
 private let sandboxReplacement: YuStorageReplaceCallback = { stagedBytes, stagedLength, targetBytes, targetLength in
     guard let stagedBytes, let targetBytes else { return EINVAL }
     let stagedPath = String(decoding: UnsafeBufferPointer(start: stagedBytes, count: stagedLength), as: UTF8.self)
@@ -893,6 +921,22 @@ final class StorageBridge {
                 ? L10n.tr("Two export tasks are already active. Finish or cancel one first.")
                 : L10n.format("Could not start HTML export (%d).", status)
             throw NSError(domain: "Yu.Export", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        if SandboxDocumentAccess.shared.enabled {
+            do {
+                let staging = NativeDocumentLocations.current.root.appendingPathComponent("ExportStaging", isDirectory: true)
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+                let bytes = Array(staging.path.utf8)
+                let configured = bytes.withUnsafeBufferPointer {
+                    yu_storage_html_export_set_publisher(task, $0.baseAddress, $0.count, sandboxExportReplacement)
+                }
+                guard configured == StorageStatus.ok else { throw BridgeError.operation(configured) }
+            } catch {
+                yu_storage_html_export_cancel(task)
+                yu_storage_html_export_destroy(task)
+                throw error
+            }
         }
         return NativeHTMLExportTask(handle: task)
     }

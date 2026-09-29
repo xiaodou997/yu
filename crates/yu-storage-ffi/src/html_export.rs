@@ -14,8 +14,8 @@ use yu_export::document::{
     ExportImage, HtmlDocument, HtmlOptions, HtmlResources, ResourceError, export_html_document,
 };
 use yu_export::portable::{
-    Destination, FrozenImages, MAX_IMAGE_PIXELS, ProtectedFile, data_image, validate_svg,
-    validate_svg_resource,
+    Destination, FrozenImages, HostPublication, MAX_IMAGE_PIXELS, ProtectedFile, data_image,
+    validate_svg, validate_svg_resource,
 };
 use yu_markdown::{EmbeddedKind, EmbeddedSpan};
 use yu_text::TextSnapshot;
@@ -36,6 +36,7 @@ struct Ready {
     protected: Vec<ProtectedFile>,
 }
 struct State {
+    publication: Option<Arc<HostPublication>>,
     phase: &'static str,
     message: String,
     warnings: Vec<String>,
@@ -69,6 +70,20 @@ impl Drop for HtmlJob {
     }
 }
 impl HtmlJob {
+    pub fn set_publication(&self, publication: HostPublication) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let before_publication = matches!(
+            state.phase,
+            "preparing" | "ready" | "warnings" | "split" | "failed"
+        ) || (self.printing
+            && matches!(state.phase, "completed" | "completed_with_warnings"));
+        if state.publication.is_some() || !before_publication {
+            return Err("导出提交方式已经固定".into());
+        }
+        state.publication = Some(Arc::new(publication));
+        Ok(())
+    }
+
     pub fn start(
         snapshot: TextSnapshot,
         source_path: PathBuf,
@@ -105,6 +120,7 @@ impl HtmlJob {
             printing: pdf_settings.is_some()
                 && config.get("printPreparation").and_then(Value::as_bool) == Some(true),
             state: Mutex::new(State {
+                publication: None,
                 phase: "preparing",
                 message: "准备文档快照".into(),
                 warnings: Vec::new(),
@@ -420,7 +436,8 @@ impl HtmlJob {
                 return Err("打印内容尚未完成或已经取消".into());
             }
             // NSSavePanel in NSPrintPanel already obtained overwrite consent.
-            let target = Destination::capture(path, true)?;
+            let mut target = Destination::capture(path, true)?;
+            target.set_publication(state.publication.clone());
             target.validate(&state.print_protected)?;
             state.print_target = Some(target);
             state.phase = "print_ready";
@@ -565,7 +582,8 @@ impl HtmlJob {
             if !matches!(state.phase, "ready" | "warnings" | "split") {
                 return Err("导出尚未准备完成".into());
             }
-            let ready = state.ready.take().ok_or("导出任务结果丢失")?;
+            let mut ready = state.ready.take().ok_or("导出任务结果丢失")?;
+            ready.destination.set_publication(state.publication.clone());
             state.phase = "writing";
             state.message = "写入并检查输出文件".into();
             ready

@@ -238,6 +238,11 @@ typedef struct YuStorageHtmlExport YuStorageHtmlExport;
 int32_t yu_storage_session_html_export_start(const YuStorageSession *session,
     const uint8_t *target, size_t target_length, const uint8_t *config,
     size_t config_length, YuStorageHtmlExport **output);
+/* Thread-safe callback; overwrite is the captured consent. No pointer retention. */
+typedef int32_t (*YuStorageExportReplaceCallback)(const uint8_t *, size_t,
+    const uint8_t *, size_t, uint8_t);
+int32_t yu_storage_html_export_set_publisher(const YuStorageHtmlExport *task,
+    const uint8_t *staging, size_t staging_length, YuStorageExportReplaceCallback replace);
 int32_t yu_storage_html_export_copy_status(const YuStorageHtmlExport *task,
     uint8_t *output, size_t capacity, size_t *written);
 int32_t yu_storage_html_export_commit(const YuStorageHtmlExport *task, uint8_t allow_warnings);

@@ -70,5 +70,39 @@ The existing Developer ID DMG pipeline and artifact are separate and were not
 modified by this draft. The Mac App Store needs its own sandboxed package; the
 notarized DMG is not an App Store build.
 
-Current UI handoff: the signed candidate is waiting in the real PDF export panel
-for `Public/YuAppStoreSaveAsCheck.pdf`. External PDF export is not yet accepted.
+## Sandbox export acceptance (September 30)
+
+The first external PDF export failed before publication and left the original
+99-byte Markdown file unchanged. Its portable writer attempted to create a
+sibling temporary file outside the selected-file sandbox grant.
+
+The sandbox host now configures a per-task publisher: Rust stages complete bytes
+in the application container, retains destination/protected-file validation and
+the cancellation commit guard, then invokes Foundation to publish. The callback
+receives the captured overwrite decision. New-file publication refuses an output
+that appeared after the final validation. Existing output uses coordinated
+Foundation replacement. The unsandboxed export path is unchanged.
+
+Signed candidate `artifacts/appstore-export-v1/Yu.app` passed:
+
+- Real NSSavePanel export to `Public/YuAppStoreSaveAsCheck.pdf` and confirmed
+  replacement of that test PDF. PDFKit independently read one A4 page containing
+  the expected document text; the output is 13,788 bytes.
+- Real HTML export to the same directory; the 2,438-byte document contains the
+  expected title and valid HTML declaration.
+- Real single-PNG export to the same directory; ImageIO decoded 800 by 186 pixels,
+  and the rendered image was visually checked.
+- Signed sandbox PDF self-check in the container: snapshot text, page dimensions,
+  source/selection/history preservation, and continued editing/undo passed.
+- 33 export unit tests and 101 existing FFI unit tests; 3 new host-publication
+  tests; export safety/write-failure tests; one additional full-job publisher
+  test. Clippy with warnings denied passed for both affected libraries.
+
+After building this candidate, the source also permits publisher registration
+when print preparation has already completed, before any print publication.
+The updated Rust source and full-job test compiled successfully. Rebuild the
+final signed release from its committed source before upload.
+
+Segmented PNG directories, external relative-image access/import, and real
+system printing remain separate sandbox acceptance items. These successes do
+not close those items. No new system permissions or settings were enabled.
