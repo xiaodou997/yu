@@ -989,6 +989,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         _ = chooseSaveDestination()
     }
 
+    @objc fileprivate func chooseFilePanelFolderFromMenu(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = "选择文件侧栏文件夹"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = persistence.isUntitled ? nil : documentURL.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try SandboxDocumentAccess.shared.rememberSelection(url)
+            filePanel.setDirectory(url)
+            sidebarTabs.selectedSegment = 0
+            sidebarHidden = false
+            updateSidebarVisibility()
+        } catch { show(error) }
+    }
+
     @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) { exportDocument(pdf: false) }
     @objc fileprivate func exportPDFFromMenu(_ sender: Any?) { exportDocument(pdf: true) }
     @objc fileprivate func exportPNGFromMenu(_ sender: Any?) { exportDocument(pdf: false, png: true) }
@@ -1085,6 +1102,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         else { destination = panel.runModal() == .OK ? panel.url : nil }
         guard let url = destination else { return false }
         do {
+            try SandboxDocumentAccess.shared.rememberSelection(url)
             try saveDocumentAs(to: url, replaceExisting: true)
             return true
         } catch { show(error); return false }
@@ -3322,6 +3340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return existing
         }
         do {
+            let url = try SandboxDocumentAccess.shared.accessibleURL(url)
             if let record = try pendingRecovery(for: url) {
                 consideredRecoveryFiles.insert(record)
                 if let target = try? StorageBridge.recoveryTarget(at: record), identity(target) == identity(url) {
@@ -3423,7 +3442,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls { _ = openDocument(at: url) }
+        for url in urls {
+            do { try SandboxDocumentAccess.shared.rememberSelection(url) }
+            catch { NSAlert(error: error).runModal(); continue }
+            _ = openDocument(at: url)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -3443,7 +3466,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls { openDocument(at: url) }
+        for url in panel.urls {
+            do { try SandboxDocumentAccess.shared.rememberSelection(url) }
+            catch { NSAlert(error: error).runModal(); continue }
+            _ = openDocument(at: url)
+        }
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
@@ -3553,6 +3580,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
+        let chooseFolder = NSMenuItem(title: "选择文件侧栏文件夹…",
+            action: #selector(DocumentViewController.chooseFilePanelFolderFromMenu(_:)), keyEquivalent: "")
+        chooseFolder.target = controller
+        chooseFolder.isEnabled = controller != nil
+        fileMenu.addItem(chooseFolder)
         let exportHTML = NSMenuItem(title: "导出 HTML…", action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
         exportHTML.target = controller
         exportHTML.isEnabled = controller != nil
