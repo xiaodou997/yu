@@ -521,6 +521,18 @@ pub struct YuStorageBlockCaret {
     pub shaped: u8,
 }
 
+/// Document-space bounds of a source range, including shaped clusters in
+/// intermediate visual lines and table cells.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageSourceBounds {
+    pub revision: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// Revision-bound shaped caret geometry and the absolute document scroll
 /// target required to reveal it in a native visual viewport.
 #[repr(C)]
@@ -6547,6 +6559,183 @@ pub unsafe extern "C" fn yu_storage_session_source_caret(
             *output = caret;
             YU_STORAGE_OK
         },
+        Err(status) => status,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn include_source_bounds(
+    bounds: &mut Option<(f32, f32, f32, f32)>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Result<(), i32> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width < 0.0
+        || height <= 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let right = x + width.max(1.0);
+    let bottom = y + height;
+    if !right.is_finite() || !bottom.is_finite() {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    *bounds = Some(match *bounds {
+        Some((left, top, old_right, old_bottom)) => (
+            left.min(x),
+            top.min(y),
+            old_right.max(right),
+            old_bottom.max(bottom),
+        ),
+        None => (x, y, right, bottom),
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_source_range_bounds(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    size: f32,
+    max_width: f32,
+) -> Result<YuStorageSourceBounds, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    if start_utf16 > end_utf16 {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    }
+    let (shaper, metrics, _config) = macos_query_text_layout(
+        session,
+        size,
+        max_width,
+        session.session.viewport_config().layout().theme(),
+    )?;
+    macos_publish_viewport_config(
+        session,
+        max_width,
+        metrics,
+        session.session.viewport_config().layout().theme(),
+    )?;
+    let source = session.session.snapshot();
+    let start = source
+        .byte_offset_for_utf16(Utf16Offset::new(start_utf16))
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let end = source
+        .byte_offset_for_utf16(Utf16Offset::new(end_utf16))
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let mut bounds = None;
+    if session.session.block_count() == 0 {
+        include_source_bounds(&mut bounds, 0.0, 0.0, 1.0, metrics.line_height())?;
+    } else {
+        if start < end {
+            for index in 0..session.session.block_count() {
+                let Some((block_source, _)) = session.session.block_metadata(index) else {
+                    return Err(YU_STORAGE_INVALID_SELECTION);
+                };
+                if block_source.start() >= end || block_source.end() <= start {
+                    continue;
+                }
+                let geometry = macos_query_layout_snapshot(session, block_source.start(), &shaper)?;
+                let placed = geometry.block(index).ok_or(YU_STORAGE_INVALID_SELECTION)?;
+                for cluster in placed.layout().clusters() {
+                    let span = cluster.source();
+                    if span.start() < end && span.end() > start {
+                        include_source_bounds(
+                            &mut bounds,
+                            cluster.x(),
+                            placed.content_y() + cluster.y(),
+                            cluster.width(),
+                            cluster.line_height(),
+                        )?;
+                    }
+                }
+            }
+        }
+        for position in [start_utf16, end_utf16] {
+            let caret = macos_shaped_caret(
+                session,
+                expected_revision,
+                None,
+                position,
+                0,
+                size,
+                max_width,
+            )?;
+            include_source_bounds(
+                &mut bounds,
+                caret.caret_x,
+                caret.caret_y,
+                1.0,
+                caret.caret_height,
+            )?;
+        }
+    }
+    let (left, top, right, bottom) = bounds.ok_or(YU_STORAGE_EDITOR_ERROR)?;
+    Ok(YuStorageSourceBounds {
+        revision: expected_revision,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+/// Shaped document-space bounds for an Accessibility source range.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_source_range_bounds(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageSourceBounds,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageSourceBounds::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            start_utf16,
+            end_utf16,
+            size,
+            max_width,
+        );
+        YU_STORAGE_SHAPER_UNAVAILABLE
+    }
+
+    #[cfg(target_os = "macos")]
+    match macos_source_range_bounds(
+        session,
+        expected_revision,
+        start_utf16,
+        end_utf16,
+        size,
+        max_width,
+    ) {
+        Ok(bounds) => {
+            // SAFETY: output was checked for null and belongs to the caller.
+            unsafe { *output = bounds };
+            YU_STORAGE_OK
+        }
         Err(status) => status,
     }
 }
@@ -13446,6 +13635,93 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn source_range_bounds_include_intermediate_visual_lines() {
+        let path = std::env::temp_dir().join(format!("yu-ax-range-{}.md", temp_id()));
+        let source = format!(
+            "a\n{}\nz\n\n| a | b |\n| - | - |\n| שלום | middle cell |\n",
+            "W".repeat(70)
+        );
+        fs::write(&path, &source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut bounds = YuStorageSourceBounds::default();
+        let end = source.find("z").expect("last line") + 1;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_source_range_bounds(
+                    raw,
+                    0,
+                    0,
+                    end as u64,
+                    16.0,
+                    500.0,
+                    &mut bounds,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(
+            bounds.width > 250.0,
+            "middle line must determine width: {bounds:?}"
+        );
+        assert!(
+            bounds.height > 50.0,
+            "all visual lines must be covered: {bounds:?}"
+        );
+        let table_start = source[..source.find("שלום").expect("bidi cell")]
+            .encode_utf16()
+            .count();
+        let table_end = source
+            [..source.find("middle cell").expect("second cell") + "middle cell".len()]
+            .encode_utf16()
+            .count();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_source_range_bounds(
+                    raw,
+                    0,
+                    table_start as u64,
+                    table_end as u64,
+                    16.0,
+                    500.0,
+                    &mut bounds,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(
+            bounds.width > 100.0 && bounds.height > 0.0,
+            "table cells: {bounds:?}"
+        );
+        let mut invalid = YuStorageSourceBounds {
+            x: 7.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_source_range_bounds(
+                    raw,
+                    0,
+                    end as u64,
+                    0,
+                    16.0,
+                    500.0,
+                    &mut invalid,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(invalid, YuStorageSourceBounds::default());
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn native_queries_share_painted_code_and_heading_geometry() {
         let path = std::env::temp_dir().join(format!("yu-shared-geometry-{}.md", temp_id()));
         let source = "# Heading\n\nparagraph above\n\n```swift\nlet value = 1\n```\n";
@@ -15015,6 +15291,52 @@ mod tests {
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("valid FFI session fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_document_publishes_a_frame_with_a_caret() {
+        for background in [false, true] {
+            let path = std::env::temp_dir().join(format!("yu-empty-frame-{}.md", temp_id()));
+            fs::write(&path, "").expect("empty fixture");
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            let session = unsafe { raw.as_mut() }.expect("session");
+            let request = MacosFrameRequest {
+                expected_revision: 0,
+                size: 16.0,
+                max_width: 500.0,
+                scroll_y: 0.0,
+                viewport_height: 240.0,
+                surface_width: 500.0,
+                surface_height: 240.0,
+                surface_generation: 0,
+                raster_scale: 2.0,
+                appearance: Appearance::Light,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let snapshot = loop {
+                match macos_render_host_frame(session, request, background) {
+                    Ok(snapshot) => break snapshot,
+                    Err(YU_STORAGE_RENDER_BUSY) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    result => {
+                        panic!("empty document publication (background={background}): {result:?}")
+                    }
+                }
+            };
+            assert_eq!(snapshot.frame_revision, 0);
+            assert_eq!(snapshot.caret_decoration_count, 1);
+            assert!(snapshot.content_height > 0.0);
+            assert_eq!(session.session.snapshot().as_str(), "");
+            unsafe { yu_storage_session_destroy(raw) };
+            fs::remove_file(path).expect("cleanup");
+        }
     }
 
     #[cfg(target_os = "macos")]

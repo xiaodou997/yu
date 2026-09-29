@@ -2189,33 +2189,33 @@ private func checkDisclosureAccessibility() throws {
             }
             return nil
         }
-        return find(view.accessibilityChildren ?? [])
+        return find(view.accessibilityChildren() ?? [])
     }
     guard let closed = disclosure() else { preconditionFailure("Missing disclosure AX element") }
-    precondition(closed.accessibilityRole == .disclosureTriangle)
-    precondition(closed.accessibilityLabel == "摘要中文 & 内容")
-    precondition((closed.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition(closed.accessibilityRole() == .disclosureTriangle)
+    precondition(closed.accessibilityLabel() == "摘要中文 & 内容")
+    precondition((closed.accessibilityValue() as? NSNumber)?.boolValue == false)
     precondition(closed.accessibilityPerformPress())
     precondition(!closed.accessibilityPerformPress(), "Stale AX action must be rejected")
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     let summary = (view.string as NSString).range(of: "摘要中文")
     view.setSelectedRanges([NSValue(range: NSRange(location: summary.location, length: 0))], affinity: .downstream, stillSelecting: false)
     let item = view.makeDisclosureMenuItem()
     precondition(view.validateMenuItem(item))
     view.toggleDisclosureFromMenu(item)
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == false)
     view.undo(nil)
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     view.undo(nil)
     precondition(view.string == original)
     let revision = bridge.revision
     let hidden = (original as NSString).range(of: "Hidden body")
     view.navigate(toSource: hidden)
     precondition(view.selectedRange() == hidden)
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     precondition(bridge.revision == revision && view.string == original)
     precondition(disclosure()?.accessibilityPerformPress() == true)
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == false)
     precondition(bridge.revision == revision && view.string == original)
     let visibleCaret = (original as NSString).range(of: "</summary>").location
     precondition(view.selectedRange() == NSRange(location: visibleCaret, length: 0))
@@ -2232,20 +2232,20 @@ private func checkDisclosureAccessibility() throws {
     try bridge.setSourceMode(false)
     view.refreshFromRust()
     precondition(view.selectedRange() == NSRange(location: hidden.location, length: 0))
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     precondition(bridge.revision == modeRevision && view.string == original)
     _ = try bridge.insertText("X")
     view.refreshFromRust()
     precondition(disclosure()?.accessibilityPerformPress() == true)
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == false)
     view.undo(nil)
     precondition(view.string == original)
     precondition(view.selectedRange() == NSRange(location: hidden.location, length: 0))
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     precondition(disclosure()?.accessibilityPerformPress() == true)
     view.redo(nil)
     precondition(view.string == original.replacingOccurrences(of: "Hidden body", with: "XHidden body"))
-    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition((disclosure()?.accessibilityValue() as? NSNumber)?.boolValue == true)
     view.undo(nil)
     precondition(view.string == original)
 
@@ -2258,7 +2258,15 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
         let initialRevision = bridge.revision
-        let initialChildren = (textView.accessibilityChildren ?? [])
+        for range in [NSRange(location: -1, length: 0),
+                      NSRange(location: 0, length: -1),
+                      NSRange(location: NSNotFound, length: 0),
+                      NSRange(location: Int.max - 1, length: 10),
+                      NSRange(location: 1, length: Int.max)] {
+            precondition(textView.accessibilityString(for: range) == nil)
+            precondition(textView.accessibilityFrame(for: range) == .zero)
+        }
+        let initialChildren = (textView.accessibilityChildren() ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
 
         func validate(
@@ -2270,7 +2278,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             for element in elements {
                 precondition(element.node.revision == revision)
                 precondition(element.parentObject === parent)
-                precondition(element.accessibilityLabel != nil)
+                precondition(element.accessibilityLabel() != nil)
                 count += 1
                 let children = element.semanticChildren
                     .compactMap { $0 as? YuAccessibilitySemanticElement }
@@ -2302,24 +2310,26 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             $0.node.kind == SemanticAccessibilityKind.taskListItem.rawValue
         }
         if !headings.isEmpty {
-            precondition(headings.allSatisfy { $0.accessibilityRole == .staticText })
+            precondition(headings.allSatisfy { $0.accessibilityRole() == .staticText })
+            precondition(headings[0].accessibilityString(
+                for: NSRange(location: Int.max - 1, length: 10)) == nil)
         }
         if !links.isEmpty {
-            precondition(links.allSatisfy { $0.accessibilityRole == .link })
+            precondition(links.allSatisfy { $0.accessibilityRole() == .link })
             precondition(
                 links
                     .filter { $0.node.destinationRange != nil }
-                    .allSatisfy { $0.accessibilityURL != nil }
+                    .allSatisfy { $0.accessibilityURL() != nil }
             )
         }
         if !tasks.isEmpty {
-            precondition(tasks.allSatisfy { $0.accessibilityRole == .checkBox })
-            precondition(tasks.allSatisfy { $0.accessibilityValue is NSNumber })
+            precondition(tasks.allSatisfy { $0.accessibilityRole() == .checkBox })
+            precondition(tasks.allSatisfy { $0.accessibilityValue() is NSNumber })
         }
         var openedLinkURLs: [URL] = []
         textView.linkURLOpener = { url in openedLinkURLs.append(url); return true }
         for link in links {
-            let expected = link.accessibilityURL
+            let expected = link.accessibilityURL()
             precondition(expected != nil)
             precondition(link.accessibilityPerformPress())
             precondition(openedLinkURLs.last == expected)
@@ -2330,7 +2340,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             precondition(items.map(\.title) == ["打开链接", "复制链接地址"])
             precondition(items.allSatisfy { textView.validateMenuItem($0) })
             precondition(NSApp.sendAction(items[0].action!, to: textView, from: items[0]))
-            precondition(openedLinkURLs.last == link.accessibilityURL)
+            precondition(openedLinkURLs.last == link.accessibilityURL())
             precondition(NSApp.sendAction(items[1].action!, to: textView, from: items[1]))
             precondition(NSPasteboard.general.string(forType: .string) == (try? bridge.linkDestination(at: link.node.labelRange.location, expectedRevision: initialRevision)))
         }
@@ -2366,7 +2376,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
                             || target.node.kind == SemanticAccessibilityKind.referenceLink.rawValue
                     )
                 }
-                let targetLabel = target.accessibilityLabel ?? ""
+                let targetLabel = target.accessibilityLabel() ?? ""
                 print("  rotor=\(index) target=\(targetLabel)")
             } else {
                 precondition(result == nil)
@@ -2375,29 +2385,29 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         }
         print("Yu Accessibility self-check: revision=\(initialRevision) nodes=\(initialCount)")
         for element in initialChildren {
-            let label = element.accessibilityLabel ?? ""
-            print("  kind=\(element.node.kind) role=\(element.accessibilityRole.rawValue) label=\(label)")
+            let label = element.accessibilityLabel() ?? ""
+            print("  kind=\(element.node.kind) role=\(element.accessibilityRole().rawValue) label=\(label)")
         }
 
         let actionRevision: UInt64
         let actionChildren: [YuAccessibilitySemanticElement]
         if let task = tasks.first,
-           let beforeValue = task.accessibilityValue as? NSNumber,
+           let beforeValue = task.accessibilityValue() as? NSNumber,
            let actionBlock = task.node.actionBlock {
             let beforeDone = beforeValue.boolValue
             precondition(task.accessibilityPerformPress())
             actionRevision = bridge.revision
             precondition(actionRevision != initialRevision)
-            precondition(task.accessibilityLabel == nil)
+            precondition(task.accessibilityLabel() == nil)
             textView.refreshFromRust()
-            actionChildren = (textView.accessibilityChildren ?? [])
+            actionChildren = (textView.accessibilityChildren() ?? [])
                 .compactMap { $0 as? YuAccessibilitySemanticElement }
             _ = validate(actionChildren, parent: textView, revision: actionRevision)
             let toggledTask = flatten(actionChildren).first {
                 $0.node.actionBlock == actionBlock
             }
             guard let toggledTask,
-                  let afterValue = toggledTask.accessibilityValue as? NSNumber else {
+                  let afterValue = toggledTask.accessibilityValue() as? NSNumber else {
                 preconditionFailure("toggled task child is missing")
             }
             precondition(afterValue.boolValue != beforeDone)
@@ -2464,13 +2474,13 @@ func runAccessibilitySelfCheck(path: String) -> Never {
 
         _ = try bridge.insertText("\n")
         if let staleCandidate = actionChildren.first {
-            precondition(staleCandidate.accessibilityLabel == nil)
+            precondition(staleCandidate.accessibilityLabel() == nil)
         }
         textView.refreshFromRust()
         let nextRevision = bridge.revision
         precondition(!splitter.accessibilityPerformIncrement())
         precondition((textView.accessibilitySplitters ?? []).isEmpty)
-        let nextChildren = (textView.accessibilityChildren ?? [])
+        let nextChildren = (textView.accessibilityChildren() ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
         precondition(nextRevision != actionRevision)
         precondition(nextChildren.allSatisfy { $0.node.revision == nextRevision })
@@ -2493,7 +2503,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             } else {
                 precondition(nodes.count > 40)
             }
-            let children = (textView.accessibilityChildren ?? []).compactMap { $0 as? YuAccessibilitySemanticElement }
+            let children = (textView.accessibilityChildren() ?? []).compactMap { $0 as? YuAccessibilitySemanticElement }
             precondition(validate(children, parent: textView, revision: bridge.revision) == nodes.count - 1)
         }
         print("Yu Accessibility self-check: capacity grow/shrink and revision checks passed")

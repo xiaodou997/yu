@@ -1135,6 +1135,61 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     }
 
     @MainActor
+    func runEmptyDocumentSelfCheck() async throws {
+        func require(_ value: Bool, _ message: String) throws {
+            if !value { throw NSError(domain: "YuEmptyDocument", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        @MainActor func settle() async throws {
+            let deadline = Date().addingTimeInterval(10)
+            repeat {
+                view.layoutSubtreeIfNeeded()
+                _ = try surfaceCoordinator.submitNow()
+                if surfaceCoordinator.hasCurrentFrame(requirePresented: true) { return }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            } while Date() < deadline
+            throw NSError(domain: "YuEmptyDocument", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Empty document did not present a current frame"])
+        }
+        try require(bridge.source.isEmpty, "Expected an empty fixture")
+        for sourceMode in [false, true] {
+            print("Yu empty document stage: mode=\(sourceMode) initial"); fflush(stdout)
+            try setSourceMode(sourceMode)
+            try await settle()
+            try require(surfaceCoordinator.lastSnapshot?.caretDecorationCount == 1,
+                        "Empty document lost its insertion caret")
+            try require(textView.accessibilityFrame(for: NSRange(location: 0, length: 0)).height > 0,
+                        "Empty document lost its AX insertion-point frame")
+            try require(statusLabel.stringValue != "文档暂时无法显示", "Empty document reported a render failure")
+            let payload = "中文🙂 first input\n"
+            print("Yu empty document stage: first input"); fflush(stdout)
+            textView.insertText(payload, replacementRange: NSRange(location: NSNotFound, length: 0))
+            try await settle()
+            try require(bridge.source == payload, "First input changed source")
+            textView.undo(nil)
+            print("Yu empty document stage: undo"); fflush(stdout)
+            try await settle()
+            try require(bridge.source.isEmpty, "Undo did not restore the empty document")
+            try require(surfaceCoordinator.lastSnapshot?.caretDecorationCount == 1,
+                        "Undo to empty lost its caret")
+            textView.redo(nil)
+            print("Yu empty document stage: redo"); fflush(stdout)
+            try await settle()
+            try require(bridge.source == payload, "Redo lost the first input")
+            textView.selectAll(nil)
+            textView.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+            print("Yu empty document stage: delete all"); fflush(stdout)
+            try await settle()
+            try require(bridge.source.isEmpty, "Delete-all did not restore empty rendering")
+            textView.undo(nil)
+            textView.undo(nil)
+            try await settle()
+            try require(bridge.source.isEmpty, "History did not return to initial content")
+        }
+        print("Yu empty document window self-check: preview/source, caret, first input, undo/redo and delete-all passed")
+    }
+
+    @MainActor
     func runWindowStateSelfCheck() async throws {
         func require(_ value: Bool, _ message: String) throws {
             if !value { throw NSError(domain: "YuWindowState", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -3004,7 +3059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let path: String
         renderRegression = CommandLine.arguments.contains("--render-regression-self-check")
         resourceRegression = CommandLine.arguments.contains("--resource-latency-self-check")
-        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check") || CommandLine.arguments.contains("--layout-coordinator-self-check") || CommandLine.arguments.contains("--window-state-self-check") || CommandLine.arguments.contains("--idle-resource-self-check") || CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") || renderRegression || resourceRegression || lifecycleSelfCheck != nil
+        launchSelfCheck = CommandLine.arguments.contains("--empty-document-window-self-check") || CommandLine.arguments.contains("--launch-window-self-check") || CommandLine.arguments.contains("--layout-coordinator-self-check") || CommandLine.arguments.contains("--window-state-self-check") || CommandLine.arguments.contains("--idle-resource-self-check") || CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") || renderRegression || resourceRegression || lifecycleSelfCheck != nil
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         // 冒烟/截图用的显式外观开关：默认跟随系统，不参与 self-check。
         forceDarkMode = CommandLine.arguments.contains("--dark-mode")
@@ -3105,6 +3160,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             if let mode = self.lifecycleSelfCheck {
                                 try await self.runDocumentLifecycleCheck(mode: mode)
                                 if mode == "--document-recovery-writer-self-check" { return }
+                            } else if CommandLine.arguments.contains("--empty-document-window-self-check") {
+                                controller.closeAlertDecision = { _ in .alertSecondButtonReturn }
+                                try await controller.runEmptyDocumentSelfCheck()
+                                self.newDocument(nil)
+                                guard let fresh = self.controller, fresh !== controller else {
+                                    throw CocoaError(.coderInvalidValue)
+                                }
+                                fresh.closeAlertDecision = { _ in .alertSecondButtonReturn }
+                                try await fresh.runEmptyDocumentSelfCheck()
                             } else if CommandLine.arguments.contains("--window-state-self-check") {
                                 try await controller.runWindowStateSelfCheck()
                             } else if CommandLine.arguments.contains("--idle-resource-self-check") {

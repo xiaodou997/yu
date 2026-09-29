@@ -423,7 +423,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     /// dispatch. The document TextKit element remains the editable source
     /// surface; semantic children and visible table splitters are stable,
     /// Revision-bound elements and never become a second text model.
-    @objc var accessibilityChildren: [Any]? {
+    override func accessibilityChildren() -> [Any]? {
         semanticElements.map { $0 as Any } + tableResizeAccessibilityElements
             .map { $0 as Any }
     }
@@ -478,7 +478,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         }.filter { element in
             let filter = parameters.filterString
             guard !filter.isEmpty else { return true }
-            return element.accessibilityLabel?.localizedCaseInsensitiveContains(filter) == true
+            return element.accessibilityLabel()?.localizedCaseInsensitiveContains(filter) == true
         }
         guard !candidates.isEmpty else { return nil }
 
@@ -500,7 +500,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         let element = candidates[index]
         let result = NSAccessibilityCustomRotor.ItemResult(targetElement: element)
         result.targetRange = element.node.sourceRange
-        result.customLabel = element.accessibilityLabel
+        result.customLabel = element.accessibilityLabel()
         return result
     }
 
@@ -2064,10 +2064,13 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         guard range.location != NSNotFound,
               range.location >= 0,
               range.length >= 0,
-              NSMaxRange(range) <= snapshot.numberOfCharacters else {
+              range.location <= snapshot.numberOfCharacters,
+              range.length <= snapshot.numberOfCharacters - range.location else {
             return nil
         }
         let source = (bridge.copySourceIfAvailable ?? canonicalSource) as NSString
+        guard range.location <= source.length,
+              range.length <= source.length - range.location else { return nil }
         if range.location < source.length,
            source.rangeOfComposedCharacterSequence(at: range.location).location != range.location {
             return nil
@@ -2082,10 +2085,26 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     }
 
     func accessibilityFrameForSemanticRange(_ range: NSRange) -> NSRect {
-        guard let window, range.location != NSNotFound,
-              let first = rustCaretRect(forSourceUTF16: range.location),
-              let last = rustCaretRect(forSourceUTF16: NSMaxRange(range)) else { return .zero }
-        let local = first.union(last).offsetBy(dx: contentOrigin.x, dy: contentOrigin.y)
+        guard let window,
+              let snapshot = bridge.accessibilitySnapshotIfAvailable,
+              let valid = accessibilitySourceRange(range, snapshot: snapshot),
+              let (size, width) = visualLayoutMetrics() else { return .zero }
+        let documentBounds: NSRect
+        if bridge.composition.active {
+            guard let first = rustCaretRect(forSourceUTF16: valid.location),
+                  let last = rustCaretRect(forSourceUTF16: NSMaxRange(valid)) else { return .zero }
+            documentBounds = first.union(last)
+        } else {
+            guard let shaped = try? bridge.sourceRangeBounds(
+                revision: snapshot.revision,
+                startUTF16: UInt64(valid.location),
+                endUTF16: UInt64(NSMaxRange(valid)),
+                size: size,
+                maxWidth: width
+            ) else { return .zero }
+            documentBounds = shaped
+        }
+        let local = documentBounds.offsetBy(dx: contentOrigin.x, dy: contentOrigin.y)
         return window.convertToScreen(convert(local, to: nil))
     }
 

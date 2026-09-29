@@ -12,7 +12,7 @@ for option in "$@"; do
     esac
 done
 "$shell_dir/build-rust-ffi.sh" "$@" >&2
-app_dir="$shell_dir/.build/Yu.app"
+app_dir="${YU_APP_OUTPUT:-$shell_dir/.build/Yu.app}"
 contents_dir="$app_dir/Contents"
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources" "$contents_dir/Helpers"
 typeset -a helper_profile_args
@@ -41,6 +41,19 @@ cp -p "$binary_dir/Yu" "$yu_staged_binary"
 mv -f "$yu_staged_binary" "$contents_dir/MacOS/Yu"
 cp "$shell_dir/AppBundle/Info.plist" "$contents_dir/Info.plist"
 cp -R "$shell_dir/AppBundle/Resources/." "$contents_dir/Resources/"
+cp "$shell_dir/../../../LICENSE" "$contents_dir/Resources/Yu-LICENSE.txt"
+# Finder expects an ICNS icon. Generate it from the existing approved artwork.
+icon_work="$(mktemp -d "$shell_dir/.build/yu-icon.XXXXXX")"
+mkdir "$icon_work/Yu.iconset"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$contents_dir/Resources/Yu.png" \
+        --out "$icon_work/Yu.iconset/icon_${size}x${size}.png" >/dev/null
+    double=$((size * 2))
+    sips -z "$double" "$double" "$contents_dir/Resources/Yu.png" \
+        --out "$icon_work/Yu.iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$icon_work/Yu.iconset" -o "$contents_dir/Resources/Yu.icns"
+rm -rf "$icon_work"
 xcrun --sdk macosx metal -c -mmacosx-version-min=26.0 \
     "$shell_dir/../yu-render-macos/native/yu_shaders.metal" -o "$shell_dir/.rust/yu_shaders.air"
 xcrun --sdk macosx metallib "$shell_dir/.rust/yu_shaders.air" \
@@ -57,5 +70,5 @@ fi
 xcrun vtool -show-build "$contents_dir/MacOS/Yu" >&2
 codesign --force --sign - "$app_dir" >&2
 python3 "$shell_dir/../../../tools/verify-macos-app.py" "$app_dir" \
-    --configuration "$profile" --output "$shell_dir/.build/build-manifest.json" >&2
+    --configuration "$profile" --output "${YU_BUILD_MANIFEST:-$shell_dir/.build/build-manifest.json}" >&2
 print -r -- "$app_dir"

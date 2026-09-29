@@ -6497,6 +6497,27 @@ prefix **羽🙂** suffix
     }
 
     #[test]
+    fn empty_source_query_uses_blank_layout_but_rejects_out_of_bounds_positions() {
+        let mut document = EditorDocument::new("");
+        for source_mode in [false, true] {
+            document.set_source_mode(source_mode).expect("mode");
+            let snapshot = document
+                .layout_snapshot_for_source(ByteOffset::ZERO, &WideShaper)
+                .expect("empty document has a valid source position");
+            assert!(snapshot.blocks().is_empty());
+            assert!(snapshot.content_height() > 0.0);
+            for source in [ByteOffset::new(1), ByteOffset::new(u64::MAX)] {
+                assert!(
+                    document
+                        .layout_snapshot_for_source(source, &WideShaper)
+                        .is_err()
+                );
+            }
+            assert_eq!(document.snapshot().as_str(), "");
+        }
+    }
+
+    #[test]
     fn source_query_prioritizes_one_paragraph_and_projection_cache_reuses_it() {
         let source = format!("{}\n# active heading\n", "paragraph\n\n".repeat(200));
         let mut document = EditorDocument::new(&source);

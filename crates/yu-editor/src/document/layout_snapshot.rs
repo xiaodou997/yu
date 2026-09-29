@@ -646,6 +646,18 @@ impl LayoutContext {
             }
         }
         self.snapshot().utf16_offset(source)?;
+        // An empty document has a valid caret at byte zero but no Markdown
+        // block to look up. Reuse the ordinary empty viewport snapshot so the
+        // worker's focus-first query has the same geometry as publication.
+        if self.snapshot().is_empty() {
+            return self.prepare_layout_snapshot_with_images_cancelable(
+                ViewportSpan::new(0.0, self.viewport_config().layout().line_height()),
+                shaper,
+                image_resolver,
+                table_resize,
+                should_cancel,
+            );
+        }
         self.viewport.sync(&self.markdown)?;
         let index =
             self.block_index_for_source(source)

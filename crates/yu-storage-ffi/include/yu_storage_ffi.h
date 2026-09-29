@@ -444,6 +444,15 @@ typedef struct YuStorageBlockCaret {
     uint8_t shaped;
 } YuStorageBlockCaret;
 
+/* Document-space bounds of a source range from shaped visual lines. */
+typedef struct YuStorageSourceBounds {
+    uint64_t revision;
+    float x;
+    float y;
+    float width;
+    float height;
+} YuStorageSourceBounds;
+
 
 
 /* Revision-bound shaped caret geometry and absolute document scroll target. */
@@ -772,6 +781,13 @@ int32_t yu_storage_session_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
+/* Includes intermediate visual lines, table cells and bidirectional clusters.
+ * Returns document-space coordinates; the native view applies padding and
+ * screen conversion once. Invalid or stale ranges leave output zeroed. */
+int32_t yu_storage_session_source_range_bounds(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t start_utf16, uint64_t end_utf16,
+    float size, float max_width, YuStorageSourceBounds *output);
 /* Read-only column hover. Attached windows use submitted geometry; stale
  * geometry returns OK with *output == 0. Does not start a resize gesture. */
 int32_t yu_storage_session_table_resize_hover(
