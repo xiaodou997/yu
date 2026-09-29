@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from acceptance_runner import ROOT, RunContext, sha, write_json
 
-CASES = {'light-1x', 'light-2x', 'dark-1x', 'split-cancel', 'split-confirm', 'directory-exists', 'source-alias', 'cancel'}
+CASES = {'light-1x', 'light-2x', 'dark-1x', 'split-cancel', 'split-confirm', 'split-table', 'oversize-table', 'directory-exists', 'source-alias', 'cancel'}
 def report_passed(code, report):
     rows = report.get('cases', [])
     return code == 0 and report.get('passed') is True and len(rows) == len(CASES) and {r.get('id') for r in rows} == CASES and all(r.get('passed') is True for r in rows)

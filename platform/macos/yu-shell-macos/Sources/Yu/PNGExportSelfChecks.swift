@@ -27,11 +27,22 @@ func runPNGExportSelfCheck(input: String, directory: String) -> Never {
         try fm.createDirectory(at:root,withIntermediateDirectories:false);owns=true
         let inputURL=URL(fileURLWithPath:input), original=try Data(contentsOf:inputURL)
         var normalSizes:[[Int]]=[]
-        for mode in ["light-1x","light-2x","dark-1x","split-cancel","split-confirm","directory-exists","source-alias","cancel"] {
+        for mode in ["light-1x","light-2x","dark-1x","split-cancel","split-confirm","split-table","oversize-table","directory-exists","source-alias","cancel"] {
             let work=root.appendingPathComponent(mode);try fm.createDirectory(at:work,withIntermediateDirectories:false)
-            let large=mode.hasPrefix("split")||mode=="directory-exists"
+            let segmented=mode.hasPrefix("split")
+            let large=segmented||mode=="directory-exists"
             let path:URL
-            if large {
+            if mode=="split-table" {
+                path=work.appendingPathComponent("split-table.md")
+                let body=(0..<150).map{n in "<tr><td rowspan=\"2\">GROUP-\(n)</td><td>CELL-\(n)-A</td></tr><tr><td>CELL-\(n)-B</td></tr>"}.joined()
+                let source="# PNG跨段合并表格\n\n<table><thead><tr><th>组</th><th>内容</th></tr></thead><tbody>\(body)</tbody></table>\n\nPNG-TABLE-END\n"
+                try Data(source.utf8).write(to:path,options:.withoutOverwriting)
+            } else if mode=="oversize-table" {
+                path=work.appendingPathComponent("oversize-table.md")
+                let rows=(1..<200).map{n in "<tr><td>ROW-\(n)</td></tr>"}.joined()
+                let source="# PNG超大单元素\n\n<table><tbody><tr><td rowspan=\"200\">OVERSIZE-GROUP</td><td>ROW-0</td></tr>\(rows)</tbody></table>\n"
+                try Data(source.utf8).write(to:path,options:.withoutOverwriting)
+            } else if large {
                 path=work.appendingPathComponent("long.md")
                 let source="# PNG分段\n\n"+(0..<700).map{"第\($0)段 SEGMENT-LINE-\($0) 中文完整内容。\n\n"}.joined()+"PNG-LONG-END\n"
                 try Data(source.utf8).write(to:path,options:.withoutOverwriting)
@@ -44,7 +55,7 @@ func runPNGExportSelfCheck(input: String, directory: String) -> Never {
             if mode=="source-alias"{try fm.linkItem(at:path,to:target)}else{try old.write(to:target,options:.withoutOverwriting)}
             let oldBytes=try Data(contentsOf:target)
             if mode=="directory-exists" {try fm.createDirectory(at:parts,withIntermediateDirectories:false);try old.write(to:parts.appendingPathComponent("keep.txt"))}
-            let scale=mode=="light-2x"||large ? 2 : 1
+            let scale=mode=="light-2x"||large||mode=="oversize-table" ? 2 : 1
             var config:[String:Any]=["exportFormat":"png","title":"PNG固定测试","referenceDay":20724,"width":800,"scale":scale,"replaceExisting":true,"fontSize":16]
             if mode=="dark-1x"{config["dark"]=true;config["foreground"]=UInt32(0xe8eaedff);config["background"]=UInt32(0x202124ff);config["link"]=UInt32(0x8ab4f8ff)}
             let task=try bridge.beginHTMLExport(to:target,config:config);defer{task.cancel()}
@@ -65,16 +76,18 @@ func runPNGExportSelfCheck(input: String, directory: String) -> Never {
                 Thread.sleep(forTimeInterval:0.01)
             }
             guard let final else {throw NSError(domain:"Yu.PNG.Timeout",code:1)}
-            let success=["light-1x","light-2x","dark-1x","split-confirm"].contains(mode)
+            let success=["light-1x","light-2x","dark-1x","split-confirm","split-table"].contains(mode)
             try require(final.phase==(success ? "completed" : (["split-cancel","cancel"].contains(mode) ? "cancelled" : "failed")),"\(mode): \(final.phase) \(final.message)")
             var sizes:[[Int]]=[],hashes:[String]=[]
             if success {
-                let urls=large ? try fm.contentsOfDirectory(at:parts,includingPropertiesForKeys:nil).sorted{$0.lastPathComponent<$1.lastPathComponent} : [target]
+                let urls=large ? try fm.contentsOfDirectory(at:parts,includingPropertiesForKeys:nil).filter{$0.pathExtension=="png"}.sorted{$0.lastPathComponent<$1.lastPathComponent} : [target]
                 for (index,url) in urls.enumerated(){if large{try require(url.lastPathComponent==String(format:"part-%03d.png",index+1),"Wrong segment order")};sizes.append(try dimensions(url));hashes.append(SHA256.hash(data:try Data(contentsOf:url)).map{String(format:"%02x",$0)}.joined())}
                 try require(sizes==final.pngSizes,"Actual PNG dimensions differ from preflight")
                 if mode.hasPrefix("light"){normalSizes.append(sizes[0])}
                 if large{try require(splitSeen&&sizes.count>1&&Data(contentsOf:target)==oldBytes,"Split target protection failed")}
+                if mode=="split-table"{try require(sizes.count>1,"Merged table did not exercise segment boundaries")}
             }else{try require(try Data(contentsOf:target)==oldBytes,"Failure or cancel changed old target")}
+            if mode=="oversize-table"{try require(final.message.contains("合并组")||final.message.contains("放入"),"Oversize table did not fail for the indivisible group")}
             if mode=="split-cancel"{try require(splitSeen && !fm.fileExists(atPath:parts.path),"Split cancellation left output")}
             if mode=="directory-exists"{try require(try fm.contentsOfDirectory(atPath:parts.path)==["keep.txt"],"Existing directory was merged")}
             try require(bridge.source==source&&bridge.revision==rev&&bridge.state.dirty==dirty&&bridge.selectionEndpoints.anchorUTF16==8&&bridge.selectionEndpoints.focusUTF16==1,"PNG changed editor identity")
