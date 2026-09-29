@@ -102,7 +102,7 @@ python3 tools/check-group5-pdf.py manifest.json 新的PDF检查报告.json
 
 `tools/inspect-pdf-native.swift` 只读检查页面、文字、链接与页脚。`tools/pdf-preview-driver.swift` 仅向明确PID的系统Preview和精确匹配的测试PDF窗口投递事件；测试文件须位于本项目artifacts，不能针对其他文档、系统剪贴板或全局偏好执行操作。阅读器搜索/拖选、目录/文末注往返及放大与PDF解析证据分别记录；未执行系统复制或外链启动不能填为已通过。
 
-原生页数边界直接调用生产写出器，1000页通过、1001页拒绝；不是1000页逐页视觉验收。共享任务测试依次执行HTML/PDF两个格式，验证两个任务准入、释放和300秒确定时刻边界，不修改时钟或等待五分钟。桌面测试保持串行；报告和截图留本机，不默认向用户发复核附件。
+原生页数边界直接调用生产写出器，1000页通过、1001页拒绝；不是1000页逐页视觉验收。共享任务测试依次执行HTML/PDF/PNG三个格式，验证两个任务准入、释放和300秒确定时刻边界，不修改时钟或等待五分钟。桌面测试保持串行；报告和截图留本机，不默认向用户发复核附件。
 
 ## 第五组系统打印验收
 
@@ -125,3 +125,25 @@ GROUP5_PRINT_PHASE=resources python3 tools/run_acceptance.py group5-print-window
 窗口套件拒绝按下物理Print按钮，只使用系统PDF保存入口，比较打印前后的队列、逐页文字与同任务冻结页。系统面板的范围/方向通过公开辅助功能控件操作并检查实际值和最终页数；`print-option`/`print-field`白名单不能提交Print/Save。AX无法完成的返回不能自行算通过：只在同一次操作后的真实控件达到期望值时记录成功，不重复投递动作。保存位置、取消和菜单仍有原生事件操作。警告与失败的首次日志保留，套件不自动关闭整组。
 
 Foundation临时目录与CUPS的TMPDIR可能不同。只观察本次新增的`yu-print-*`目录，不读取、删除已有任务目录或用户输出。复核资料只留本机；使用方式和软件链路/实体设备边界见`docs/architecture/mac-group5-printing.md`。
+
+## 第五组 PNG 验收
+
+```sh
+# 审计后的 Release：整图1×/2×、深色、分段确认/取消、已有目录及源文件保护。
+python3 tools/run_acceptance.py group5-png artifacts/新的PNG原生目录
+
+# 实际文件菜单、保存与格式配置、分段先取消再明确确认。
+python3 tools/run_acceptance.py group5-png-window artifacts/新的PNG窗口目录
+
+# 两个文档交替10次、3次准备中取消/重试、关闭所属文档和继续编辑。
+python3 tools/run_acceptance.py group5-png-lifecycle artifacts/新的PNG生命周期目录
+
+# 实际任务告警/权限/目标变化/资源冻结及三个格式的准入/准备截止检查。
+cargo test --locked -p yu-storage-ffi --lib html_export::bounds:: -- --test-threads=1
+```
+
+`--png-export-self-check INPUT NEW_DIRECTORY` 走生产快照、CoreText布局、离屏编码与提交，不是测试专用绘制器。目录须不存在；只操作本次输入副本与输出。`group5-png`核对8个完整命名场景，不自动关闭I01—I03。图像尺寸和实际解码由`inspect-png-native.swift`独立核对；`check-png-linear.swift INPUT_DIRECTORY NEW_OUTPUT_DIRECTORY EXPECTED_LINES`用于固定纯文字样本的像素墨迹行数与接缝裁片，不使用OCR，也不是任意文档的文字识别器。
+
+窗口测试使用原生菜单及受限公开辅助功能动作；配置和保存字段必须实际达到目标值，最终PNG必须能解码。仅在自身输入目录保存，尚不把文件夹键盘导航、PNG未命名基准与告警的全部实窗手势记为通过。打开文档使用系统open定位隔离应用与本次夹具；每次打开有独立步骤名，避免统一执行器将第二次打开拒绝为重复步骤。
+
+单段限制16 Mi像素及32768边长，总任务128 Mi像素、64段、256 MiB编码字节。超限分段须明确同意，写到新的`名称-images/part-001.png`等编号文件；已有目录不覆盖、不合并。生产目录提交使用macOS原子排他重命名，测试覆盖提交前出现的空目录，失败不能以普通rename覆盖它。按段分配和释放位图，不同时保存全部段的位图。完整实现、证据边界与剩余检查见`docs/architecture/mac-group5-png.md`。
