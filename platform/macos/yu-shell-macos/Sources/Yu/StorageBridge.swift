@@ -34,9 +34,9 @@ enum DiskState: UInt8 {
 
     var label: String {
         switch self {
-        case .unchanged: return "磁盘一致"
-        case .changed: return "外部已修改"
-        case .missing: return "文件不存在"
+        case .unchanged: return L10n.tr("Disk matches")
+        case .changed: return L10n.tr("Modified externally")
+        case .missing: return L10n.tr("File missing")
         }
     }
 }
@@ -792,7 +792,7 @@ final class StorageBridge {
         do {
             guard let library = Bundle.main.url(forResource: "yu_shaders", withExtension: "metallib") else {
                 throw NSError(domain: "Yu.Renderer", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "应用缺少 yu_shaders.metallib，请重新构建完整应用包。"])
+                userInfo: [NSLocalizedDescriptionKey: L10n.tr("The app is missing yu_shaders.metallib. Rebuild the complete application bundle.")])
             }
             let libraryPath = Array(library.path.utf8)
             let libraryStatus = libraryPath.withUnsafeBufferPointer {
@@ -800,7 +800,7 @@ final class StorageBridge {
             }
             guard libraryStatus == StorageStatus.ok else {
                 throw NSError(domain: "Yu.Renderer", code: Int(libraryStatus),
-                    userInfo: [NSLocalizedDescriptionKey: "无法加载应用的 Metal 着色器库。"])
+                userInfo: [NSLocalizedDescriptionKey: L10n.tr("Could not load the app’s Metal shader library.")])
             }
             cachedSource = try copyBytesThrowing { output, capacity, written in
                 yu_storage_session_copy_source(
@@ -825,7 +825,7 @@ final class StorageBridge {
 
     private struct PresentationStorageError: LocalizedError {
         let underlying: Error
-        var errorDescription: String? { "无法保存或恢复表格列宽：\(underlying.localizedDescription)" }
+        var errorDescription: String? { L10n.format("Could not save or restore table column widths: %@", underlying.localizedDescription) }
     }
 
     private func configureTableWidthStore() throws {
@@ -869,8 +869,10 @@ final class StorageBridge {
         }
         guard status == StorageStatus.ok, let task else {
             let message = status == YU_STORAGE_INVALID_STATE
-                ? "请先完成或取消输入法组字，再导出。导出不会改变组字内容。"
-                : status == YU_STORAGE_RENDER_BUSY ? "已有两个导出任务，请先完成或取消其中一个。" : "无法启动 HTML 导出（\(status)）。"
+            ? L10n.tr("Finish or cancel input method composition before exporting. Export does not change the composition text.")
+            : status == YU_STORAGE_RENDER_BUSY
+                ? L10n.tr("Two export tasks are already active. Finish or cancel one first.")
+                : L10n.format("Could not start HTML export (%d).", status)
             throw NSError(domain: "Yu.Export", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message])
         }
         return NativeHTMLExportTask(handle: task)
@@ -2357,13 +2359,13 @@ enum BridgeError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .open(let status): return "无法打开 Markdown 文件（Rust status \(status)）"
-        case .operation(24): return "无法粘贴表格：行列数量、目标区域或单元格内容不合法。文档未修改。"
-        case .operation(let status): return "文档操作失败（Rust status \(status)）"
-        case .clipboard: return "无法访问 macOS 剪贴板"
+        case .open(let status): return L10n.format("Could not open Markdown file (Rust status %d)", status)
+        case .operation(24): return L10n.tr("Could not paste table: row/column count, target range, or cell content is invalid. The document was not modified.")
+        case .operation(let status): return L10n.format("Document operation failed (Rust status %d)", status)
+        case .clipboard: return L10n.tr("Could not access the macOS clipboard")
         case .watcher(let status):
             let reason = String(cString: strerror(status))
-            return "无法监听文档所在目录（\(reason)）"
+            return L10n.format("Could not monitor the document directory (%@)", reason)
         }
     }
 }

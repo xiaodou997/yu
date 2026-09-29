@@ -218,7 +218,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     let scrollView = NSScrollView()
     /// 区头（「大纲」+ 条目计数）。面板自己持有：计数是 reload 的派生物，
     /// 放进面板里才不会在窗口另存一份可以对不上的状态。
-    let sectionHeader = YuSidebarSectionHeader(title: "大纲")
+    let sectionHeader = YuSidebarSectionHeader(title: L10n.tr("Outline"))
     private let outlineView = NativeOutlineView()
     private var roots: [OutlineNode] = []
     private var orderedNodes: [OutlineNode] = []
@@ -232,7 +232,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     override init() {
         super.init()
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("outline"))
-        column.title = "大纲"
+        column.title = L10n.tr("Outline")
         column.resizingMask = .autoresizingMask
         outlineView.addTableColumn(column)
         outlineView.outlineTableColumn = column
@@ -261,7 +261,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
                 self.highlightHeading(containing: position)
             }
         }
-        outlineView.setAccessibilityLabel("文档大纲")
+        outlineView.setAccessibilityLabel(L10n.tr("Document Outline"))
 
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true

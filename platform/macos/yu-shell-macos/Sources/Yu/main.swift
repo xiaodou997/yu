@@ -19,6 +19,10 @@ if CommandLine.arguments.contains("--presentation-latency-self-check") || Comman
     UserDefaults.standard.setVolatileDomain(["Yu.readingTheme": 0], forName: UserDefaults.argumentDomain)
 }
 NativeTheme.registerFonts()
+if CommandLine.arguments.contains("--localization-self-check") {
+    runLocalizationSelfCheck()
+    exit(0)
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--png-export-self-check"),
    CommandLine.arguments.indices.contains(flag + 2) {
     MainActor.assumeIsolated { runPNGExportSelfCheck(input: CommandLine.arguments[flag + 1], directory: CommandLine.arguments[flag + 2]) }

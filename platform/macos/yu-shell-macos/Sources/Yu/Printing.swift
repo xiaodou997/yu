@@ -16,17 +16,26 @@ final class NativePrintController: NSObject, NSWindowDelegate {
     private let validateDestination: (URL) throws -> Void
     private let onFinish: (String) -> Void
     private let panel: NSPanel
-    private let stage = NSTextField(wrappingLabelWithString: "准备打印内容…")
-    private let detail = NSTextField(wrappingLabelWithString: "使用启动时的固定正文，您可以继续编辑。打印只在系统面板确认后提交。")
-    private let cancelButton = NSButton(title: "取消打印", target: nil, action: nil)
+    private let stage = NSTextField(wrappingLabelWithString: L10n.tr("Preparing print content…"))
+    private let detail = NSTextField(wrappingLabelWithString: L10n.tr("Printing uses the fixed content captured at start. You can continue editing. The job is submitted only after confirmation in the system print panel."))
+    private let cancelButton = NSButton(title: L10n.tr("Cancel Printing"), target: nil, action: nil)
     private var cancelled = false
     private var systemPanelActive = false
     private var warningAlert: NSAlert?
     private var execution: Task<Void, Never>?
     private let info: NSPrintInfo
 
+    private func localizedStage(for phase: String) -> String {
+        switch phase {
+        case "warnings": return L10n.tr("Waiting for print confirmation…")
+        case "writing", "committing", "print_ready": return L10n.tr("Saving print output…")
+        case "cancelled": return L10n.tr("Printing cancelled")
+        default: return L10n.tr("Preparing print…")
+        }
+    }
+
     static func validateSpoolPrinters(_ names: [String]) throws {
-        guard !names.isEmpty else { throw NSError(domain: "Yu.Print", code: 4, userInfo: [NSLocalizedDescriptionKey: "没有可用打印机；请从打印面板选择存储为 PDF。"] ) }
+        guard !names.isEmpty else { throw NSError(domain: "Yu.Print", code: 4, userInfo: [NSLocalizedDescriptionKey: L10n.tr("No printers are available; choose Save as PDF from the print panel.")] ) }
     }
 
     static func preparationConfig(title: String, untitled: Bool, resourceBase: URL?, info: NSPrintInfo) -> [String: Any] {
@@ -42,7 +51,7 @@ final class NativePrintController: NSObject, NSWindowDelegate {
 
     init(bridge: StorageBridge, owner: NSWindow, title: String, untitled: Bool, resourceBase: URL?,
          validateDestination: @escaping (URL) throws -> Void, onFinish: @escaping (String) -> Void) throws {
-        guard !Self.busy else { throw NSError(domain: "Yu.Print", code: 1, userInfo: [NSLocalizedDescriptionKey: "请先完成或取消当前打印。"] ) }
+        guard !Self.busy else { throw NSError(domain: "Yu.Print", code: 1, userInfo: [NSLocalizedDescriptionKey: L10n.tr("Finish or cancel the current print job first.")] ) }
         self.owner = owner; self.validateDestination = validateDestination; self.onFinish = onFinish
         // Independent print info: never mutate NSPrintInfo.shared or printer setup.
         info = NSPrintInfo(dictionary: [:])
@@ -59,7 +68,7 @@ final class NativePrintController: NSObject, NSWindowDelegate {
             styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
         Self.busy = true
-        panel.title = "打印"; panel.isReleasedWhenClosed = false; panel.delegate = self
+        panel.title = L10n.tr("Print"); panel.isReleasedWhenClosed = false; panel.delegate = self
         panel.becomesKeyOnlyIfNeeded = true
         cancelButton.target = self; cancelButton.action = #selector(cancelPressed)
         cancelButton.setAccessibilityIdentifier("yu-print-cancel")
@@ -74,23 +83,28 @@ final class NativePrintController: NSObject, NSWindowDelegate {
     private func awaitPrepared() async throws -> NativeHTMLExportTask.Status {
         var committed = false
         while true {
-            let status = try task.status(); stage.stringValue = status.message
+            let status = try task.status(); stage.stringValue = localizedStage(for: status.phase)
             if ["completed", "completed_with_warnings"].contains(status.phase) { return status }
-            if ["failed", "cancelled"].contains(status.phase) { throw error(status.message) }
+            if status.phase == "failed" {
+                fputs("Yu backend print preparation failure: \(status.message)\n", stderr)
+                throw error(L10n.tr("Print preparation failed."))
+            }
+            if status.phase == "cancelled" { throw error(L10n.tr("Printing cancelled")) }
             if cancelled { task.cancel() }
             else if status.phase == "ready" && !committed { try task.commit(allowWarnings: false); committed = true }
             else if status.phase == "warnings" && !committed {
-                guard let owner else { throw error("所属文档已关闭") }
-                let alert = NSAlert(); alert.messageText = "打印内容包含资源警告，是否继续？"
-                alert.informativeText = status.warnings.prefix(8).joined(separator: "\n")
-                alert.addButton(withTitle: "取消打印").keyEquivalent = "\u{1b}"
-                alert.addButton(withTitle: "带诊断继续打印")
+                guard let owner else { throw error(L10n.tr("The document window was closed.")) }
+                let alert = NSAlert(); alert.messageText = L10n.tr("Print content contains resource warnings. Continue?")
+                alert.informativeText = L10n.format(status.warnings.count == 1 ? "%d resource issue requires confirmation." : "%d resource issues require confirmation.", status.warnings.count)
+                    + " " + L10n.tr("Some content may use placeholders or be omitted from the export.")
+                alert.addButton(withTitle: L10n.tr("Cancel Printing")).keyEquivalent = "\u{1b}"
+                alert.addButton(withTitle: L10n.tr("Continue Printing with Diagnostics"))
                 warningAlert = alert
                 let response = await withCheckedContinuation { continuation in
                     alert.beginSheetModal(for: owner) { continuation.resume(returning: $0) }
                 }
                 warningAlert = nil
-                guard response == .alertSecondButtonReturn, !cancelled else { task.cancel(); throw error("已取消打印") }
+                guard response == .alertSecondButtonReturn, !cancelled else { task.cancel(); throw error(L10n.tr("Printing cancelled")) }
                 try task.commit(allowWarnings: true); committed = true
             }
             try await Task.sleep(nanoseconds: 40_000_000)
@@ -104,10 +118,10 @@ final class NativePrintController: NSObject, NSWindowDelegate {
         try autoreleasepool {
             let limit = 256 * 1024 * 1024
             let length = try input.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            guard length > 0, length <= limit else { throw NSError(domain: "Yu.Print", code: 5, userInfo: [NSLocalizedDescriptionKey: "系统打印文件超过 256 MiB 预算或为空。"]) }
+            guard length > 0, length <= limit else { throw NSError(domain: "Yu.Print", code: 5, userInfo: [NSLocalizedDescriptionKey: L10n.tr("System print file exceeds the 256 MiB budget or is empty.")]) }
             let bytes = try Data(contentsOf: input, options: .mappedIfSafe)
             guard bytes.count == length, let document = PDFDocument(data: bytes), (1...1000).contains(document.pageCount) else {
-                throw NSError(domain: "Yu.Print", code: 6, userInfo: [NSLocalizedDescriptionKey: "系统没有生成有效的打印文件。"])
+                throw NSError(domain: "Yu.Print", code: 6, userInfo: [NSLocalizedDescriptionKey: L10n.tr("System did not generate a valid print file.")])
             }
             // The system Save as PDF panel prepopulates Author with the account
             // name. Do not implicitly publish it or other environment metadata.
@@ -115,14 +129,14 @@ final class NativePrintController: NSObject, NSWindowDelegate {
             guard let data = document.dataRepresentation(), !data.isEmpty, data.count <= limit,
                   let checked = PDFDocument(data: data), checked.pageCount == document.pageCount,
                   checked.documentAttributes?[PDFDocumentAttribute.authorAttribute] == nil else {
-                throw NSError(domain: "Yu.Print", code: 7, userInfo: [NSLocalizedDescriptionKey: "系统打印文件元数据检查失败，未提交文件。"])
+                throw NSError(domain: "Yu.Print", code: 7, userInfo: [NSLocalizedDescriptionKey: L10n.tr("System print file metadata validation failed; the file was not committed.")])
             }
             try data.write(to: output, options: .withoutOverwriting)
         }
     }
 
     private func run(title: String) async {
-        var message = "已取消打印"
+        var message = L10n.tr("Printing cancelled")
         defer {
             isRunning = false; Self.busy = false; execution = nil
             owner?.removeChildWindow(panel); panel.delegate = nil; panel.close()
@@ -133,9 +147,9 @@ final class NativePrintController: NSObject, NSWindowDelegate {
             let preparedStatus = try await awaitPrepared()
             guard !cancelled, let owner else { return }
             guard let document = PDFDocument(url: prepared), (1...1000).contains(document.pageCount),
-                  let firstPage = document.page(at: 0) else { throw error("无法读取打印页面。") }
+                  let firstPage = document.page(at: 0) else { throw error(L10n.tr("Could not read print page.")) }
             let printView = NativePrintedPagesView(task: task, sourceSize: firstPage.bounds(for: .mediaBox).size, pages: document.pageCount)
-            guard NSPrintOperation.current == nil else { throw error("已有系统打印操作，请先完成或取消。") }
+            guard NSPrintOperation.current == nil else { throw error(L10n.tr("A system print operation is already active. Finish or cancel it first.")) }
             let operation = printView.makeOperation(info: info)
             defer { operation.cleanUp() }
             operation.jobTitle = title
@@ -151,17 +165,17 @@ final class NativePrintController: NSObject, NSWindowDelegate {
             // completion hook checks destinations before it authorizes delivery.
             var saving = false
             systemPanel.approval = { [self] approvedInfo in
-                guard !cancelled else { throw error("已取消打印") }
+                guard !cancelled else { throw error(L10n.tr("Printing cancelled")) }
                 try printView.validatePaper()
                 saving = approvedInfo.jobDisposition == .save
                 if saving {
-                    guard let destination = approvedInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] as? URL else { throw error("系统未提供打印文件位置。") }
+                    guard let destination = approvedInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] as? URL else { throw error(L10n.tr("System did not provide a print output location.")) }
                     try validateDestination(destination)
                     try task.printOutput(destination, publish: false)
                     approvedInfo.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = spool
                 } else if approvedInfo.jobDisposition == .spool {
                     try Self.validateSpoolPrinters(NSPrinter.printerNames)
-                } else { throw error("请选择打印或存储为 PDF；其他系统 PDF 工作流程暂不支持。") }
+                } else { throw error(L10n.tr("Choose Print or Save as PDF; other system PDF workflows are not currently supported.")) }
             }
             operation.showsPrintPanel = true
             operation.showsProgressPanel = true
@@ -174,25 +188,29 @@ final class NativePrintController: NSObject, NSWindowDelegate {
             systemPanelActive = false
             if let failure = systemPanel.failure { throw failure }
             guard completed, !cancelled else { return }
-            guard !printView.drawingFailed else { throw error("系统打印未能完整绘制；文档未改变。") }
+            guard !printView.drawingFailed else { throw error(L10n.tr("System printing did not finish drawing; the document was not changed.")) }
             if saving {
                 owner.addChildWindow(panel, ordered: .above)
-                panel.orderFront(nil); stage.stringValue = "检查系统打印文件…"
+                panel.orderFront(nil); stage.stringValue = L10n.tr("Checking system print file…")
                 let clean = directory.appendingPathComponent("checked-output.pdf"), input = spool
                 try await Task.detached(priority: .userInitiated) { try Self.prepareSystemPDF(input, output: clean, title: title) }.value
                 guard !cancelled else { task.cancel(); return }
                 try task.printOutput(clean, publish: true)
                 while true {
-                    let status = try task.status(); stage.stringValue = status.message
-                    if ["completed", "completed_with_warnings"].contains(status.phase) { message = status.message; break }
-                    if ["failed", "cancelled"].contains(status.phase) { throw error(status.message) }
+                    let status = try task.status(); stage.stringValue = localizedStage(for: status.phase)
+                    if ["completed", "completed_with_warnings"].contains(status.phase) { message = L10n.tr("Saved print output successfully."); break }
+                    if status.phase == "failed" {
+                        fputs("Yu backend print output failure: \(status.message)\n", stderr)
+                        throw error(L10n.tr("Print output failed."))
+                    }
+                    if status.phase == "cancelled" { throw error(L10n.tr("Printing cancelled")) }
                     if cancelled { task.cancel() }
                     try await Task.sleep(nanoseconds: 40_000_000)
                 }
-            } else { message = "已交给系统打印；设备出纸状态请查看系统队列。" }
-            if !preparedStatus.warnings.isEmpty { message += "（包含已确认的资源诊断）" }
+            } else { message = L10n.tr("Submitted to the system print queue; check the system queue for device output status.") }
+            if !preparedStatus.warnings.isEmpty { message += " (" + L10n.tr("Includes confirmed resource diagnostics.") + ")" }
         } catch {
-            message = cancelled ? "已取消打印" : error.localizedDescription
+            message = cancelled ? L10n.tr("Printing cancelled") : error.localizedDescription
         }
     }
     private func error(_ message: String) -> Error { NSError(domain: "Yu.Print", code: 2, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -266,7 +284,7 @@ final class NativePrintedPagesView: NSView {
         guard box.width.isFinite, box.height.isFinite, box.width > 0, box.height > 0,
               sourceSize.width > 0, sourceSize.height > 0,
               min(box.width / sourceSize.width, box.height / sourceSize.height) >= 0.25 else {
-            throw NSError(domain: "Yu.Print", code: 3, userInfo: [NSLocalizedDescriptionKey: "可打印区域过小，整页需要缩小至 25% 以下；请调整纸张或方向。"])
+            throw NSError(domain: "Yu.Print", code: 3, userInfo: [NSLocalizedDescriptionKey: L10n.tr("Printable area is too small; the whole page would need to scale below 25%. Adjust paper size or orientation.")])
         }
         drawingFailed = false
     }
@@ -299,10 +317,10 @@ final class NativePrintedPagesView: NSView {
 @MainActor
 private final class NativePrintExplanation: NSViewController, NSPrintPanelAccessorizing {
     override func loadView() {
-        let label = NSTextField(wrappingLabelWithString: "使用与 PDF 相同的固定分页及浅色纸张。更改打印纸张、方向或可打印区域时，整页等比缩小，不重新分页；预览即系统输出内容。")
+        let label = NSTextField(wrappingLabelWithString: L10n.tr("Uses the same fixed pagination and light paper as PDF export. When paper size, orientation, or printable area changes, the whole page scales proportionally without repagination; the preview matches system output."))
         label.frame = NSRect(x: 0, y: 0, width: 300, height: 75); view = label
     }
     func localizedSummaryItems() -> [[NSPrintPanel.AccessorySummaryKey: String]] {
-        [[.itemName: "页面适配", .itemDescription: "固定分页；整页等比缩小至纸张"]]
+        [[.itemName: L10n.tr("Page Scaling"), .itemDescription: L10n.tr("Fixed pagination; scale whole page to paper")]]
     }
 }

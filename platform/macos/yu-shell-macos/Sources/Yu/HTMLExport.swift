@@ -29,14 +29,14 @@ final class NativeHTMLExportTask {
                 yu_storage_html_export_copy_status(handle, $0.baseAddress, $0.count, &written)
             }
             if code == YU_STORAGE_BUFFER_TOO_SMALL { capacity = written; continue }
-            guard code == YU_STORAGE_OK, written <= bytes.count else { throw failure("无法读取导出任务状态。") }
+            guard code == YU_STORAGE_OK, written <= bytes.count else { throw failure(L10n.tr("Could not read export task status.")) }
             return try JSONDecoder().decode(Status.self, from: Data(bytes.prefix(written)))
         }
-        throw failure("导出状态持续变化，读取失败。")
+        throw failure(L10n.tr("Export status kept changing and could not be read."))
     }
     func commit(allowWarnings: Bool) throws {
         guard yu_storage_html_export_commit(handle, allowWarnings ? 1 : 0) == YU_STORAGE_OK else {
-            throw failure("任务未准备完成、已取消，或尚未确认资源警告。")
+            throw failure(L10n.tr("The task is not ready, was cancelled, or resource warnings have not been confirmed."))
         }
     }
     func drawPrintPage(_ page: Int, context: CGContext) -> Bool {
@@ -46,7 +46,10 @@ final class NativeHTMLExportTask {
     func printOutput(_ url: URL, publish: Bool) throws {
         let bytes = Array(url.path.utf8)
         let code = bytes.withUnsafeBufferPointer { yu_storage_print_output(handle, $0.baseAddress, $0.count, publish ? 1 : 0) }
-        guard code == YU_STORAGE_OK else { throw failure((try? status().message) ?? "系统打印输出失败。") }
+        guard code == YU_STORAGE_OK else {
+            fputs("Yu backend print output failure: \((try? status().message) ?? "unknown")\n", stderr)
+            throw failure(L10n.tr("Print output failed."))
+        }
     }
     func cancel() { yu_storage_html_export_cancel(handle) }
     private func failure(_ message: String) -> Error {
@@ -60,20 +63,20 @@ final class NativeHTMLExportTask {
 final class NativeHTMLExportOptions: NSObject {
     let view = NSStackView()
     private let style = NSPopUpButton()
-    private let baseLabel = NSTextField(labelWithString: "图片基准目录：未选择")
+    private let baseLabel = NSTextField(labelWithString: L10n.tr("Image base directory: Not selected"))
     private(set) var resourceBase: URL?
     private let preferenceKey: String
     init(untitled: Bool, preferenceKey: String = "Yu.exportHTML.currentTheme") {
         self.preferenceKey = preferenceKey
         super.init()
-        style.addItems(withTitles: ["浅色", "当前正文主题"])
+        style.addItems(withTitles: [L10n.tr("Light"), L10n.tr("Current editor theme")])
         style.selectItem(at: UserDefaults.standard.bool(forKey: preferenceKey) ? 1 : 0)
-        let styleRow = NSStackView(views: [NSTextField(labelWithString: "导出样式："), style])
+        let styleRow = NSStackView(views: [NSTextField(labelWithString: L10n.tr("Export style:")), style])
         styleRow.orientation = .horizontal
         view.orientation = .vertical; view.alignment = .leading; view.spacing = 10
         view.addArrangedSubview(styleRow)
         if untitled {
-            let choose = NSButton(title: "选择图片基准目录…", target: self, action: #selector(chooseBase))
+            let choose = NSButton(title: L10n.tr("Choose image base directory…"), target: self, action: #selector(chooseBase))
             view.addArrangedSubview(choose)
             baseLabel.lineBreakMode = .byTruncatingMiddle
             view.addArrangedSubview(baseLabel)
@@ -82,10 +85,10 @@ final class NativeHTMLExportOptions: NSObject {
     }
     @objc private func chooseBase() {
         let panel = NSOpenPanel()
-        panel.title = "选择相对图片路径的基准目录"
+        panel.title = L10n.tr("Choose the base directory for relative image paths")
         panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
-            resourceBase = url; baseLabel.stringValue = "图片基准目录：\(url.lastPathComponent)"
+            resourceBase = url; baseLabel.stringValue = L10n.format("Image base directory: %@", url.lastPathComponent)
         }
     }
     func config(title: String, untitled: Bool, appearance: NSAppearance) -> [String: Any] {
@@ -114,11 +117,11 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private weak var owner: NSWindow?
     private var destination: URL
     private let panel: NSPanel
-    private let stage = NSTextField(wrappingLabelWithString: "准备导出…")
-    private let detail = NSTextField(wrappingLabelWithString: "导出使用确认时的固定内容，您可以继续编辑文档。")
+    private let stage = NSTextField(wrappingLabelWithString: L10n.tr("Preparing export…"))
+    private let detail = NSTextField(wrappingLabelWithString: L10n.tr("Export uses a fixed snapshot from confirmation time. You can continue editing the document."))
     private let indicator = NSProgressIndicator()
-    private let cancelButton = NSButton(title: "取消导出", target: nil, action: nil)
-    private let revealButton = NSButton(title: "在访达中显示", target: nil, action: nil)
+    private let cancelButton = NSButton(title: L10n.tr("Cancel Export"), target: nil, action: nil)
+    private let revealButton = NSButton(title: L10n.tr("Show in Finder"), target: nil, action: nil)
     private var timer: Timer?
     private var askedWarnings = false
     private var committed = false
@@ -127,12 +130,24 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private(set) var isRunning = true
     private(set) var lastStatus: NativeHTMLExportTask.Status?
 
+    private func localizedStage(for phase: String) -> String {
+        switch phase {
+        case "ready": return L10n.tr("Ready to export")
+        case "warnings", "split": return L10n.tr("Waiting for export confirmation…")
+        case "writing", "committing": return L10n.tr("Saving export…")
+        case "completed", "completed_with_warnings": return L10n.tr("Export completed")
+        case "cancelled": return L10n.tr("Export cancelled")
+        case "failed": return L10n.tr("Export failed. No output was committed.")
+        default: return L10n.tr("Preparing export…")
+        }
+    }
+
     init(task: NativeHTMLExportTask, destination: URL, owner: NSWindow, formatName: String = "HTML", onClose: @escaping () -> Void) {
         self.task = task; self.destination = destination; self.owner = owner; self.onClose = onClose
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 185),
             styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
-        panel.title = "导出 \(formatName)"; panel.isReleasedWhenClosed = false; panel.delegate = self
+        panel.title = L10n.format("Export %@", formatName); panel.isReleasedWhenClosed = false; panel.delegate = self
         panel.becomesKeyOnlyIfNeeded = true
         stage.font = .boldSystemFont(ofSize: 14)
         indicator.style = .bar; indicator.isIndeterminate = true; indicator.startAnimation(nil)
@@ -158,7 +173,7 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private func poll() {
         guard !closed, let task else { return }
         do {
-            let status = try task.status(); lastStatus = status; stage.stringValue = status.message
+            let status = try task.status(); lastStatus = status; stage.stringValue = localizedStage(for: status.phase)
             switch status.phase {
             case "ready":
                 if !committed { committed = true; try task.commit(allowWarnings: false) }
@@ -170,14 +185,26 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
                 if let output = status.outputPath { destination = URL(fileURLWithPath: output) }
                 isRunning = false; timer?.invalidate(); timer = nil
                 indicator.stopAnimation(nil); indicator.isHidden = true
-                detail.stringValue = "\(destination.lastPathComponent)" + ((status.pages ?? 0) > 0 ? " · \(status.pages ?? 0) 页" : "") + " · \(status.images) 张图片 · \(status.embedded) 项公式/图表" + (status.warnings.isEmpty ? "" : "\n含 \(status.warnings.count) 项警告，不是完整成功。")
-                if let sizes = status.pngSizes, !sizes.isEmpty {
-                    detail.stringValue += " · \(sizes.count) 张 PNG · 宽 \(sizes[0][0]) px"
+                var summary = destination.lastPathComponent
+                if let pages = status.pages, pages > 0 {
+                    summary += " · " + L10n.format(pages == 1 ? "%d page" : "%d pages", pages)
                 }
-                revealButton.isHidden = false; cancelButton.title = "关闭"
+                summary += " · " + L10n.format(status.images == 1 ? "%d image" : "%d images", status.images)
+                summary += " · " + L10n.format(status.embedded == 1 ? "%d formula/chart item" : "%d formula/chart items", status.embedded)
+                if !status.warnings.isEmpty {
+                    summary += "\n" + L10n.format(status.warnings.count == 1 ? "Contains %d warning; export is not fully successful." : "Contains %d warnings; export is not fully successful.", status.warnings.count)
+                }
+                detail.stringValue = summary
+                if let sizes = status.pngSizes, !sizes.isEmpty {
+                    detail.stringValue += " · " + L10n.format(sizes.count == 1 ? "%d PNG file · width %d px" : "%d PNG files · width %d px", sizes.count, sizes[0][0])
+                }
+                revealButton.isHidden = false; cancelButton.title = L10n.tr("Close")
                 self.task = nil
-            case "failed", "cancelled":
-                finishFailure(status.message)
+            case "failed":
+                fputs("Yu backend export failure: \(status.message)\n", stderr)
+                finishFailure(L10n.tr("Export failed. No output was committed."))
+            case "cancelled":
+                finishFailure(L10n.tr("Export cancelled"))
             default: break
             }
         } catch { task.cancel(); finishFailure(error.localizedDescription) }
@@ -185,11 +212,15 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private func confirmSplit(_ status: NativeHTMLExportTask.Status) {
         guard let owner else { cancelAndClose(); return }
         let alert = NSAlert()
-        alert.messageText = "文档超过单张 PNG 预算，是否分段导出？"
-        let name = status.outputPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "新目录"
-        alert.informativeText = "将按完整行／表格合并组输出 \(status.pngSizes?.count ?? 0) 张编号 PNG，保存到“\(name)”。不覆盖已有目录；取消不会产生半套输出。" + (status.warnings.isEmpty ? "" : "\n另有资源诊断：\n" + status.warnings.prefix(8).joined(separator: "\n"))
-        alert.addButton(withTitle: "取消导出").keyEquivalent = "\u{1b}"
-        alert.addButton(withTitle: status.warnings.isEmpty ? "分段导出" : "带诊断分段导出")
+        alert.messageText = L10n.tr("Document exceeds the single-PNG budget. Export in segments?")
+        let name = status.outputPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? L10n.tr("New Folder")
+        alert.informativeText = L10n.format("Export %d numbered PNG files using complete row/table groups to “%@”. Existing directories are not overwritten; cancelling never leaves a partial set.", status.pngSizes?.count ?? 0, name)
+        if !status.warnings.isEmpty {
+            alert.informativeText += "\n" + L10n.format(status.warnings.count == 1 ? "%d resource issue requires confirmation." : "%d resource issues require confirmation.", status.warnings.count)
+                + " " + L10n.tr("Some content may use placeholders or be omitted from the export.")
+        }
+        alert.addButton(withTitle: L10n.tr("Cancel Export")).keyEquivalent = "\u{1b}"
+        alert.addButton(withTitle: status.warnings.isEmpty ? L10n.tr("Export in Segments") : L10n.tr("Export in Segments with Diagnostics"))
         alert.beginSheetModal(for: owner) { [weak self] response in
             guard let self, !self.closed, let task = self.task else { return }
             if response == .alertSecondButtonReturn {
@@ -201,12 +232,14 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private func confirmWarnings(_ status: NativeHTMLExportTask.Status) {
         guard let owner else { cancelAndClose(); return }
         let alert = NSAlert(); alert.alertStyle = .warning
-        alert.messageText = "部分内容需要占位或诊断，是否继续？"
-        alert.informativeText = status.warnings.prefix(8).joined(separator: "\n") + (status.warnings.count > 8 ? "\n另有 \(status.warnings.count - 8) 项警告。" : "") + "\n取消将保留已有输出文件。"
-        let cancel = alert.addButton(withTitle: "取消导出")
+        alert.messageText = L10n.tr("Some content requires placeholders or diagnostics. Continue?")
+        alert.informativeText = L10n.format(status.warnings.count == 1 ? "%d resource issue requires confirmation." : "%d resource issues require confirmation.", status.warnings.count)
+            + " " + L10n.tr("Some content may use placeholders or be omitted from the export.")
+            + "\n" + L10n.tr("Cancelling keeps existing output files.")
+        let cancel = alert.addButton(withTitle: L10n.tr("Cancel Export"))
         cancel.keyEquivalent = "\u{1b}"
         cancel.setAccessibilityIdentifier("yu-html-warning-cancel")
-        let proceed = alert.addButton(withTitle: "带占位或诊断继续导出")
+        let proceed = alert.addButton(withTitle: L10n.tr("Continue Export with Placeholders or Diagnostics"))
         proceed.setAccessibilityIdentifier("yu-html-warning-proceed")
         alert.beginSheetModal(for: owner) { [weak self] response in
             guard let self, !self.closed, self.isRunning, let task = self.task else { return }
@@ -219,8 +252,8 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private func finishFailure(_ message: String) {
         isRunning = false; timer?.invalidate(); timer = nil
         indicator.stopAnimation(nil); indicator.isHidden = true
-        stage.stringValue = message; detail.stringValue = "没有提交新的输出文件。原文及已有输出保持不变。"
-        cancelButton.title = "关闭"; task = nil
+        stage.stringValue = message; detail.stringValue = L10n.tr("No new output was committed. The source document and existing output remain unchanged.")
+        cancelButton.title = L10n.tr("Close"); task = nil
     }
     @objc private func reveal() { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
     @objc private func cancelPressed() { cancelAndClose() }

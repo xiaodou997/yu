@@ -37,7 +37,7 @@ swiftc Sources/Yu/NativeSpelling.swift Tests/NativeSpellingChecks.swift -o /tmp/
 /tmp/yu-native-spelling-check
 
 # Filesystem import checks use private temporary resources and remove them.
-swiftc Sources/Yu/ImageResources.swift Sources/Yu/WritingPreferences.swift Tests/ImageResourceChecks.swift -o /tmp/yu-image-resource-checks
+swiftc Sources/Yu/Localization.swift Sources/Yu/ImageResources.swift Sources/Yu/WritingPreferences.swift Tests/ImageResourceChecks.swift -o /tmp/yu-image-resource-checks
 /tmp/yu-image-resource-checks
 
 # --build 是增量构建。删除一个 C 类型或 FFI 函数后，SwiftPM 可能不会重编引用
@@ -53,6 +53,17 @@ fi
 binary="${YU_SELF_CHECK_BINARY:-$host_dir/.build/Yu.app/Contents/MacOS/Yu}"
 if [[ ! -x "$binary" ]]; then
     print -r -- "未找到可执行文件 $binary，请先运行 $0 --build" >&2
+    exit 1
+fi
+
+printf "%-34s " "localization"
+localization_app="${binary:A:h:h:h}"
+if output="$("$binary" --localization-self-check 2>&1)" \
+    && python3 "$host_dir/run-localization-checks.py" "$localization_app" >/dev/null; then
+    print -r -- "OK"
+else
+    print -r -- "FAILED"
+    print -r -- "$output" | sed 's/^/    /'
     exit 1
 fi
 

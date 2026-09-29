@@ -116,7 +116,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
         surfaceCoordinator.onError = { [weak self] error in
             // Report an unavailable surface without pretending a fallback rendered it.
-            self?.statusLabel.stringValue = "文档暂时无法显示"
+            self?.statusLabel.stringValue = L10n.tr("Document temporarily unavailable")
             self?.statusLabel.toolTip = error.localizedDescription
         }
     }
@@ -335,7 +335,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
 
         statusLabel.setAccessibilityElement(true)
-        statusLabel.setAccessibilityLabel("文档状态")
+        statusLabel.setAccessibilityLabel(L10n.tr("Document Status"))
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = NSFont.systemFont(ofSize: YuVisualTokens.statusBarFontSize)
         statusLabel.textColor = NativeTheme.color(\.text).withAlphaComponent(0.65)
@@ -348,7 +348,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         statusDetailLabel.alignment = .right
         statusDetailLabel.translatesAutoresizingMaskIntoConstraints = false
         statusDetailLabel.setAccessibilityElement(true)
-        statusDetailLabel.setAccessibilityLabel("字数")
+        statusDetailLabel.setAccessibilityLabel(L10n.tr("Character Count"))
 
         let statusBar = YuStatusBarView()
         statusBar.addSubview(statusLabel)
@@ -377,16 +377,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // 后者的 holding priority 会再压过首选高度约束一次（陷阱 26 是它的
         // 水平版），而这里根本不需要用户拖分隔线。
         sidebarTabs.segmentCount = 2
-        sidebarTabs.setLabel("文件", forSegment: 0)
-        sidebarTabs.setLabel("大纲", forSegment: 1)
+        sidebarTabs.setLabel(L10n.tr("Files"), forSegment: 0)
+        sidebarTabs.setLabel(L10n.tr("Outline"), forSegment: 1)
         sidebarTabs.selectedSegment = 1
         sidebarTabs.segmentStyle = .automatic
         sidebarTabs.segmentDistribution = .fillEqually
-        sidebarTabs.toolTip = "切换文件或大纲"
+        sidebarTabs.toolTip = L10n.tr("Switch between Files and Outline")
         sidebarTabs.target = self
         sidebarTabs.action = #selector(selectSidebarTab(_:))
         sidebarTabs.translatesAutoresizingMaskIntoConstraints = false
-        sidebarTabs.setAccessibilityLabel("侧栏内容")
+        sidebarTabs.setAccessibilityLabel(L10n.tr("Sidebar Content"))
         let sidebarHeader = NSView()
         sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
         sidebarHeader.addSubview(sidebarTabs)
@@ -776,10 +776,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         if identifier.rawValue == "yu.more" {
             let item = NSMenuToolbarItem(itemIdentifier: identifier)
-            item.label = "阅读主题"
-            item.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: "更多")
-            let menu = NSMenu(title: "阅读主题")
-            for (index, title) in ["Yu · 跟随系统", "Github", "Night"].enumerated() {
+            item.label = L10n.tr("Reading Theme")
+            item.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: L10n.tr("More"))
+            let menu = NSMenu(title: L10n.tr("Reading Theme"))
+            for (index, title) in [L10n.tr("Yu · Follow System"), "Github", "Night"].enumerated() {
                 let action = NSMenuItem(title: title, action: #selector(selectReadingTheme(_:)), keyEquivalent: "")
                 action.target = self
                 action.tag = index
@@ -791,16 +791,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.target = self
         if identifier.rawValue == "yu.sidebar" {
-            item.label = "侧栏"
+            item.label = L10n.tr("Sidebar")
             item.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: item.label)
             item.action = #selector(toggleSidebarToolbar(_:))
         } else if identifier.rawValue == "yu.find" {
-            item.label = "查找"
+            item.label = L10n.tr("Find")
             item.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: item.label)
             item.action = #selector(toggleSearchFromMenu(_:))
         } else if identifier.rawValue == "yu.source" {
-            item.label = bridge.sourceMode ? "即时预览" : "源码模式"
-            item.toolTip = "切换 Markdown 源码与即时预览"
+            item.label = bridge.sourceMode ? L10n.tr("Instant Preview") : L10n.tr("Source Mode")
+            item.toolTip = L10n.tr("Switch between Markdown source and instant preview")
             item.image = NSImage(systemSymbolName: bridge.sourceMode ? "doc.richtext" : "chevron.left.forwardslash.chevron.right", accessibilityDescription: item.label)
             item.action = #selector(toggleSourceMode(_:))
         } else { return nil }
@@ -821,7 +821,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         refreshOutline(force: true)
         view.needsLayout = true
         for item in view.window?.toolbar?.items ?? [] where item.itemIdentifier.rawValue == "yu.source" {
-            item.label = enabled ? "即时预览" : "源码模式"
+            item.label = enabled ? L10n.tr("Instant Preview") : L10n.tr("Source Mode")
             item.image = NSImage(systemSymbolName: enabled ? "doc.richtext" : "chevron.left.forwardslash.chevron.right", accessibilityDescription: item.label)
         }
         scheduleVisualSubmit()
@@ -959,7 +959,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     @objc fileprivate func insertImageFromMenu(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.title = "插入图片"
+        panel.title = L10n.tr("Insert Image")
         panel.allowedContentTypes = [.image]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
@@ -996,17 +996,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     @objc fileprivate func printFromMenu(_ sender: Any?) {
         guard !NativePrintController.busy, htmlExport?.isRunning != true, let window = view.window else { return }
         guard !bridge.composition.active, !textView.hasMarkedText() else {
-            let message = "请先完成或取消组字，再打印。"
+            let message = L10n.tr("Finish or cancel text composition before printing.")
             statusLabel.stringValue = message; statusLabel.setAccessibilityValue(message)
             return
         }
         var base: URL?
         if persistence.isUntitled {
-            let alert = NSAlert(); alert.messageText = "打印未命名文档"
-            alert.informativeText = "如正文包含相对路径图片，请选择图片基准目录；无需先保存 Markdown。"
-            alert.addButton(withTitle: "继续打印")
-            alert.addButton(withTitle: "选择图片基准目录…")
-            alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
+            let alert = NSAlert(); alert.messageText = L10n.tr("Print Untitled Document")
+            alert.informativeText = L10n.tr("If the document contains relative image paths, choose an image base directory; you do not need to save the Markdown file first.")
+            alert.addButton(withTitle: L10n.tr("Continue Printing"))
+            alert.addButton(withTitle: L10n.tr("Choose image base directory…"))
+            alert.addButton(withTitle: L10n.tr("Cancel")).keyEquivalent = "\u{1b}"
             let response = alert.runModal()
             if response == .alertSecondButtonReturn {
                 let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
@@ -1016,7 +1016,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
         do {
             printing = try NativePrintController(bridge: bridge, owner: window,
-                title: persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent,
+                title: persistence.isUntitled ? L10n.tr("Untitled") : documentURL.deletingPathExtension().lastPathComponent,
                 untitled: persistence.isUntitled, resourceBase: base,
                 validateDestination: { [weak self] url in try self?.onValidateSaveDestination?(url) },
                 onFinish: { [weak self] message in
@@ -1033,9 +1033,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             // Refusal only updates existing chrome; it never enters a file panel,
             // commits or cancels the overlay. The next document update restores
             // the ordinary status automatically.
-            let message = "请先完成或取消组字，再导出。"
+            let message = L10n.tr("Finish or cancel text composition before exporting.")
             statusLabel.stringValue = message
-            statusLabel.toolTip = "导出不会替您提交或取消输入法组字。"
+            statusLabel.toolTip = L10n.tr("Export will not commit or cancel input method composition.")
             statusLabel.setAccessibilityValue(message)
             return
         }
@@ -1046,11 +1046,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         let formatName = png ? "PNG" : (pdf ? "PDF" : "HTML")
         let pdfOptions = pdf ? NativePDFExportOptions(untitled: persistence.isUntitled) : nil
         let panel = NSSavePanel()
-        panel.title = "导出 \(formatName)"
-        panel.prompt = "导出"
+        panel.title = L10n.format("Export %@", formatName)
+        panel.prompt = L10n.tr("Export")
         panel.allowedContentTypes = png ? [.png] : (pdf ? [.pdf] : [.html])
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + (png ? ".png" : (pdf ? ".pdf" : ".html"))
+        panel.nameFieldStringValue = (persistence.isUntitled ? L10n.tr("Untitled") : documentURL.deletingPathExtension().lastPathComponent) + (png ? ".png" : (pdf ? ".pdf" : ".html"))
         if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
         panel.accessoryView = pngOptions?.view ?? pdfOptions?.view ?? htmlOptions?.view
         guard panel.runModal() == .OK, let destination = panel.url else { return }
@@ -1075,8 +1075,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     @discardableResult
     private func chooseSaveDestination() -> Bool {
         let panel = NSSavePanel()
-        panel.title = persistence.isUntitled ? "保存文档" : "另存为"
-        panel.nameFieldStringValue = persistence.isUntitled ? "未命名.md" : documentURL.lastPathComponent
+        panel.title = persistence.isUntitled ? L10n.tr("Save Document") : L10n.tr("Save As")
+        panel.nameFieldStringValue = persistence.isUntitled ? L10n.tr("Untitled.md") : documentURL.lastPathComponent
         if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
         panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText, .plainText]
         panel.canCreateDirectories = true
@@ -2903,13 +2903,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         let conflict = request.close_state >= 3
         let alert = NSAlert()
         alert.alertStyle = conflict ? .warning : .informational
-        alert.messageText = conflict ? "文件已被外部修改" : "要保存对“\(view.window?.title ?? "未命名")”的更改吗？"
+        alert.messageText = conflict
+            ? L10n.tr("File Was Modified Externally")
+            : L10n.format("Save changes to “%@”?", view.window?.title ?? L10n.tr("Untitled"))
         alert.informativeText = conflict
-            ? "磁盘版本不会被覆盖。可以将本地内容保存为副本，或丢弃本地修改。"
-            : "可以保存、丢弃这次修改，或取消关闭。"
-        alert.addButton(withTitle: conflict ? "保存副本…" : "保存")
-        alert.addButton(withTitle: "不保存")
-        alert.addButton(withTitle: "取消")
+            ? L10n.tr("The disk version will not be overwritten. You can save local content as a copy, or discard local changes.")
+            : L10n.tr("You can save, discard changes, or cancel closing.")
+        alert.addButton(withTitle: conflict ? L10n.tr("Save a Copy…") : L10n.tr("Save"))
+        alert.addButton(withTitle: L10n.tr("Don't Save"))
+        alert.addButton(withTitle: L10n.tr("Cancel"))
         let response = closeAlertDecision?(alert) ?? alert.runModal()
         do {
             if response == .alertFirstButtonReturn {
@@ -2971,16 +2973,18 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = state.disk == .missing ? "文件已被删除或移动" : "文件已被外部修改"
+        alert.messageText = state.disk == .missing
+            ? L10n.tr("File Was Deleted or Moved")
+            : L10n.tr("File Was Modified Externally")
         if state.dirty {
             alert.informativeText =
-                "文件已在其他应用中修改。本地更改仍保留，请保存副本或关闭窗口处理冲突。"
-            alert.addButton(withTitle: "知道了")
+                L10n.tr("The file was modified in another app. Local changes are preserved. Save a copy or close the window to resolve the conflict.")
+            alert.addButton(withTitle: L10n.tr("OK"))
         } else {
             alert.informativeText =
-                "当前没有本地未保存修改，可以重新加载磁盘上的版本。"
-            alert.addButton(withTitle: "重新加载")
-            alert.addButton(withTitle: "稍后")
+                L10n.tr("There are no unsaved local changes. You can reload the version on disk.")
+            alert.addButton(withTitle: L10n.tr("Reload"))
+            alert.addButton(withTitle: L10n.tr("Later"))
         }
         let response = externalAlertDecision?(alert) ?? alert.runModal()
         guard !state.dirty, response == .alertFirstButtonReturn else { return }
@@ -2994,14 +2998,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     private func updateStatus() {
         let state = bridge.state
-        let dirty = state.dirty ? "● 未保存" : "已保存"
+        let dirty = state.dirty ? L10n.tr("● Unsaved") : L10n.tr("Saved")
         let bom = state.bom ? "UTF-8 BOM" : "UTF-8"
         let status = "\(dirty) · Rev \(state.revision) · \(state.disk.label) · \(bom)"
         statusLabel.stringValue = persistence.notice ?? ""
         statusLabel.toolTip = persistence.notice ?? status
         view.window?.isDocumentEdited = state.dirty
         statusLabel.setAccessibilityValue(status)
-        statusDetailLabel.stringValue = "\((bridge.source as NSString).length) 字符"
+        let characterCount = (bridge.source as NSString).length
+        statusDetailLabel.stringValue = L10n.format(characterCount == 1 ? "%d character" : "%d characters", characterCount)
         statusDetailLabel.setAccessibilityValue(statusDetailLabel.stringValue)
     }
 
@@ -3143,8 +3148,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             exit(EXIT_FAILURE)
                         }
                     }
-                    let saveItem = NSMenuItem(title: "保存", action: #selector(DocumentViewController.saveFromMenu(_:)), keyEquivalent: "s")
-                    let reloadItem = NSMenuItem(title: "重新加载", action: #selector(DocumentViewController.reloadFromMenu(_:)), keyEquivalent: "")
+                    let saveItem = NSMenuItem(title: L10n.tr("Save"), action: #selector(DocumentViewController.saveFromMenu(_:)), keyEquivalent: "s")
+                    let reloadItem = NSMenuItem(title: L10n.tr("Reload"), action: #selector(DocumentViewController.reloadFromMenu(_:)), keyEquivalent: "")
                     guard window.toolbar != nil,
                           window.titleVisibility == .visible,
                           window.representedURL?.standardizedFileURL == URL(fileURLWithPath: bridge.path).standardizedFileURL,
@@ -3238,7 +3243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window.setContentSize(NSSize(width: 900, height: 620))
         window.titleVisibility = .visible
-        window.title = controller.persistence.isUntitled ? "未命名" : controller.documentURL.lastPathComponent
+        window.title = controller.persistence.isUntitled ? L10n.tr("Untitled") : controller.documentURL.lastPathComponent
         window.representedURL = controller.persistence.isUntitled ? nil : controller.documentURL
         window.toolbarStyle = .unified
         // AppKit owns chrome appearance independently from Github/Night.
@@ -3260,12 +3265,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self, let controller else { throw CocoaError(.userCancelled) }
             if let existing = self.existingWindow(for: destination), existing !== window {
                 throw NSError(domain: "Yu.Document", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "这个文件已在另一个 Yu 窗口中打开，请选择其他位置。"])
+                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This file is already open in another Yu window. Choose a different location.")])
             }
             if self.identity(destination) != self.identity(controller.documentURL),
                try self.pendingRecovery(for: destination) != nil {
                 throw NSError(domain: "Yu.Document", code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "这个位置有未处理的恢复副本。请先从“恢复未保存的文档”处理，或选择其他位置。"])
+                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This location has an unresolved recovery copy. Handle it from “Recover Unsaved Documents” first, or choose another location.")])
             }
         }
         controller.onDocumentURLChange = { [weak self, weak window, weak controller] in
@@ -3306,11 +3311,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func recoveryResponse(for target: URL) -> NSApplication.ModalResponse {
         let alert = NSAlert()
-        alert.messageText = "恢复未保存的文档？"
-        alert.informativeText = "\(NativeDocumentLocations.current.isDraft(target) ? "未命名文档" : target.path)\n恢复不会立即覆盖磁盘文件；确认内容后请手动保存。"
-        alert.addButton(withTitle: "恢复")
-        alert.addButton(withTitle: "丢弃恢复副本")
-        alert.addButton(withTitle: "稍后")
+        alert.messageText = L10n.tr("Recover Unsaved Document?")
+        let targetDescription = NativeDocumentLocations.current.isDraft(target)
+            ? L10n.tr("Untitled Document") : target.path
+        alert.informativeText = L10n.format("%@\nRecovery will not overwrite the file on disk immediately. Review the content, then save manually.", targetDescription)
+        alert.addButton(withTitle: L10n.tr("Recover"))
+        alert.addButton(withTitle: L10n.tr("Discard Recovery Copy"))
+        alert.addButton(withTitle: L10n.tr("Later"))
         return recoveryAlertDecision?(alert) ?? alert.runModal()
     }
 
@@ -3334,10 +3341,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 } else {
                     let alert = NSAlert()
-                    alert.messageText = "这个文档的恢复副本无法读取"
-                    alert.informativeText = "可以保留损坏副本用于后续检查，再打开磁盘文件。副本不会被删除。"
-                    alert.addButton(withTitle: "保留副本并打开")
-                    alert.addButton(withTitle: "取消")
+                    alert.messageText = L10n.tr("This Document’s Recovery Copy Could Not Be Read")
+                    alert.informativeText = L10n.tr("You can keep the damaged copy for later inspection and open the disk file. The copy will not be deleted.")
+                    alert.addButton(withTitle: L10n.tr("Keep Copy and Open"))
+                    alert.addButton(withTitle: L10n.tr("Cancel"))
                     guard (recoveryAlertDecision?(alert) ?? alert.runModal()) == .alertFirstButtonReturn else { return nil }
                     let archive = NativeDocumentLocations.current.recovery.appendingPathComponent("Invalid", isDirectory: true)
                     try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -3389,8 +3396,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let target = try StorageBridge.recoveryTarget(at: record)
                     if let existing = existingWindow(for: target), documents[existing]?.persistence.bridge.state.dirty == true {
                         let alert = NSAlert()
-                        alert.messageText = "恢复副本已保留"
-                        alert.informativeText = "“\(existing.title)”当前有未保存修改。请先处理该窗口，再从“文件 → 恢复未保存的文档”打开恢复副本。"
+                        alert.messageText = L10n.tr("Recovery Copy Kept")
+                        alert.informativeText = L10n.format("“%@” currently has unsaved changes. Resolve that window first, then open the recovery copy from “File → Recover Unsaved Documents”.", existing.title)
                         _ = recoveryAlertDecision?(alert) ?? alert.runModal()
                         continue
                     }
@@ -3410,8 +3417,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 } catch {
                     let alert = NSAlert(error: error)
-                    alert.messageText = "无法读取恢复副本"
-                    alert.informativeText = "恢复文件已保留：\(record.path)\n\(error.localizedDescription)"
+                    alert.messageText = L10n.tr("Could Not Read Recovery Copy")
+                    alert.informativeText = L10n.format("Recovery file kept: %@\n%@", record.path, error.localizedDescription)
                     if let documentErrorPresenter { documentErrorPresenter(error) }
                     else { alert.runModal() }
                 }
@@ -3520,16 +3527,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu(title: "Yu")
         appMenu.addItem(
-            withTitle: "关于 Yu",
+            withTitle: L10n.tr("About Yu"),
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
-        let settings = NSMenuItem(title: "设置…", action: #selector(showSettings(_:)), keyEquivalent: ",")
+        let settings = NSMenuItem(title: L10n.tr("Settings…"), action: #selector(showSettings(_:)), keyEquivalent: ",")
         settings.target = self
         appMenu.addItem(settings)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
-            title: "退出 Yu",
+            title: L10n.tr("Quit Yu"),
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -3539,41 +3546,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(appMenuItem)
 
         let fileMenuItem = NSMenuItem()
-        let fileMenu = NSMenu(title: "文件")
-        fileMenu.addItem(withTitle: "新建", action: #selector(newDocument(_:)), keyEquivalent: "n").target = self
-        fileMenu.addItem(withTitle: "打开…", action: #selector(openFromMenu(_:)), keyEquivalent: "o").target = self
+        let fileMenu = NSMenu(title: L10n.tr("File"))
+        fileMenu.addItem(withTitle: L10n.tr("New"), action: #selector(newDocument(_:)), keyEquivalent: "n").target = self
+        fileMenu.addItem(withTitle: L10n.tr("Open…"), action: #selector(openFromMenu(_:)), keyEquivalent: "o").target = self
         let save = NSMenuItem(
-            title: "保存",
+            title: L10n.tr("Save"),
             action: #selector(DocumentViewController.saveFromMenu(_:)),
             keyEquivalent: "s"
         )
         save.target = controller
         fileMenu.addItem(save)
-        let saveAs = NSMenuItem(title: "另存为…", action: #selector(DocumentViewController.saveAsFromMenu(_:)), keyEquivalent: "s")
+        let saveAs = NSMenuItem(title: L10n.tr("Save As…"), action: #selector(DocumentViewController.saveAsFromMenu(_:)), keyEquivalent: "s")
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
-        let exportHTML = NSMenuItem(title: "导出 HTML…", action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
+        let exportHTML = NSMenuItem(title: L10n.tr("Export HTML…"), action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
         exportHTML.target = controller
         exportHTML.isEnabled = controller != nil
         fileMenu.addItem(exportHTML)
-        let exportPDF = NSMenuItem(title: "导出 PDF…", action: #selector(DocumentViewController.exportPDFFromMenu(_:)), keyEquivalent: "")
+        let exportPDF = NSMenuItem(title: L10n.tr("Export PDF…"), action: #selector(DocumentViewController.exportPDFFromMenu(_:)), keyEquivalent: "")
         exportPDF.target = controller
         exportPDF.isEnabled = controller != nil
         fileMenu.addItem(exportPDF)
-        let exportPNG = NSMenuItem(title: "导出 PNG…", action: #selector(DocumentViewController.exportPNGFromMenu(_:)), keyEquivalent: "")
+        let exportPNG = NSMenuItem(title: L10n.tr("Export PNG…"), action: #selector(DocumentViewController.exportPNGFromMenu(_:)), keyEquivalent: "")
         exportPNG.target = controller; exportPNG.isEnabled = controller != nil
         fileMenu.addItem(exportPNG)
-        let printItem = NSMenuItem(title: "打印…", action: #selector(DocumentViewController.printFromMenu(_:)), keyEquivalent: "p")
+        let printItem = NSMenuItem(title: L10n.tr("Print…"), action: #selector(DocumentViewController.printFromMenu(_:)), keyEquivalent: "p")
         printItem.target = controller; printItem.isEnabled = controller != nil
         fileMenu.addItem(printItem)
-        let insertImage = NSMenuItem(title: "插入图片…", action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
+        let insertImage = NSMenuItem(title: L10n.tr("Insert Image…"), action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
         insertImage.target = controller
         fileMenu.addItem(insertImage)
-        let imageProperties = NSMenuItem(title: "图片属性…", action: #selector(DocumentViewController.editImagePropertiesFromMenu(_:)), keyEquivalent: "")
+        let imageProperties = NSMenuItem(title: L10n.tr("Image Properties…"), action: #selector(DocumentViewController.editImagePropertiesFromMenu(_:)), keyEquivalent: "")
         imageProperties.target = controller
         fileMenu.addItem(imageProperties)
-        let recent = NSMenu(title: "最近打开")
+        let recent = NSMenu(title: L10n.tr("Open Recent"))
         for url in NSDocumentController.shared.recentDocumentURLs {
             let item = NSMenuItem(title: url.lastPathComponent, action: #selector(openRecentDocument(_:)), keyEquivalent: "")
             item.representedObject = url
@@ -3582,17 +3589,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             recent.addItem(item)
         }
         recent.addItem(.separator())
-        recent.addItem(withTitle: "清除菜单", action: #selector(clearRecentDocuments(_:)), keyEquivalent: "").target = self
-        let recentItem = NSMenuItem(title: "最近打开", action: nil, keyEquivalent: "")
+        recent.addItem(withTitle: L10n.tr("Clear Menu"), action: #selector(clearRecentDocuments(_:)), keyEquivalent: "").target = self
+        let recentItem = NSMenuItem(title: L10n.tr("Open Recent"), action: nil, keyEquivalent: "")
         recentItem.submenu = recent
         fileMenu.addItem(recentItem)
-        let autosave = NSMenuItem(title: "自动保存", action: #selector(toggleAutosave(_:)), keyEquivalent: "")
+        let autosave = NSMenuItem(title: L10n.tr("Autosave"), action: #selector(toggleAutosave(_:)), keyEquivalent: "")
         autosave.target = self
         autosave.state = NativeDocumentPersistence.autosaveEnabled ? .on : .off
         fileMenu.addItem(autosave)
-        fileMenu.addItem(withTitle: "恢复未保存的文档…", action: #selector(recoverDocuments(_:)), keyEquivalent: "").target = self
+        fileMenu.addItem(withTitle: L10n.tr("Recover Unsaved Documents…"), action: #selector(recoverDocuments(_:)), keyEquivalent: "").target = self
         let reload = NSMenuItem(
-            title: "重新加载",
+            title: L10n.tr("Reload"),
             action: #selector(DocumentViewController.reloadFromMenu(_:)),
             keyEquivalent: "r"
         )
@@ -3600,7 +3607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fileMenu.addItem(reload)
         fileMenu.addItem(.separator())
         let close = NSMenuItem(
-            title: "关闭窗口",
+            title: L10n.tr("Close Window"),
             action: #selector(NSWindow.performClose(_:)),
             keyEquivalent: "w"
         )
@@ -3610,17 +3617,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(fileMenuItem)
 
         let editMenuItem = NSMenuItem()
-        let editMenu = NSMenu(title: "编辑")
+        let editMenu = NSMenu(title: L10n.tr("Edit"))
         // Standard nil-target actions follow the current native responder,
         // including remote file panels, search fields and settings. Yu's own
         // NSTextInputClient handles the same selectors through Rust below.
         let editItems: [(String, Selector, String)] = [
-            ("撤销", NSSelectorFromString("undo:"), "z"),
-            ("重做", NSSelectorFromString("redo:"), "Z"),
-            ("剪切", #selector(DocumentTextView.cut(_:)), "x"),
-            ("复制", #selector(DocumentTextView.copy(_:)), "c"),
-            ("粘贴", #selector(DocumentTextView.paste(_:)), "v"),
-            ("全选", #selector(DocumentTextView.selectAll(_:)), "a"),
+            (L10n.tr("Undo"), NSSelectorFromString("undo:"), "z"),
+            (L10n.tr("Redo"), NSSelectorFromString("redo:"), "Z"),
+            (L10n.tr("Cut"), #selector(DocumentTextView.cut(_:)), "x"),
+            (L10n.tr("Copy"), #selector(DocumentTextView.copy(_:)), "c"),
+            (L10n.tr("Paste"), #selector(DocumentTextView.paste(_:)), "v"),
+            (L10n.tr("Select All"), #selector(DocumentTextView.selectAll(_:)), "a"),
         ]
         for (title, action, keyEquivalent) in editItems.prefix(2) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
@@ -3635,16 +3642,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         editMenu.addItem(.separator())
         let findItems: [(String, Selector, String, NSEvent.ModifierFlags)] = [
-            ("查找", #selector(DocumentViewController.findFromMenu(_:)), "f", [.command]),
-            ("查找下一个", #selector(DocumentViewController.findNextFromMenu(_:)), "g", [.command]),
+            (L10n.tr("Find"), #selector(DocumentViewController.findFromMenu(_:)), "f", [.command]),
+            (L10n.tr("Find Next"), #selector(DocumentViewController.findNextFromMenu(_:)), "g", [.command]),
             (
-                "查找上一个",
+                L10n.tr("Find Previous"),
                 #selector(DocumentViewController.findPreviousFromMenu(_:)),
                 "g",
                 [.command, .shift]
             ),
             (
-                "选中全部匹配",
+                L10n.tr("Select All Matches"),
                 #selector(DocumentViewController.selectAllMatchesFromMenu(_:)),
                 "l",
                 [.command, .shift]
@@ -3660,20 +3667,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(editMenuItem)
 
         let tableMenuItem = NSMenuItem()
-        tableMenuItem.submenu = controller?.makeTableMenu() ?? NSMenu(title: "表格")
+        tableMenuItem.submenu = controller?.makeTableMenu() ?? NSMenu(title: L10n.tr("Table"))
         mainMenu.addItem(tableMenuItem)
 
         let viewMenuItem = NSMenuItem()
-        let viewMenu = NSMenu(title: "显示")
-        let sourceMode = NSMenuItem(title: "源码模式", action: #selector(DocumentViewController.toggleSourceMode(_:)), keyEquivalent: "m")
+        let viewMenu = NSMenu(title: L10n.tr("View"))
+        let sourceMode = NSMenuItem(title: L10n.tr("Source Mode"), action: #selector(DocumentViewController.toggleSourceMode(_:)), keyEquivalent: "m")
         sourceMode.keyEquivalentModifierMask = [.command, .shift]
         sourceMode.target = controller
         viewMenu.addItem(sourceMode)
-        let disclosure = NSMenuItem(title: "展开／折叠当前摘要", action: #selector(DocumentTextView.toggleDisclosureFromMenu(_:)), keyEquivalent: "d")
+        let disclosure = NSMenuItem(title: L10n.tr("Expand/Collapse Current Details"), action: #selector(DocumentTextView.toggleDisclosureFromMenu(_:)), keyEquivalent: "d")
         disclosure.keyEquivalentModifierMask = [.command, .option, .control]
         viewMenu.addItem(disclosure)
         let outline = NSMenuItem(
-            title: "大纲",
+            title: L10n.tr("Outline"),
             action: #selector(DocumentViewController.toggleOutlineFromMenu(_:)),
             keyEquivalent: "1"
         )
@@ -3681,7 +3688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         outline.target = controller
         viewMenu.addItem(outline)
         let searchToggle = NSMenuItem(
-            title: "搜索结果",
+            title: L10n.tr("Search Results"),
             action: #selector(DocumentViewController.toggleSearchFromMenu(_:)),
             keyEquivalent: "2"
         )
@@ -3690,9 +3697,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         viewMenu.addItem(searchToggle)
         viewMenu.addItem(.separator())
         for (title, action, key) in [
-            ("放大", #selector(DocumentViewController.zoomInFromMenu(_:)), "+"),
-            ("缩小", #selector(DocumentViewController.zoomOutFromMenu(_:)), "-"),
-            ("实际大小", #selector(DocumentViewController.resetZoomFromMenu(_:)), "0")
+            (L10n.tr("Zoom In"), #selector(DocumentViewController.zoomInFromMenu(_:)), "+"),
+            (L10n.tr("Zoom Out"), #selector(DocumentViewController.zoomOutFromMenu(_:)), "-"),
+            (L10n.tr("Actual Size"), #selector(DocumentViewController.resetZoomFromMenu(_:)), "0")
         ] {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
             item.target = controller
@@ -3928,9 +3935,9 @@ extension AppDelegate {
         do { try initial.saveDocumentAs(to: renamed, replaceExisting: true); throw CocoaError(.coderInvalidValue) }
         catch let error as NSError { try require(error.domain == "Yu.Document", "Save As did not reject another window's target") }
         draftWindow.makeKeyAndOrderFront(nil)
-        let fileMenu = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == "文件" })?.submenu
-        try require((fileMenu?.items.first(where: { $0.title == "保存" })?.target as? DocumentViewController) === draft, "Save menu targets the wrong window")
-        let recentMenu = fileMenu?.items.first(where: { $0.title == "最近打开" })?.submenu
+        let fileMenu = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == L10n.tr("File") })?.submenu
+        try require((fileMenu?.items.first(where: { $0.title == L10n.tr("Save") })?.target as? DocumentViewController) === draft, "Save menu targets the wrong window")
+        let recentMenu = fileMenu?.items.first(where: { $0.title == L10n.tr("Open Recent") })?.submenu
         guard let recentItem = recentMenu?.items.first(where: { ($0.representedObject as? URL).map(identity) == identity(renamed) }) else { throw CocoaError(.coderInvalidValue) }
         openRecentDocument(recentItem)
         try require(documents.count == count, "Open Recent duplicated a window")
