@@ -713,7 +713,16 @@ int32_t yu_storage_recovery_copy_target(const uint8_t *path, size_t path_length,
 /* action: 0 write current recovery, 1 clear current recovery. */
 int32_t yu_storage_session_recovery(const YuStorageSession *session, const uint8_t *root, size_t root_length, uint8_t action);
 int32_t yu_storage_recovery_copy_path(const uint8_t *root, size_t root_length, const uint8_t *target, size_t target_length, uint8_t *output, size_t capacity, size_t *written);
+typedef int32_t (*YuStorageReplaceCallback)(const uint8_t *staged_path,
+                                             size_t staged_path_length,
+                                             const uint8_t *target_path,
+                                             size_t target_path_length);
 int32_t yu_storage_session_save_as(YuStorageSession *session, const uint8_t *path, size_t path_length, uint8_t replace_existing);
+int32_t yu_storage_session_save_as_with_replacer(YuStorageSession *session,
+                                                  const uint8_t *path, size_t path_length,
+                                                  uint8_t replace_existing,
+                                                  const uint8_t *staging_dir, size_t staging_dir_length,
+                                                  YuStorageReplaceCallback replace);
 
 int32_t yu_storage_session_open(const uint8_t *path, size_t path_length,
                                 YuStorageSession **output);
@@ -1034,6 +1043,13 @@ int32_t yu_storage_session_save(YuStorageSession *session,
                                 uint64_t *revision_output,
                                 size_t *bytes_written_output,
                                 uint8_t *changed_output);
+int32_t yu_storage_session_save_with_replacer(YuStorageSession *session,
+                                               const uint8_t *staging_dir,
+                                               size_t staging_dir_length,
+                                               YuStorageReplaceCallback replace,
+                                               uint64_t *revision_output,
+                                               size_t *bytes_written_output,
+                                               uint8_t *changed_output);
 int32_t yu_storage_session_reload(YuStorageSession *session,
                                   uint64_t *revision_output);
 

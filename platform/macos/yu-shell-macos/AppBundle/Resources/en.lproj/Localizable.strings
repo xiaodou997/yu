@@ -294,3 +294,5 @@
 "The document contains a diagnostic at this position. The original source is preserved and can be edited directly." = "The document contains a diagnostic at this position. The original source is preserved and can be edited directly.";
 "Choose File Sidebar Folder" = "Choose File Sidebar Folder";
 "Choose File Sidebar Folder…" = "Choose File Sidebar Folder…";
+"Document Saved" = "Document Saved";
+"The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu.";

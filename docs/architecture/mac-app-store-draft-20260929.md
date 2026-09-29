@@ -21,16 +21,40 @@ The user will manage App Review contact details personally. Do not create
 a Git tag or a GitHub Release until the Windows build is ready for a joint
 release.
 
-This branch contains an **incomplete** App Store sandbox path. The candidate
-builder at `tools/release-macos-appstore.py` built and signed an Apple
-Distribution app with separate app and helper entitlements, and
-`codesign --verify --deep --strict` passed. A sandboxed empty-document window
-self-check passed. External document open/save, relative image access, recent
-files, and recovery still require full UI acceptance after merging the
-internationalization work. The Open panel selected a dedicated `.md` test file
-but left its Open button disabled; investigate this before upload. The team
-also needs a Mac Installer Distribution certificate to sign the App Store
-`.pkg`.
+The App Store sandbox candidate is signed with Apple Distribution, including
+separate app and helper entitlements. The Mac Installer Distribution certificate
+is installed, and the packaging pipeline has produced and verified an Apple-signed
+`.pkg`. No package has been uploaded yet.
+
+## Sandbox document acceptance
+
+The external-file test exposed two failures, now corrected in the working tree:
+
+- Rust's sibling temporary file was outside a file-only Powerbox grant. The
+  sandbox path now stages canonical bytes in the app container and delegates
+  replacement to Foundation, preserving Rust's conflict checks.
+- Save As tried to create a security-scoped bookmark before creating the file.
+  It now retains the panel grant, writes the file, then persists the bookmark.
+  Bookmark failure is reported separately from write failure.
+
+Candidate `artifacts/appstore-saveas-v3/Yu.app` passed Apple Distribution signing,
+secure timestamps, and strict bundle verification on macOS 27. Its signed sandbox
+image-batch self-check passed first save, image paste, undo/redo, and reopen inside
+the container. This is separate from external-folder image acceptance.
+
+With a real NSSavePanel, the user saved `Public/YuAppStoreSaveAsCheck.md`.
+Disk bytes were verified after initial save and a second edit/save. After quitting
+and relaunching Yu, Recent Open reopened the file without a new panel grant; another
+edit/save succeeded and its disk bytes were verified. Earlier testing also passed
+external existing-document save, autosave, and reopen.
+
+Regression checks passed: 27 document-session tests, 16 image Save As tests,
+16 storage unit tests, 101 FFI unit tests, the standalone bookmark lifecycle test,
+and localization validation for all five bundled languages (298 keys).
+
+External-folder relative images, exports, and the remaining store acceptance
+still need completion. Candidates are not upload artifacts. Rebuild from a clean
+commit after the fixes are committed; the previous build-3 package predates them.
 
 The app privacy policy is in `PRIVACY.md`; publish it on the default branch
 before using its URL in App Store Connect. The repository README previously

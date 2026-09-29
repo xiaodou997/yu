@@ -294,3 +294,5 @@
 "The document contains a diagnostic at this position. The original source is preserved and can be edited directly." = "書類のこの位置に診断があります。元のソースは保持されており、直接編集できます。";
 "Choose File Sidebar Folder" = "ファイルサイドバーのフォルダを選択";
 "Choose File Sidebar Folder…" = "ファイルサイドバーのフォルダを選択…";
+"Document Saved" = "書類を保存しました";
+"The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "書類は保存されましたが、アクセス権を記憶できませんでした。Yu を再起動した後、ファイルを再度選択する必要がある場合があります。";

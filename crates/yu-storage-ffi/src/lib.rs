@@ -10,6 +10,7 @@
 //! result structs; its TextKit mirror is disposable and never canonical.
 
 use std::ffi::c_void;
+use std::io;
 use std::path::PathBuf;
 use std::ptr;
 #[cfg(target_os = "macos")]
@@ -5215,6 +5216,73 @@ pub unsafe extern "C" fn yu_storage_session_save_as(
     YU_STORAGE_OK
 }
 
+/// Save As through a host-owned sandbox replacement. The host callback must
+/// consume the staged file before returning success and must not retain paths.
+/// # Safety
+/// Live session; readable UTF-8 path and staging directory byte buffers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_save_as_with_replacer(
+    session: *mut YuStorageSession,
+    path: *const u8,
+    path_length: usize,
+    replace_existing: u8,
+    staging_dir: *const u8,
+    staging_dir_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize) -> i32>,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if replace_existing > 1 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if session.session.composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let staging_dir = match read_utf8(staging_dir, staging_dir_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    if let Err(error) = session.session.save_as_with_replacer(
+        path,
+        replace_existing != 0,
+        &staging_dir,
+        |source, target| {
+            let source = source
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let status = replace(source.as_ptr(), source.len(), target.as_ptr(), target.len());
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status))
+            }
+        },
+    ) {
+        return status_from_error(error);
+    }
+    session.table_resize_gesture = None;
+    session.table_resize_override = None;
+    #[cfg(target_os = "macos")]
+    {
+        session.macos_render_host = None;
+        session.macos_embedded_resources = MacosEmbeddedResourceState::new();
+    }
+    YU_STORAGE_OK
+}
+
 /// Configure application-owned column metadata storage for this session.
 /// Malformed or stale cache entries are ignored by the store; I/O errors surface.
 /// # Safety
@@ -9478,6 +9546,69 @@ pub unsafe extern "C" fn yu_storage_session_save(
         SaveOutcome::Unchanged { revision } => (revision.get(), 0, 0),
     };
     // SAFETY: all output pointers were checked above.
+    unsafe {
+        *revision_output = revision;
+        *bytes_written_output = bytes_written;
+        *changed_output = changed;
+    }
+    YU_STORAGE_OK
+}
+
+/// Saves canonical Rust bytes through a host-provided atomic replacement.
+/// The staging directory must be writable by the caller (the app container
+/// for a sandboxed Mac app). The callback must not retain either path pointer.
+/// # Safety
+/// Live session and writable output pointers; root must be readable UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_save_with_replacer(
+    session: *mut YuStorageSession,
+    staging_dir: *const u8,
+    staging_dir_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize) -> i32>,
+    revision_output: *mut u64,
+    bytes_written_output: *mut usize,
+    changed_output: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if revision_output.is_null() || bytes_written_output.is_null() || changed_output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let staging_dir = match read_utf8(staging_dir, staging_dir_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let outcome = match session
+        .session
+        .save_with_replacer(&staging_dir, |source, target| {
+            let source = source
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let status = replace(source.as_ptr(), source.len(), target.as_ptr(), target.len());
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status))
+            }
+        }) {
+        Ok(outcome) => outcome,
+        Err(error) => return status_from_error(error),
+    };
+    let (revision, bytes_written, changed) = match outcome {
+        SaveOutcome::Saved {
+            revision,
+            bytes_written,
+        } => (revision.get(), bytes_written, 1),
+        SaveOutcome::Unchanged { revision } => (revision.get(), 0, 0),
+    };
     unsafe {
         *revision_output = revision;
         *bytes_written_output = bytes_written;

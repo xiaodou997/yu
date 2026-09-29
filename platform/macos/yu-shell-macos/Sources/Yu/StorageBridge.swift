@@ -4,6 +4,25 @@ import Foundation
 import UniformTypeIdentifiers
 import YuStorageFFI
 
+private let sandboxReplacement: YuStorageReplaceCallback = { stagedBytes, stagedLength, targetBytes, targetLength in
+    guard let stagedBytes, let targetBytes else { return EINVAL }
+    let stagedPath = String(decoding: UnsafeBufferPointer(start: stagedBytes, count: stagedLength), as: UTF8.self)
+    let targetPath = String(decoding: UnsafeBufferPointer(start: targetBytes, count: targetLength), as: UTF8.self)
+    do {
+        let staged = URL(fileURLWithPath: stagedPath)
+        let target = URL(fileURLWithPath: targetPath)
+        if FileManager.default.fileExists(atPath: targetPath) {
+            _ = try FileManager.default.replaceItemAt(target, withItemAt: staged)
+        } else {
+            try FileManager.default.moveItem(at: staged, to: target)
+        }
+        return 0
+    } catch {
+        NSLog("Yu sandbox replacement failed: %@", error.localizedDescription)
+        return EIO
+    }
+}
+
 // Rust `yu-storage-ffi` 的 Swift 封装：C ABI 调用、错误码映射，以及
 // 跨边界结构的 Swift 镜像。这里不做任何决策，只做搬运与类型转换。
 
@@ -2184,10 +2203,19 @@ final class StorageBridge {
         return String(decoding: bytes.prefix(written), as: UTF8.self)
     }
 
-    func saveAs(_ url: URL, replaceExisting: Bool) throws {
+    func saveAs(_ url: URL, replaceExisting: Bool, stagingDirectory: URL? = nil) throws {
         let bytes = Array(url.path.utf8)
-        let status = bytes.withUnsafeBufferPointer {
-            yu_storage_session_save_as(handle, $0.baseAddress, $0.count, replaceExisting ? 1 : 0)
+        let status = bytes.withUnsafeBufferPointer { target in
+            if let stagingDirectory {
+                let stagingBytes = Array(stagingDirectory.path.utf8)
+                return stagingBytes.withUnsafeBufferPointer { staging in
+                    yu_storage_session_save_as_with_replacer(handle,
+                        target.baseAddress, target.count, replaceExisting ? 1 : 0,
+                        staging.baseAddress, staging.count, sandboxReplacement)
+                }
+            }
+            return yu_storage_session_save_as(handle, target.baseAddress, target.count,
+                replaceExisting ? 1 : 0)
         }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
         openedPath = path
@@ -2252,16 +2280,20 @@ final class StorageBridge {
         _ = yu_storage_session_close_resolve(handle, UInt8(YU_STORAGE_CLOSE_RESOLVE_ABORT))
     }
 
-    func save() throws {
+    func save(stagingDirectory: URL? = nil) throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
         var changed: UInt8 = 0
-        let status = yu_storage_session_save(
-            handle,
-            &revision,
-            &bytes,
-            &changed
-        )
+        let status: Int32
+        if let stagingDirectory {
+            let path = Array(stagingDirectory.path.utf8)
+            status = path.withUnsafeBufferPointer {
+                yu_storage_session_save_with_replacer(handle, $0.baseAddress, $0.count,
+                    sandboxReplacement, &revision, &bytes, &changed)
+            }
+        } else {
+            status = yu_storage_session_save(handle, &revision, &bytes, &changed)
+        }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 

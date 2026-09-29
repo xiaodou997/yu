@@ -294,3 +294,5 @@
 "The document contains a diagnostic at this position. The original source is preserved and can be edited directly." = "文档在此位置包含需要处理的诊断。原始源码已保留，可直接修改。";
 "Choose File Sidebar Folder" = "选择文件侧栏文件夹";
 "Choose File Sidebar Folder…" = "选择文件侧栏文件夹…";
+"Document Saved" = "文档已保存";
+"The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "文档已保存，但未能记住访问权限。重新启动 Yu 后，可能需要重新选择该文件。";

@@ -1102,8 +1102,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         else { destination = panel.runModal() == .OK ? panel.url : nil }
         guard let url = destination else { return false }
         do {
-            try SandboxDocumentAccess.shared.rememberSelection(url)
-            try saveDocumentAs(to: url, replaceExisting: true)
+            let bookmarkError = try SandboxDocumentAccess.shared.saveSelectedFile(url) {
+                try saveDocumentAs(to: url, replaceExisting: true)
+            }
+            if let bookmarkError {
+                let alert = NSAlert(error: bookmarkError)
+                alert.messageText = L10n.tr("Document Saved")
+                alert.informativeText = L10n.tr("The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu.")
+                alert.runModal()
+            }
             return true
         } catch { show(error); return false }
     }
