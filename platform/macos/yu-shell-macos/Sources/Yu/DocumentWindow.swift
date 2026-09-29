@@ -991,6 +991,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) { exportDocument(pdf: false) }
     @objc fileprivate func exportPDFFromMenu(_ sender: Any?) { exportDocument(pdf: true) }
+    @objc fileprivate func exportPNGFromMenu(_ sender: Any?) { exportDocument(pdf: false, png: true) }
 
     @objc fileprivate func printFromMenu(_ sender: Any?) {
         guard !NativePrintController.busy, htmlExport?.isRunning != true, let window = view.window else { return }
@@ -1025,7 +1026,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         } catch { show(error) }
     }
 
-    private func exportDocument(pdf: Bool) {
+    private func exportDocument(pdf: Bool, png: Bool = false) {
         guard htmlExport?.isRunning != true, printing?.isRunning != true else { return }
         guard !bridge.composition.active, !textView.hasMarkedText() else {
             // Do not add a modal focus transition while composition is alive.
@@ -1040,28 +1041,32 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
         guard let window = view.window else { return }
         htmlExport?.cancelAndClose()
-        let htmlOptions = pdf ? nil : NativeHTMLExportOptions(untitled: persistence.isUntitled)
+        let htmlOptions = pdf || png ? nil : NativeHTMLExportOptions(untitled: persistence.isUntitled)
+        let pngOptions = png ? NativePNGExportOptions(untitled: persistence.isUntitled) : nil
+        let formatName = png ? "PNG" : (pdf ? "PDF" : "HTML")
         let pdfOptions = pdf ? NativePDFExportOptions(untitled: persistence.isUntitled) : nil
         let panel = NSSavePanel()
-        panel.title = pdf ? "导出 PDF" : "导出 HTML"
+        panel.title = "导出 \(formatName)"
         panel.prompt = "导出"
-        panel.allowedContentTypes = pdf ? [.pdf] : [.html]
+        panel.allowedContentTypes = png ? [.png] : (pdf ? [.pdf] : [.html])
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + (pdf ? ".pdf" : ".html")
+        panel.nameFieldStringValue = (persistence.isUntitled ? "未命名" : documentURL.deletingPathExtension().lastPathComponent) + (png ? ".png" : (pdf ? ".pdf" : ".html"))
         if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
-        panel.accessoryView = pdfOptions?.view ?? htmlOptions?.view
+        panel.accessoryView = pngOptions?.view ?? pdfOptions?.view ?? htmlOptions?.view
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         do {
             try onValidateSaveDestination?(destination)
             let title = destination.deletingPathExtension().lastPathComponent
             let config: [String: Any]
-            if let pdfOptions {
+            if let pngOptions {
+                config = try pngOptions.config(title: title, untitled: persistence.isUntitled, appearance: view.effectiveAppearance)
+            } else if let pdfOptions {
                 config = try pdfOptions.config(title: title, untitled: persistence.isUntitled)
             } else if let htmlOptions {
                 config = htmlOptions.config(title: title, untitled: persistence.isUntitled, appearance: view.effectiveAppearance)
             } else { return }
             let task = try bridge.beginHTMLExport(to: destination, config: config)
-            htmlExport = NativeHTMLExportController(task: task, destination: destination, owner: window, formatName: pdf ? "PDF" : "HTML") { [weak self] in
+            htmlExport = NativeHTMLExportController(task: task, destination: destination, owner: window, formatName: formatName) { [weak self] in
                 self?.htmlExport = nil
             }
         } catch { show(error) }
@@ -2775,7 +2780,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
         if menuItem.action == #selector(printFromMenu(_:)) { return !NativePrintController.busy && htmlExport?.isRunning != true }
-        if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) { return htmlExport?.isRunning != true && printing?.isRunning != true }
+        if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) || menuItem.action == #selector(exportPNGFromMenu(_:)) { return htmlExport?.isRunning != true && printing?.isRunning != true }
         if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) { return textView.canEditImage() }
         if menuItem.action == #selector(insertImageFromMenu(_:)) { return textView.isEditable }
         let state = bridge.state
@@ -3492,6 +3497,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         exportPDF.target = controller
         exportPDF.isEnabled = controller != nil
         fileMenu.addItem(exportPDF)
+        let exportPNG = NSMenuItem(title: "导出 PNG…", action: #selector(DocumentViewController.exportPNGFromMenu(_:)), keyEquivalent: "")
+        exportPNG.target = controller; exportPNG.isEnabled = controller != nil
+        fileMenu.addItem(exportPNG)
         let printItem = NSMenuItem(title: "打印…", action: #selector(DocumentViewController.printFromMenu(_:)), keyEquivalent: "p")
         printItem.target = controller; printItem.isEnabled = controller != nil
         fileMenu.addItem(printItem)

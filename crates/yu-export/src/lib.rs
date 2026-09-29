@@ -46,6 +46,7 @@ mod html_import;
 /// Whole-document export is deliberately separate from clipboard contracts.
 pub mod document;
 pub mod paged;
+pub mod png;
 pub mod portable;
 
 pub use html_import::{HtmlImportError, import_html_fragment};

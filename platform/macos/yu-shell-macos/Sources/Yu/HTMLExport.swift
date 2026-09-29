@@ -14,6 +14,8 @@ final class NativeHTMLExportTask {
         let images: Int
         let embedded: Int
         let pages: Int?
+        let pngSizes: [[Int]]?
+        let outputPath: String?
     }
     private let handle: OpaquePointer
     init(handle: OpaquePointer) { self.handle = handle }
@@ -60,10 +62,12 @@ final class NativeHTMLExportOptions: NSObject {
     private let style = NSPopUpButton()
     private let baseLabel = NSTextField(labelWithString: "图片基准目录：未选择")
     private(set) var resourceBase: URL?
-    init(untitled: Bool) {
+    private let preferenceKey: String
+    init(untitled: Bool, preferenceKey: String = "Yu.exportHTML.currentTheme") {
+        self.preferenceKey = preferenceKey
         super.init()
         style.addItems(withTitles: ["浅色", "当前正文主题"])
-        style.selectItem(at: UserDefaults.standard.bool(forKey: "Yu.exportHTML.currentTheme") ? 1 : 0)
+        style.selectItem(at: UserDefaults.standard.bool(forKey: preferenceKey) ? 1 : 0)
         let styleRow = NSStackView(views: [NSTextField(labelWithString: "导出样式："), style])
         styleRow.orientation = .horizontal
         view.orientation = .vertical; view.alignment = .leading; view.spacing = 10
@@ -91,7 +95,7 @@ final class NativeHTMLExportOptions: NSObject {
         let theme = NativeTheme.spec(resolved: resolved)
         let reading = NativeWritingPreferences.shared
         let width = reading.columnWidth > 0 ? reading.columnWidth : Double(theme.column_width)
-        UserDefaults.standard.set(current, forKey: "Yu.exportHTML.currentTheme")
+        UserDefaults.standard.set(current, forKey: preferenceKey)
         var result: [String: Any] = ["title": title, "foreground": theme.text,
             "background": theme.background, "link": theme.link,
             "fontSize": reading.fontSize, "width": Int(min(1200, max(360, width))),
@@ -108,7 +112,7 @@ final class NativeHTMLExportOptions: NSObject {
 final class NativeHTMLExportController: NSObject, NSWindowDelegate {
     private var task: NativeHTMLExportTask?
     private weak var owner: NSWindow?
-    private let destination: URL
+    private var destination: URL
     private let panel: NSPanel
     private let stage = NSTextField(wrappingLabelWithString: "准备导出…")
     private let detail = NSTextField(wrappingLabelWithString: "导出使用确认时的固定内容，您可以继续编辑文档。")
@@ -158,12 +162,18 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
             switch status.phase {
             case "ready":
                 if !committed { committed = true; try task.commit(allowWarnings: false) }
+            case "split":
+                if !askedWarnings { askedWarnings = true; confirmSplit(status) }
             case "warnings":
                 if !askedWarnings { askedWarnings = true; confirmWarnings(status) }
             case "completed", "completed_with_warnings":
+                if let output = status.outputPath { destination = URL(fileURLWithPath: output) }
                 isRunning = false; timer?.invalidate(); timer = nil
                 indicator.stopAnimation(nil); indicator.isHidden = true
                 detail.stringValue = "\(destination.lastPathComponent)" + ((status.pages ?? 0) > 0 ? " · \(status.pages ?? 0) 页" : "") + " · \(status.images) 张图片 · \(status.embedded) 项公式/图表" + (status.warnings.isEmpty ? "" : "\n含 \(status.warnings.count) 项警告，不是完整成功。")
+                if let sizes = status.pngSizes, !sizes.isEmpty {
+                    detail.stringValue += " · \(sizes.count) 张 PNG · 宽 \(sizes[0][0]) px"
+                }
                 revealButton.isHidden = false; cancelButton.title = "关闭"
                 self.task = nil
             case "failed", "cancelled":
@@ -171,6 +181,22 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
             default: break
             }
         } catch { task.cancel(); finishFailure(error.localizedDescription) }
+    }
+    private func confirmSplit(_ status: NativeHTMLExportTask.Status) {
+        guard let owner else { cancelAndClose(); return }
+        let alert = NSAlert()
+        alert.messageText = "文档超过单张 PNG 预算，是否分段导出？"
+        let name = status.outputPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "新目录"
+        alert.informativeText = "将按完整行／表格合并组输出 \(status.pngSizes?.count ?? 0) 张编号 PNG，保存到“\(name)”。不覆盖已有目录；取消不会产生半套输出。" + (status.warnings.isEmpty ? "" : "\n另有资源诊断：\n" + status.warnings.prefix(8).joined(separator: "\n"))
+        alert.addButton(withTitle: "取消导出").keyEquivalent = "\u{1b}"
+        alert.addButton(withTitle: status.warnings.isEmpty ? "分段导出" : "带诊断分段导出")
+        alert.beginSheetModal(for: owner) { [weak self] response in
+            guard let self, !self.closed, let task = self.task else { return }
+            if response == .alertSecondButtonReturn {
+                do { self.committed = true; try task.commit(allowWarnings: !status.warnings.isEmpty) }
+                catch { task.cancel(); self.finishFailure(error.localizedDescription) }
+            } else { self.cancelAndClose() }
+        }
     }
     private func confirmWarnings(_ status: NativeHTMLExportTask.Status) {
         guard let owner else { cancelAndClose(); return }

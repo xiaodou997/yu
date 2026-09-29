@@ -30,6 +30,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 struct Ready {
     document: HtmlDocument,
     pdf: Option<yu_render_macos::RenderedPdf>,
+    png: Option<yu_render_macos::PngPlan>,
+    segments_destination: Option<Destination>,
     destination: Destination,
     protected: Vec<ProtectedFile>,
 }
@@ -44,6 +46,8 @@ struct State {
     print_target: Option<Destination>,
     print_protected: Vec<ProtectedFile>,
     print_plan: Option<yu_render_macos::PrintPagePlan>,
+    png_sizes: Vec<[u32; 2]>,
+    output_path: Option<PathBuf>,
 }
 pub struct HtmlJob {
     control: RenderControl,
@@ -53,6 +57,8 @@ pub struct HtmlJob {
     state: Mutex<State>,
     counted: bool,
     printing: bool,
+    png_settings: Option<yu_export::png::PngSettings>,
+    target_path: PathBuf,
 }
 impl Drop for HtmlJob {
     fn drop(&mut self) {
@@ -70,9 +76,14 @@ impl HtmlJob {
         config: &Value,
     ) -> Result<Arc<Self>, String> {
         let pdf_settings = match config.get("exportFormat").and_then(Value::as_str) {
-            None | Some("html") => None,
+            None | Some("html" | "png") => None,
             Some("pdf") => Some(yu_export::paged::PageSettings::from_config(config)?),
             _ => return Err("未知导出格式".into()),
+        };
+        let png_settings = if config.get("exportFormat").and_then(Value::as_str) == Some("png") {
+            Some(yu_export::png::PngSettings::from_config(config)?)
+        } else {
+            None
         };
         let revision = snapshot.revision().get();
         let control = RenderControl::default();
@@ -89,6 +100,8 @@ impl HtmlJob {
             preparation_deadline: Instant::now() + TASK_TIMEOUT,
             pdf_settings,
             counted: true,
+            png_settings,
+            target_path: target.to_path_buf(),
             printing: pdf_settings.is_some()
                 && config.get("printPreparation").and_then(Value::as_bool) == Some(true),
             state: Mutex::new(State {
@@ -102,6 +115,8 @@ impl HtmlJob {
                 print_target: None,
                 print_protected: Vec::new(),
                 print_plan: None,
+                png_sizes: Vec::new(),
+                output_path: None,
             }),
         });
         let setup = (|| {
@@ -204,6 +219,21 @@ impl HtmlJob {
                             state.print_plan =
                                 ready.pdf.as_mut().and_then(|pdf| pdf.print_plan.take());
                         }
+                        if let Some(png) = &ready.png {
+                            state.png_sizes = png.sizes.clone();
+                            state.output_path = Some(
+                                ready
+                                    .segments_destination
+                                    .as_ref()
+                                    .unwrap_or(&ready.destination)
+                                    .path()
+                                    .to_path_buf(),
+                            );
+                            if png.sizes.len() > 1 {
+                                state.phase = "split";
+                                state.message = format!("PNG需分为{}段，等待确认", png.sizes.len());
+                            }
+                        }
                         state.ready = Some(ready);
                     }
                     Ok(Err(error)) => worker.fail(error),
@@ -257,7 +287,13 @@ impl HtmlJob {
                     })?;
             }
         }
-        let mut result = export_html_document(&document, &options, &mut resources)?;
+        let mut html_options = options.clone();
+        // Width here only belongs to the inert HTML transport stylesheet. PNG
+        // lays out at its independently validated width in the native flow.
+        if self.png_settings.is_some() {
+            html_options.width = options.width.clamp(360, 1200);
+        }
+        let mut result = export_html_document(&document, &html_options, &mut resources)?;
         let pdf = if let Some(settings) = self.pdf_settings {
             self.stage("准备 PDF 页面内容");
             let packet = yu_export::paged::prepare_pdf_packet(&result, settings)?;
@@ -275,12 +311,39 @@ impl HtmlJob {
         } else {
             None
         };
+        let png = if let Some(settings) = self.png_settings {
+            self.stage("布局整文档 PNG 并检查像素预算");
+            let packet = yu_export::png::prepare_png_packet(&result, settings, &options)?;
+            let plan = yu_render_macos::prepare_png(&packet, || {
+                self.prepare_checkpoint_at(Instant::now()).is_ok()
+            })?;
+            settings.validate_sizes(&plan.sizes)?;
+            result.html.clear();
+            Some(plan)
+        } else {
+            None
+        };
+        let segments_destination = if png.as_ref().is_some_and(|p| p.sizes.len() > 1) {
+            let name = self
+                .target_path
+                .file_stem()
+                .ok_or("PNG文件名无效")?
+                .to_string_lossy();
+            let path = self.target_path.with_file_name(format!("{name}-images"));
+            let target = Destination::capture(&path, false)?;
+            target.validate(&resources.images.protected)?;
+            Some(target)
+        } else {
+            None
+        };
         resources.images.verify()?;
         resources.checkpoint()?;
         destination.validate(&resources.images.protected)?;
         Ok(Ready {
             document: result,
             pdf,
+            png,
+            segments_destination,
             destination,
             protected: resources.images.protected.clone(),
         })
@@ -445,11 +508,49 @@ impl HtmlJob {
             .map_err(|_| "无法启动打印文件保存线程".to_owned())?;
         Ok(())
     }
+    fn publish_png(&self, mut ready: Ready) -> Result<(), String> {
+        let mut plan = ready.png.take().ok_or("PNG布局丢失")?;
+        let count = plan.sizes.len();
+        let check = || {
+            if self.control.is_current(self.revision) {
+                Ok(())
+            } else {
+                Err("已取消PNG导出".to_owned())
+            }
+        };
+        let guard = || {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            check()?;
+            state.phase = "committing";
+            Ok(state)
+        };
+        if let Some(directory) = ready.segments_destination {
+            directory.publish_png_directory(
+                count,
+                &ready.protected,
+                |index, limit| {
+                    self.stage(&format!("绘制并编码PNG {}/{}", index + 1, count));
+                    plan.encode(index, limit, || check().is_ok())
+                },
+                check,
+                guard,
+                yu_render_macos::move_directory_exclusive,
+            )
+        } else {
+            self.stage("绘制并编码整文档PNG");
+            let bytes =
+                plan.encode(0, yu_export::document::MAX_OUTPUT_BYTES, || check().is_ok())?;
+            ready
+                .destination
+                .publish_guarded(&bytes, &ready.protected, check, guard)
+        }
+    }
     pub fn status_json(&self) -> String {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         json!({"phase": state.phase, "message": state.message, "revision": self.revision,
             "warnings": state.warnings, "images": state.images, "embedded": state.embedded,
-            "pages": state.pages, "format": if self.pdf_settings.is_some() { "pdf" } else { "html" }})
+            "pages": state.pages, "pngSizes":state.png_sizes,"outputPath":state.output_path,
+            "format": if self.png_settings.is_some() { "png" } else if self.pdf_settings.is_some() { "pdf" } else { "html" }})
         .to_string()
     }
     pub fn commit(self: &Arc<Self>, allow_warnings: bool) -> Result<(), String> {
@@ -458,10 +559,10 @@ impl HtmlJob {
             if !self.control.is_current(self.revision) {
                 return Err("导出已经取消".into());
             }
-            if state.phase == "warnings" && !allow_warnings {
+            if !state.warnings.is_empty() && !allow_warnings {
                 return Err("需要明确确认带占位或诊断导出".into());
             }
-            if !matches!(state.phase, "ready" | "warnings") {
+            if !matches!(state.phase, "ready" | "warnings" | "split") {
                 return Err("导出尚未准备完成".into());
             }
             let ready = state.ready.take().ok_or("导出任务结果丢失")?;
@@ -473,32 +574,36 @@ impl HtmlJob {
         std::thread::Builder::new()
             .name("yu-html-publish".into())
             .spawn(move || {
-                let result = ready.destination.publish_guarded(
-                    ready
-                        .pdf
-                        .as_ref()
-                        .map_or(ready.document.html.as_bytes(), |pdf| pdf.bytes.as_slice()),
-                    &ready.protected,
-                    || {
-                        if worker.control.is_current(worker.revision) {
-                            Ok(())
-                        } else {
-                            Err("已取消导出".into())
-                        }
-                    },
-                    || {
-                        let mut state = worker
-                            .state
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner());
-                        if !worker.control.is_current(worker.revision) {
-                            return Err("已取消导出".into());
-                        }
-                        state.phase = "committing";
-                        state.message = "正在提交完整文件".into();
-                        Ok(state)
-                    },
-                );
+                let result = if ready.png.is_some() {
+                    worker.publish_png(ready)
+                } else {
+                    ready.destination.publish_guarded(
+                        ready
+                            .pdf
+                            .as_ref()
+                            .map_or(ready.document.html.as_bytes(), |pdf| pdf.bytes.as_slice()),
+                        &ready.protected,
+                        || {
+                            if worker.control.is_current(worker.revision) {
+                                Ok(())
+                            } else {
+                                Err("已取消导出".into())
+                            }
+                        },
+                        || {
+                            let mut state = worker
+                                .state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            if !worker.control.is_current(worker.revision) {
+                                return Err("已取消导出".into());
+                            }
+                            state.phase = "committing";
+                            state.message = "正在提交完整文件".into();
+                            Ok(state)
+                        },
+                    )
+                };
                 match result {
                     Ok(()) => {
                         let mut state = worker
@@ -511,7 +616,9 @@ impl HtmlJob {
                             "completed_with_warnings"
                         };
                         state.message = if state.warnings.is_empty() {
-                            if worker.pdf_settings.is_some() {
+                            if worker.png_settings.is_some() {
+                                "PNG 导出完成".into()
+                            } else if worker.pdf_settings.is_some() {
                                 "PDF 导出完成".into()
                             } else {
                                 "HTML 导出完成".into()
