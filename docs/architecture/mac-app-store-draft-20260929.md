@@ -14,6 +14,8 @@ The App Store Connect record is saved as a draft:
 - Traditional Chinese: `Yu: Markdown 寫作` / `所見即所得，專注寫作`
 - Primary category: Productivity; age rating: 4+
 - No build uploaded and no review submitted
+- Traditional Chinese version description, promotional text, keywords, and support URL saved
+- Review contact fields are now populated in App Store Connect; values remain in Apple’s system
 
 Group 7 internationalization was merged into this branch. Complete the store
 listing, screenshots, privacy information, regional availability, and submission.
@@ -28,7 +30,7 @@ is installed, and the packaging pipeline has produced and verified an Apple-sign
 
 ## Sandbox document acceptance
 
-The external-file test exposed two failures, now corrected in the working tree:
+The external-file test exposed two failures, corrected in commit `435bd435`:
 
 - Rust's sibling temporary file was outside a file-only Powerbox grant. The
   sandbox path now stages canonical bytes in the app container and delegates
@@ -56,11 +58,17 @@ External-folder relative images, exports, and the remaining store acceptance
 still need completion. Candidates are not upload artifacts. Rebuild from a clean
 commit after the fixes are committed; the previous build-3 package predates them.
 
-The app privacy policy is in `PRIVACY.md`; publish it on the default branch
-before using its URL in App Store Connect. The repository README previously
+The app privacy policy is in `PRIVACY.md`. Its public `codex/mac-app-store`
+branch URL is saved in App Store Connect for Simplified Chinese, Traditional
+Chinese, and English (US). The user confirmed Apple’s privacy declaration
+commitment, and the “Data Not Collected” answers were published successfully.
+Move the URL to the default branch when the release changes merge. The repository README previously
 called the app unusable; it now states the actual pre-release status. All
 store answers must match the final signed build.
 
 The existing Developer ID DMG pipeline and artifact are separate and were not
 modified by this draft. The Mac App Store needs its own sandboxed package; the
 notarized DMG is not an App Store build.
+
+Current UI handoff: the signed candidate is waiting in the real PDF export panel
+for `Public/YuAppStoreSaveAsCheck.pdf`. External PDF export is not yet accepted.
