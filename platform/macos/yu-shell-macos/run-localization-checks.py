@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-LANGUAGES = ("en", "zh-Hans", "zh-Hant")
+LANGUAGES = ("en", "zh-Hans", "zh-Hant", "ja", "ko")
 
 
 def fail(message: str) -> None:

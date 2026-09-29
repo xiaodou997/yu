@@ -27,9 +27,13 @@ func runLocalizationSelfCheck() {
         ("en", "Settings…", "Settings…"),
         ("zh-Hans", "Settings…", "设置…"),
         ("zh-Hant", "Settings…", "設定…"),
+        ("ja", "Settings…", "設定…"),
+        ("ko", "Settings…", "설정…"),
         ("en", "Export failed. No output was committed.", "Export failed. No output was committed."),
         ("zh-Hans", "Export failed. No output was committed.", "导出失败，没有提交新的输出文件。"),
         ("zh-Hant", "Export failed. No output was committed.", "匯出失敗，沒有提交新的輸出檔案。"),
+        ("ja", "Export failed. No output was committed.", "書き出しに失敗しました。新しい出力は保存されていません。"),
+        ("ko", "Export failed. No output was committed.", "내보내기에 실패했습니다. 새 출력은 저장되지 않았습니다."),
     ]
     for (language, key, expected) in probes {
         guard let actual = L10n.tr(key, language: language), actual == expected else {
@@ -38,7 +42,7 @@ func runLocalizationSelfCheck() {
         }
     }
     let available = Set(Bundle.main.localizations)
-    guard Set(["en", "zh-Hans", "zh-Hant"]).isSubset(of: available) else {
+    guard Set(["en", "zh-Hans", "zh-Hant", "ja", "ko"]).isSubset(of: available) else {
         fputs("localization-self-check failed: bundle localizations = \(available.sorted())\n", stderr)
         exit(1)
     }
