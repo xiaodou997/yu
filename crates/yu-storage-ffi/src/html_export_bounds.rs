@@ -3,6 +3,8 @@
 use super::*;
 use yu_text::TextBuffer;
 
+static EXPORT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn wait(job: &HtmlJob) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -17,6 +19,7 @@ fn wait(job: &HtmlJob) {
 }
 #[test]
 fn html_budget_lifecycle_two_jobs_deadline_and_source_refusal() {
+    let _serial = EXPORT_TEST_SERIAL.lock().expect("export test serial");
     for format in ["html", "pdf", "png"] {
         check_format_budget(format);
     }
@@ -105,6 +108,7 @@ fn check_format_budget(format: &str) {
 
 #[test]
 fn png_task_warning_and_file_failure_contracts() {
+    let _serial = EXPORT_TEST_SERIAL.lock().expect("export test serial");
     use std::os::unix::fs::PermissionsExt;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
