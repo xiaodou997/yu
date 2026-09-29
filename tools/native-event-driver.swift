@@ -255,7 +255,62 @@ case "controls":
     }
     collect(application)
     json(["controls": controls])
-case "save-name":
+case "export-button":
+    guard args.count==3,["关闭","取消导出","分段导出","带诊断分段导出"].contains(args[2]) else{fail("Only bounded export buttons allowed")}
+    var count=0
+    func exportButton(_ e:AXUIElement,depth:Int=0)->AXUIElement?{
+        guard depth<18,count<2000 else{return nil};count+=1
+        if attribute(e,"AXRole") as? String == "AXButton",attribute(e,"AXTitle") as? String == args[2],attribute(e,"AXEnabled") as? Bool == true{return e}
+        for c in attribute(e,"AXChildren") as? [AXUIElement] ?? [] {if let r=exportButton(c,depth:depth+1){return r}}
+        return nil
+    }
+    var button:AXUIElement?
+    if let focused=attribute(application,"AXFocusedWindow"),CFGetTypeID(focused)==AXUIElementGetTypeID(){button=exportButton(unsafeBitCast(focused,to:AXUIElement.self))}
+    if button == nil{count=0;button=exportButton(application)}
+    guard let button else{fail("Export button not available")}
+    let result=AXUIElementPerformAction(button,kAXPressAction as CFString)
+    RunLoop.current.run(until:Date().addingTimeInterval(0.5))
+    json(["title":args[2],"ax_status":result.rawValue,"interaction":"export_accessibility_button"])
+case "png-setting":
+    // Only benign PNG accessory fields in the current native save panel.
+    guard args.count==4,["width","scale","style"].contains(args[2]),
+          let focused=attribute(application,"AXFocusedWindow"),CFGetTypeID(focused)==AXUIElementGetTypeID() else{fail("PNG setting required")}
+    let window=unsafeBitCast(focused,to:AXUIElement.self)
+    guard attribute(window,"AXIdentifier") as? String == "save-panel" else{fail("Expected current save panel")}
+    let field=args[2],value=args[3]
+    guard (field=="width" && Int(value).map{(320...2048).contains($0)}==true)
+        || (field=="scale" && ["1×","2×"].contains(value))
+        || (field=="style" && ["浅色","当前正文主题"].contains(value)) else{fail("Invalid PNG setting")}
+    var count=0
+    func search(_ e:AXUIElement,_ predicate:(AXUIElement)->Bool,depth:Int=0)->AXUIElement?{
+        guard depth<20,count<2500 else{return nil};count+=1
+        if predicate(e){return e}
+        for child in attribute(e,"AXChildren") as? [AXUIElement] ?? [] {if let r=search(child,predicate,depth:depth+1){return r}}
+        if let shown=attribute(e,"AXShownMenu"),CFGetTypeID(shown)==AXUIElementGetTypeID(){return search(unsafeBitCast(shown,to:AXUIElement.self),predicate,depth:depth+1)}
+        return nil
+    }
+    guard let control=search(window,{e in
+        if field=="style"{return attribute(e,"AXRole") as? String == "AXPopUpButton" && ["浅色","当前正文主题"].contains(attribute(e,"AXValue") as? String ?? "")}
+        return attribute(e,"AXIdentifier") as? String == "yu-png-\(field)"
+    }) else{fail("PNG accessory control missing")}
+    if attribute(control,"AXValue") as? String != value {
+        if field=="width"{_ = AXUIElementSetAttributeValue(control,kAXValueAttribute as CFString,value as CFString)}
+        else {
+            _ = AXUIElementPerformAction(control,kAXPressAction as CFString)
+            let deadline=Date().addingTimeInterval(5);var option:AXUIElement?
+            repeat{count=0;option=search(application,{attribute($0,"AXRole") as? String == "AXMenuItem" && attribute($0,"AXTitle") as? String == value});if option == nil{RunLoop.current.run(until:Date().addingTimeInterval(0.1))}}while option == nil && Date()<deadline
+            guard let option else{fail("PNG popup option not shown")}
+            _ = AXUIElementPerformAction(option,kAXPressAction as CFString)
+        }
+    }
+    let deadline=Date().addingTimeInterval(5)
+    while attribute(control,"AXValue") as? String != value && Date()<deadline{RunLoop.current.run(until:Date().addingTimeInterval(0.1))}
+    guard attribute(control,"AXValue") as? String == value else{fail("PNG setting not applied")}
+    // Selected value changes before AppKit finishes closing a popup menu.
+    // Let that one operation settle before a subsequent field is activated.
+    RunLoop.current.run(until:Date().addingTimeInterval(0.7))
+    json(["field":field,"value":value,"interaction":"native_accessibility"])
+case "save-name", "save-name-value":
     // Focus the exact visible save field before one real keyboard sequence.
     // This never writes a file, changes the clipboard, or presses Print/Save.
     guard args.count == 3, !args[2].isEmpty, args[2].utf16.count <= 200,
@@ -271,6 +326,13 @@ case "save-name":
         return nil
     }
     guard let field = saveField(window) else { fail("No visible save filename field") }
+    if action == "save-name-value" {
+        let code=AXUIElementSetAttributeValue(field,kAXValueAttribute as CFString,args[2] as CFString)
+        RunLoop.current.run(until:Date().addingTimeInterval(0.3))
+        guard attribute(field,"AXValue") as? String == args[2] else { fail("Save field AX value did not change") }
+        json(["expected":args[2],"actual":args[2],"ax_status":code.rawValue,"interaction":"native_save_field_accessibility"])
+        break
+    }
     let focusResult = AXUIElementSetAttributeValue(field,kAXFocusedAttribute as CFString,kCFBooleanTrue)
     RunLoop.current.run(until:Date().addingTimeInterval(0.3))
     guard attribute(field,"AXFocused") as? Bool == true else { fail("Save filename did not receive focus") }

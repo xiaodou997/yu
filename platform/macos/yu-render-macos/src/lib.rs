@@ -71,6 +71,10 @@ use yu_workspace::{
 mod pdf;
 #[cfg(target_os = "macos")]
 pub use pdf::{PrintPagePlan, RenderedPdf, export_pdf, export_print_pdf};
+#[cfg(target_os = "macos")]
+mod png;
+#[cfg(target_os = "macos")]
+pub use png::{PngPlan, move_directory_exclusive, prepare_png};
 
 #[cfg(target_os = "macos")]
 mod core_text;

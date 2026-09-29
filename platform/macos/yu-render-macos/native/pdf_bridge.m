@@ -37,22 +37,34 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
 @property BOOL numbers;
 @property BOOL recording;
 @property NSMutableArray *pageCommands;
+@property BOOL raster;
+@property NSMutableArray *segmentHeights;
+@property NSUInteger commandCount;
+@property NSColor *foreground, *background, *linkColor;
 @end
 @implementation YuPDFComposer
 // Retain the original shaped CTLines and frozen images, not PDF-page redraws:
 // Quartz/PDFKit page replay can lose ToUnicode mappings on system PDF output.
 - (void)emit:(void (^)(CGContextRef))draw {
-    draw(_context);
+    if (!_raster) draw(_context);
+    if (_raster && ++_commandCount > 200000) { _failure=@"PNG 绘制命令超过 200000 项预算"; return; }
     if (_recording) [_pageCommands.lastObject addObject:[draw copy]];
 }
 - (void)fill:(CGRect)rect r:(CGFloat)r g:(CGFloat)g b:(CGFloat)b {
+    if (_raster && r==g && g==b) {
+        CGFloat mix=1-r;
+        r=_background.redComponent*(1-mix)+_foreground.redComponent*mix;
+        g=_background.greenComponent*(1-mix)+_foreground.greenComponent*mix;
+        b=_background.blueComponent*(1-mix)+_foreground.blueComponent*mix;
+    }
     [self emit:^(CGContextRef c){CGContextSetRGBFillColor(c,r,g,b,1);CGContextFillRect(c,rect);}];
 }
 - (void)border:(CGRect)rect {
     [self emit:^(CGContextRef c){CGContextSetRGBStrokeColor(c,0.65,0.65,0.65,1);CGContextSetLineWidth(c,0.5);CGContextStrokeRect(c,rect);}];
 }
 - (void)strike:(CGRect)box height:(CGFloat)h {
-    [self emit:^(CGContextRef c){CGContextSetRGBStrokeColor(c,0,0,0,1);CGContextSetLineWidth(c,0.6);CGContextMoveToPoint(c,box.origin.x,box.origin.y+h*0.55);CGContextAddLineToPoint(c,CGRectGetMaxX(box),box.origin.y+h*0.55);CGContextStrokePath(c);}];
+    NSColor *color=_raster?_foreground:NSColor.blackColor;
+    [self emit:^(CGContextRef c){CGContextSetStrokeColorWithColor(c,color.CGColor);CGContextSetLineWidth(c,0.6);CGContextMoveToPoint(c,box.origin.x,box.origin.y+h*0.55);CGContextAddLineToPoint(c,CGRectGetMaxX(box),box.origin.y+h*0.55);CGContextStrokePath(c);}];
 }
 - (void)textLine:(CTLineRef)line x:(CGFloat)x y:(CGFloat)y {
     id retained=(__bridge id)line;
@@ -66,12 +78,18 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     }];
 }
 
-- (BOOL)checkpoint {if (!_check(_owner)) {_failure=@"PDF 已取消或超过准备时间预算";return NO;}return YES;}
+- (BOOL)checkpoint {if(_failure)return NO;if (!_check(_owner)) {_failure=@"PDF 已取消或超过准备时间预算";return NO;}return YES;}
 - (BOOL)beginPage {
     if (![self checkpoint]) return NO;
-    if (_pages >= _maxPages) {_failure=@"PDF 超过 1000 页预算";return NO;}
-    if (_pages) CGPDFContextEndPage(_context);
-    CGPDFContextBeginPage(_context,NULL);_pages++;_y=_margin;
+    if (_pages >= _maxPages) {_failure=_raster?@"PNG 超过 64 段预算":@"PDF 超过 1000 页预算";return NO;}
+    if (_raster) {
+        if(!_segmentHeights)_segmentHeights=NSMutableArray.array;
+        if(_pages)[_segmentHeights addObject:@(MIN(_height,ceil(_y+_margin)))];
+    } else {
+        if (_pages) CGPDFContextEndPage(_context);
+        CGPDFContextBeginPage(_context,NULL);
+    }
+    _pages++;_y=_margin;
     if(_recording){if(!_pageCommands)_pageCommands=NSMutableArray.array;[_pageCommands addObject:NSMutableArray.array];}
     [self fill:CGRectMake(0,0,_width,_height) r:1 g:1 b:1];
     if (_numbers) {
@@ -101,6 +119,7 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     CGFloat base=[kind isEqual:@"code"]?10.5:12;
     BOOL heading=[kind hasPrefix:@"h"] && kind.length==2;
     if (heading) {NSUInteger level=[[kind substringFromIndex:1] integerValue];base=level==1?22:level==2?17:14;}
+    if(_raster)base*=[_packet[@"png"][@"fontSize"] doubleValue]/16.0;
     NSMutableAttributedString *text=[[NSMutableAttributedString alloc] initWithString:@""];
     NSMutableArray *pictures=NSMutableArray.array,*anchors=NSMutableArray.array;
     for (NSDictionary *run in runs) {
@@ -114,13 +133,13 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
             CTFontRef italic=CTFontCreateCopyWithSymbolicTraits((__bridge CTFontRef)font,0,NULL,kCTFontItalicTrait,kCTFontItalicTrait);
             if(italic)font=CFBridgingRelease(italic);
         }
-        NSMutableDictionary *attrs=[@{NSFontAttributeName:font,NSForegroundColorAttributeName:NSColor.blackColor,
+        NSMutableDictionary *attrs=[@{NSFontAttributeName:font,NSForegroundColorAttributeName:(_raster?_foreground:NSColor.blackColor),
             NSBaselineOffsetAttributeName:run[@"rise"]?:@0} mutableCopy];
         NSString *link=[run[@"link"] isKindOfClass:NSString.class]?run[@"link"]:nil;
-        if (link) {attrs[@"yu-link"]=link;attrs[NSForegroundColorAttributeName]=[NSColor colorWithSRGBRed:0.12 green:0.28 blue:0.58 alpha:1];attrs[NSUnderlineStyleAttributeName]=@1;}
+        if (link) {attrs[@"yu-link"]=link;attrs[NSForegroundColorAttributeName]=_raster?_linkColor:[NSColor colorWithSRGBRed:0.12 green:0.28 blue:0.58 alpha:1];attrs[NSUnderlineStyleAttributeName]=@1;}
         if ([run[@"underline"] boolValue]) attrs[NSUnderlineStyleAttributeName]=@1;
         if ([run[@"strike"] boolValue]) attrs[@"yu-strike"]=@YES;
-        if ([run[@"highlight"] boolValue]) attrs[@"yu-highlight"]=@YES;
+        if ([run[@"highlight"] boolValue]) {attrs[@"yu-highlight"]=@YES;if(_raster)attrs[NSForegroundColorAttributeName]=NSColor.blackColor;}
         if (run[@"image"]) {
             NSUInteger index=[run[@"image"] unsignedIntegerValue];NSImage *image=[self image:index];if (!image)return nil;
             NSDictionary *resource=_packet[@"images"][index];
@@ -165,6 +184,7 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     return @{@"text":text,@"lines":lines,@"pictures":pictures,@"anchors":anchors,@"height":@(total)};
 }
 - (void)anchor:(NSString *)name x:(CGFloat)x y:(CGFloat)y {
+    if(_raster)return;
     if ([_destinations containsObject:name])return;
     [_destinations addObject:name];CGPDFContextAddDestinationAtPoint(_context,(__bridge CFStringRef)name,CGPointMake(x,_height-y));
 }
@@ -182,6 +202,7 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
         if([attrs[@"yu-highlight"] boolValue])[self fill:box r:1 g:0.95 b:0.65];
         if([attrs[@"yu-strike"] boolValue])[self strike:box height:h];
         NSString *link=attrs[@"yu-link"];
+        if(self.raster) return;
         if([link hasPrefix:@"#"])CGPDFContextSetDestinationForRect(self.context,(__bridge CFStringRef)[link substringFromIndex:1],box);
         else if([link hasPrefix:@"https:"]||[link hasPrefix:@"http:"]||[link hasPrefix:@"mailto:"]){NSURL *url=[NSURL URLWithString:link];if(url)CGPDFContextSetURLForRect(self.context,(__bridge CFURLRef)url,box);}
     }];
@@ -244,9 +265,9 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
     };
     _y+=6;
     for(NSArray *band in table[@"bands"]){if(![self checkpoint])return NO;NSUInteger first=[band[0] unsignedIntegerValue],end=[band[1] unsignedIntegerValue];CGFloat h=0;
-        for(NSUInteger r=first;r<end;r++)h+=[heights[r] doubleValue];CGFloat repeat=first>=headers?headerHeight:0;
+        for(NSUInteger r=first;r<end;r++)h+=[heights[r] doubleValue];CGFloat repeat=!_raster&&first>=headers?headerHeight:0;
         if(h+repeat>_bottom-_margin){_failure=@"表格完整跨行合并组无法放入单页，请调整纸张方向或页边距";return NO;}
-        if(_y+h>_bottom){if(![self beginPage])return NO;if(first>=headers&&headers&&!drawBand(0,headers))return NO;}
+        if(_y+h>_bottom){if(![self beginPage])return NO;if(!_raster&&first>=headers&&headers&&!drawBand(0,headers))return NO;}
         if(!drawBand(first,end))return NO;
     }
     _y+=10;return YES;
@@ -261,7 +282,8 @@ static CGFloat image_width(void *p) {return ((YuPDFImageMetrics *)p)->width;}
         else if([block[@"kind"] isEqual:@"table"]){if(![self table:block])return NO;}
         else {if(_y+16>_bottom&&![self beginPage])return NO;[self fill:CGRectMake(_margin,_height-_y-8,_width-2*_margin,0.5) r:0.6 g:0.6 b:0.6];_y+=16;}
     }}
-    return YES;
+    if(_raster)[_segmentHeights addObject:@(MIN(_height,ceil(_y+_margin)))];
+    return [self checkpoint];
 }
 @end
 
@@ -299,3 +321,4 @@ int yu_macos_print_plan_draw(void *plan,uint32_t page,void *context){
         @catch(NSException *e){return 0;}}
 }
 void yu_macos_print_plan_free(void *plan){if(plan)CFRelease(plan);}
+#include "png_bridge.m"

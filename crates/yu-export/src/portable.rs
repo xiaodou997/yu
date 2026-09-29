@@ -8,6 +8,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(test)]
+#[path = "png_transactions.rs"]
+mod png_transactions;
+
 pub const MAX_RESOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RESOURCE_TOTAL: usize = 128 * 1024 * 1024;
 pub const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
@@ -69,6 +73,59 @@ pub struct Destination {
     parent_identity: Stamp,
 }
 impl Destination {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// A new segment directory is staged in the same parent and never merged.
+    /// The platform supplies an atomic, no-clobber directory move.
+    pub fn publish_png_directory<G>(
+        self,
+        count: usize,
+        protected: &[ProtectedFile],
+        mut encode: impl FnMut(usize, usize) -> Result<Vec<u8>, String>,
+        mut checkpoint: impl FnMut() -> Result<(), String>,
+        begin_commit: impl FnOnce() -> Result<G, String>,
+        move_exclusive: impl FnOnce(&Path, &Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.initial.is_some() || !(2..=crate::png::MAX_PNG_SEGMENTS).contains(&count) {
+            return Err("PNG分段只能发布至新的目录".into());
+        }
+        self.validate(protected)?;
+        checkpoint()?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".yu-export-png-")
+            .tempdir_in(&self.parent)
+            .map_err(|_| "不能建立PNG临时目录")?;
+        let mut total = 0usize;
+        for index in 0..count {
+            checkpoint()?;
+            let bytes = encode(index, MAX_OUTPUT_BYTES - total)?;
+            total = total
+                .checked_add(bytes.len())
+                .filter(|&n| n <= MAX_OUTPUT_BYTES)
+                .ok_or("PNG编码总量超过256MiB")?;
+            if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err("PNG分段签名无效".into());
+            }
+            let path = temporary.path().join(format!("part-{:03}.png", index + 1));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|_| "不能创建PNG分段")?;
+            for part in bytes.chunks(1024 * 1024) {
+                checkpoint()?;
+                file.write_all(part).map_err(|_| "写入PNG分段失败")?;
+            }
+            file.sync_all().map_err(|_| "同步PNG分段失败")?;
+        }
+        self.validate(protected)?;
+        checkpoint()?;
+        let _guard = begin_commit()?;
+        move_exclusive(temporary.path(), &self.path)?;
+        Ok(())
+    }
+
     /// Call at destination confirmation, before long-running preparation.
     pub fn capture(path: &Path, replace_existing: bool) -> Result<Self, String> {
         let parent = path

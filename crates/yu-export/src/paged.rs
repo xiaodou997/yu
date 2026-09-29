@@ -510,6 +510,13 @@ pub fn prepare_pdf_packet(
     document: &HtmlDocument,
     settings: PageSettings,
 ) -> Result<Vec<u8>, String> {
+    prepare_flow_packet(document, settings, None)
+}
+pub(crate) fn prepare_flow_packet(
+    document: &HtmlDocument,
+    settings: PageSettings,
+    png: Option<Value>,
+) -> Result<Vec<u8>, String> {
     let raw = document
         .html
         .split_once("<main>")
@@ -532,7 +539,11 @@ pub fn prepare_pdf_packet(
         .split_once("<title>")
         .and_then(|(_, s)| s.split_once("</title>").map(|(title, _)| title))
         .unwrap_or("Yu 文档");
-    let packet = json!({"title":yu_markdown::image_markup::decode_image_text(title,true),"width":settings.width,"height":settings.height,"margin":settings.margin,"pageNumbers":settings.page_numbers,"maxPages":MAX_PDF_PAGES,"minFigureScale":MIN_FIGURE_SCALE,"blocks":blocks,"images":adapter.images});
+    let mut packet = json!({"title":yu_markdown::image_markup::decode_image_text(title,true),"width":settings.width,"height":settings.height,"margin":settings.margin,"pageNumbers":settings.page_numbers,"maxPages":MAX_PDF_PAGES,"minFigureScale":MIN_FIGURE_SCALE,"blocks":blocks,"images":adapter.images});
+    if let Some(png) = png {
+        packet["maxPages"] = png["maxSegments"].clone();
+        packet["png"] = png;
+    }
     struct BoundedPacket(Vec<u8>);
     impl std::io::Write for BoundedPacket {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

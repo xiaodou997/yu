@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/metal_bridge.m");
     println!("cargo:rerun-if-changed=native/image_bridge.m");
     println!("cargo:rerun-if-changed=native/pdf_bridge.m");
+    println!("cargo:rerun-if-changed=native/png_bridge.m");
     println!("cargo:rerun-if-changed=native/yu_shaders.metal");
 
     let target = env::var("TARGET").expect("Cargo must provide TARGET");
