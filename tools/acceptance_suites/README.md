@@ -133,7 +133,10 @@ Foundation临时目录与CUPS的TMPDIR可能不同。只观察本次新增的`yu
 python3 tools/run_acceptance.py group5-png artifacts/新的PNG原生目录
 
 # 实际文件菜单、保存与格式配置、分段先取消再明确确认。
-python3 tools/run_acceptance.py group5-png-window artifacts/新的PNG窗口目录
+GROUP5_PNG_PHASE=window python3 tools/run_acceptance.py group5-png-window artifacts/新的PNG窗口目录
+
+# 未命名相对图片基准，以及资源告警先取消再明确确认。
+GROUP5_PNG_PHASE=resources python3 tools/run_acceptance.py group5-png-window artifacts/新的PNG资源目录
 
 # 两个文档交替10次、3次准备中取消/重试、关闭所属文档和继续编辑。
 python3 tools/run_acceptance.py group5-png-lifecycle artifacts/新的PNG生命周期目录
@@ -142,8 +145,8 @@ python3 tools/run_acceptance.py group5-png-lifecycle artifacts/新的PNG生命�
 cargo test --locked -p yu-storage-ffi --lib html_export::bounds:: -- --test-threads=1
 ```
 
-`--png-export-self-check INPUT NEW_DIRECTORY` 走生产快照、CoreText布局、离屏编码与提交，不是测试专用绘制器。目录须不存在；只操作本次输入副本与输出。`group5-png`核对8个完整命名场景，不自动关闭I01—I03。图像尺寸和实际解码由`inspect-png-native.swift`独立核对；`check-png-linear.swift INPUT_DIRECTORY NEW_OUTPUT_DIRECTORY EXPECTED_LINES`用于固定纯文字样本的像素墨迹行数与接缝裁片，不使用OCR，也不是任意文档的文字识别器。
+`--png-export-self-check INPUT NEW_DIRECTORY` 走生产快照、CoreText布局、离屏编码与提交，不是测试专用绘制器。目录须不存在；只操作本次输入副本与输出。`group5-png`核对10个完整命名场景，包括跨段合并表格与不可分割超大表格；单一suite本身仍不自动关闭I01—I03。图像尺寸和实际解码由`inspect-png-native.swift`独立核对；`check-png-linear.swift INPUT_DIRECTORY NEW_OUTPUT_DIRECTORY EXPECTED_LINES`用于固定纯文字样本的像素墨迹行数与接缝裁片，不使用OCR，也不是任意文档的文字识别器。
 
-窗口测试使用原生菜单及受限公开辅助功能动作；配置和保存字段必须实际达到目标值，最终PNG必须能解码。仅在自身输入目录保存，尚不把文件夹键盘导航、PNG未命名基准与告警的全部实窗手势记为通过。打开文档使用系统open定位隔离应用与本次夹具；每次打开有独立步骤名，避免统一执行器将第二次打开拒绝为重复步骤。
+窗口测试使用原生菜单及受限公开辅助功能动作；配置和保存字段必须实际达到目标值，最终PNG必须能解码。仅在自身输入目录保存；5D结项时未命名基准与告警的实际面板路径已由 `GROUP5_PNG_PHASE=resources` 签收。更多文件夹键盘导航组合不在本批范围。打开文档使用系统open定位隔离应用与本次夹具；每次打开有独立步骤名，避免统一执行器将第二次打开拒绝为重复步骤。
 
-单段限制16 Mi像素及32768边长，总任务128 Mi像素、64段、256 MiB编码字节。超限分段须明确同意，写到新的`名称-images/part-001.png`等编号文件；已有目录不覆盖、不合并。生产目录提交使用macOS原子排他重命名，测试覆盖提交前出现的空目录，失败不能以普通rename覆盖它。按段分配和释放位图，不同时保存全部段的位图。完整实现、证据边界与剩余检查见`docs/architecture/mac-group5-png.md`。
+单段限制16 Mi像素及32768边长，总任务128 Mi像素、64段、256 MiB编码字节。超限分段须明确同意，写到新的`名称-images/part-001.png`等编号文件；已有目录不覆盖、不合并。生产目录提交使用macOS原子排他重命名，测试覆盖提交前出现的空目录，失败不能以普通rename覆盖它。按段分配和释放位图，不同时保存全部段的位图。完整实现、证据边界与结项说明见`docs/architecture/mac-group5-png.md`。
