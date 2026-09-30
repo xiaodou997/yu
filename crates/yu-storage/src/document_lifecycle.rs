@@ -4,9 +4,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{
-    CloseStateMachine, DocumentEditorSession, DocumentSession, ExternalFileState, FileFingerprint,
-    RecoveryRecord, SaveOutcome, StorageError, atomic_replace, atomic_replace_with_replacer,
-    canonical_storage_path, current_fingerprint, serialize_source,
+    CloseState, CloseStateError, CloseStateMachine, CloseTransition, DocumentEditorSession,
+    DocumentSession, ExternalFileState, FileFingerprint, RecoveryRecord, SaveOutcome, StorageError,
+    atomic_replace, atomic_replace_with_replacer, canonical_storage_path, current_fingerprint,
+    serialize_source,
 };
 
 impl DocumentSession {
@@ -112,6 +113,33 @@ impl DocumentEditorSession {
     ) -> Result<SaveOutcome, StorageError> {
         self.document
             .save_as_with_replacer(path, replace_existing, staging_dir, replace)
+    }
+
+    /// Saves an untitled/renamed document while a close prompt is active, then
+    /// completes that same close transition. Product shells need this when the
+    /// user answers "Save" for a document that has no persisted path yet.
+    ///
+    /// The destination write and close state remain one Rust-owned lifecycle:
+    /// callers never have to fake a successful close after a separate save-as.
+    pub fn save_as_close(
+        &mut self,
+        path: impl Into<PathBuf>,
+        replace_existing: bool,
+    ) -> Result<CloseTransition, StorageError> {
+        if !matches!(self.close.state(), CloseState::Prompting(_)) {
+            return Err(StorageError::CloseState(CloseStateError::NotPrompting));
+        }
+        match self.document.save_as(path, replace_existing) {
+            Ok(_) => self
+                .close
+                .save_succeeded()
+                .map_err(StorageError::CloseState),
+            Err(error @ StorageError::ExternalChange { state, .. }) => {
+                let _ = self.close.save_failed_external(state);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Recovery restores the original disk baseline, never the fingerprint of

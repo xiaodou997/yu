@@ -4060,6 +4060,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-shell-windows"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "yu-editor",
+ "yu-storage",
+ "yu-workspace",
+]
+
+[[package]]
 name = "yu-state"
 version = "0.1.0"
 dependencies = [

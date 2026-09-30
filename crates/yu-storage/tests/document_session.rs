@@ -107,6 +107,28 @@ fn staged_save_as_failure_preserves_document_identity_and_retry_moves_to_destina
 }
 
 #[test]
+fn untitled_close_can_save_as_and_finish_the_same_close_transition() {
+    let destination = TestPath::new("untitled-close-save-as");
+    let mut session = DocumentEditorSession::new("Untitled.md", "# draft\n");
+    assert_eq!(
+        session.close_request().expect("close request"),
+        CloseRequest::Prompt(ClosePrompt::SaveChanges)
+    );
+    assert_eq!(
+        session
+            .save_as_close(destination.as_path(), false)
+            .expect("save as close"),
+        CloseTransition::Closed
+    );
+    assert_eq!(session.path(), destination.as_path());
+    assert!(!session.is_dirty());
+    assert_eq!(
+        fs::read_to_string(destination.as_path()).expect("saved"),
+        "# draft\n"
+    );
+}
+
+#[test]
 fn source_mode_save_preserves_bom_crlf_and_shared_undo() {
     let path = TestPath::new("source-mode");
     let body = "# 标题\r\n\r\n| a | b |\r\n| - | - |\r\n| x | y |\r\n";

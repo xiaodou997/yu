@@ -32,6 +32,9 @@ cargo test --workspace
 step "本地门禁与 CI 一致"
 python3 tools/check-ci-parity.py
 
+step "双平台产品壳都在验证面上"
+python3 tools/check-platform-parity.py
+
 step "crate 依赖方向"
 python3 tools/check-deps.py
 
@@ -82,6 +85,9 @@ if [[ "${1:-}" == "--rust-only" ]]; then
     printf "\n\033[1;32m✓ Rust 检查全部通过\033[0m\n"
     exit 0
 fi
+
+step "Windows 产品壳 self-check"
+printf "当前主机不是 Windows，跳过执行；Windows CI 执行：./platform/windows/yu-shell-windows/run-self-checks.ps1\n"
 
 step "macOS 产品壳 self-check"
 if [[ "${1:-}" == "--clean" ]]; then
