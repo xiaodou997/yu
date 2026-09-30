@@ -4199,6 +4199,33 @@ Windows SDK/CRT 与 Rust llvm-tools 的 `llvm-lib` 模式，已经对
 HWND 后自动关闭。当前开发 Runner 是 macOS，因此这一条真实窗口 smoke 仍必须在
 Windows runner/真机补绿；完整记录见 [Windows acceptance](../windows-acceptance.md)。
 
+#### Windows 第三组：DirectWrite + D3D11 / DXGI
+
+第三组把第二组那个“空的 editor surface HWND”接到真正的共享渲染链。字体端
+`yu-font-windows` 现在用 `IDWriteTextAnalyzer` 做 script / bidi 分析，
+`IDWriteFontFallback::MapCharacters` 做 fallback，再把
+`GetGlyphs + GetGlyphPlacements` 的数组交给第一组已经验证过的
+`clusterMap → GlyphRun` 翻译层。
+
+这里补了两个只靠“能编译”抓不住的点。第一，paragraph reading direction 不能
+永远写 LTR；按 UAX #9 的 first-strong 事实选择 LTR/RTL，再让 DirectWrite 给出
+resolved bidi levels。第二，`MapCharacters` 的 `mapped_scale` 是 fallback face
+身份的一部分：它同时进入 `SharedFaceTable` identity、font metrics 与
+rasterization。漏掉它的表现是“run advance 正确、atlas glyph 尺寸错误”。
+
+渲染端新增 `yu-render-windows`：D3D11 11_0 + DXGI flip-discard swapchain。
+它不重新翻译 `RenderCommand`；平台中立的
+`yu_render::build_draw_commands` 仍然是唯一 `RenderPlan → DrawCommand`
+实现，Windows 只把 flat command 填进 16-byte aligned constant buffer，再绑定
+atlas/image texture 与 shader。resize、DPI、device-lost 都只重建原生资源，不建立
+第二份场景/布局答案。
+
+第二组的 `--window-self-check` 现在同时是第三组的 render smoke：窗口初始化会
+真的创建 DirectWrite shaper、CPU glyph atlas、D3D device/swapchain，发布并
+Present 一帧以后才自动关闭。开发机仍是 macOS，因此这里只能完成
+`cargo-xwin` 的 x64 check/clippy/link；真实 DirectWrite runtime 测试与 GPU
+Present 由 Windows CI/真机负责，不能用交叉编译冒充。
+
 #### 深色模式 —— 已完成
 
 **S7 里第一个不属于「第 N 刀」的产品缺陷。** 它从第四刀的人工验收就登记着

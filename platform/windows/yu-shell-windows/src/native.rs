@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColorBrush};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, COLOR_WINDOW, EndPaint, GetSysColorBrush, PAINTSTRUCT,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, CoUninitialize,
@@ -33,18 +35,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, FCONTROL, FSHIFT, FVIRTKEY,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, HACCEL, HMENU, IDC_ARROW,
-    LoadCursorW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassExW,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU,
+    IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE,
+    WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
-use yu_editor::EditorCommand;
+use yu_editor::{EditorCommand, ViewportSpan};
+use yu_font::{FontRequest, GlyphAtlasConfig};
+use yu_font_windows::DirectWriteShaper;
+use yu_render::SurfaceConfig;
+use yu_render_windows::{D3DRenderError, D3DRenderer};
+use yu_scene::Rect;
 use yu_storage::{ClosePrompt, CloseRequest, CloseTransition};
-use yu_workspace::Appearance;
+use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
 
 use crate::{DocumentSlot, Locale, SaveAction, ShellError, ShellState, SidebarMode, WindowMetrics};
 
@@ -59,6 +67,8 @@ const ID_FILE_EXIT: u16 = 1005;
 const ID_EDIT_UNDO: u16 = 1101;
 const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
+const WM_APP_RENDER: u32 = WM_APP + 1;
+const BODY_FONT_SIZE: f32 = 16.0;
 
 const CANCELLED_HRESULT: i32 = 0x8007_04c7_u32 as i32;
 
@@ -81,12 +91,91 @@ impl Drop for ComApartment {
     }
 }
 
+struct RenderHost {
+    surface_hwnd: HWND,
+    builder: ViewportFrameBuilder<DirectWriteShaper>,
+    renderer: D3DRenderer,
+}
+
+impl RenderHost {
+    fn new(surface_hwnd: HWND, appearance: Appearance) -> Result<Self, ShellError> {
+        let surface = native_surface_config(surface_hwnd)?;
+        let config = viewport_render_config(surface, appearance)?;
+        let font = FontRequest::new("Segoe UI", BODY_FONT_SIZE)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let shaper = DirectWriteShaper::new(font)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let builder =
+            ViewportFrameBuilder::with_shaper(shaper, config, GlyphAtlasConfig::default())
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let renderer = D3DRenderer::new(surface_hwnd, surface)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(Self {
+            surface_hwnd,
+            builder,
+            renderer,
+        })
+    }
+
+    fn sync_surface(
+        &mut self,
+        surface_hwnd: HWND,
+        appearance: Appearance,
+    ) -> Result<(), ShellError> {
+        let surface = native_surface_config(surface_hwnd)?;
+        if (surface.scale() - self.renderer.surface().scale()).abs() > f64::EPSILON {
+            *self = Self::new(surface_hwnd, appearance)?;
+            return Ok(());
+        }
+        self.renderer
+            .resize(surface)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.builder
+            .update_config(viewport_render_config(surface, appearance)?)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(())
+    }
+
+    fn render(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
+        let revision = state.document().session().revision();
+        let snapshot = state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .capture_render_snapshot();
+        let mut layout = snapshot.into_layout_context();
+        let publication = self
+            .builder
+            .publish(&mut layout)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+
+        match self.renderer.render_viewport_frame(
+            revision,
+            publication.frame(),
+            self.builder.atlas(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(D3DRenderError::DeviceLost) => {
+                let surface = self.renderer.surface();
+                self.renderer = D3DRenderer::new(self.surface_hwnd, surface)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                self.renderer
+                    .render_viewport_frame(revision, publication.frame(), self.builder.atlas())
+                    .map_err(|error| ShellError::Platform(error.to_string()))
+            }
+            Err(error) => Err(ShellError::Platform(error.to_string())),
+        }
+    }
+}
+
 struct AppWindow {
     hwnd: HWND,
     sidebar: HWND,
     surface: HWND,
     status: HWND,
     state: ShellState,
+    render: Option<RenderHost>,
 }
 
 impl AppWindow {
@@ -97,6 +186,7 @@ impl AppWindow {
             surface: HWND::default(),
             status: HWND::default(),
             state,
+            render: None,
         }
     }
 
@@ -107,7 +197,19 @@ impl AppWindow {
         self.create_children()?;
         self.refresh_chrome();
         self.update_layout();
+        self.render = Some(RenderHost::new(self.surface, self.state.appearance())?);
+        self.render_current()?;
         Ok(())
+    }
+
+    fn render_current(&mut self) -> Result<(), ShellError> {
+        let Some(mut render) = self.render.take() else {
+            return Ok(());
+        };
+        render.sync_surface(self.surface, self.state.appearance())?;
+        let result = render.render(&mut self.state);
+        self.render = Some(render);
+        result
     }
 
     fn install_menu(&self) -> Result<(), ShellError> {
@@ -297,6 +399,9 @@ impl AppWindow {
                 self.update_layout();
             }
             _ => {}
+        }
+        if command != ID_FILE_EXIT {
+            self.render_current()?;
         }
         Ok(())
     }
@@ -494,7 +599,10 @@ fn register_classes() -> Result<(), ShellError> {
         lpfnWndProc: Some(surface_proc),
         hInstance: HINSTANCE(instance.0),
         hCursor: cursor,
-        hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
+        // The D3D swapchain owns every editor pixel. A class brush here would
+        // briefly erase the retained backbuffer during WM_PAINT and create a
+        // second visual path/flicker.
+        hbrBackground: Default::default(),
         lpszClassName: SURFACE_CLASS,
         ..Default::default()
     };
@@ -595,6 +703,9 @@ unsafe extern "system" fn window_proc(
             }
             WM_SIZE => {
                 app.update_layout();
+                if let Err(error) = app.render_current() {
+                    show_error(hwnd, &app.state, &error);
+                }
                 return LRESULT(0);
             }
             WM_DPICHANGED => {
@@ -611,11 +722,23 @@ unsafe extern "system" fn window_proc(
                     );
                 }
                 app.update_layout();
+                if let Err(error) = app.render_current() {
+                    show_error(hwnd, &app.state, &error);
+                }
                 return LRESULT(0);
             }
             WM_SETTINGCHANGE => {
                 app.apply_system_theme();
                 app.refresh_chrome();
+                if let Err(error) = app.render_current() {
+                    show_error(hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
+            WM_APP_RENDER => {
+                if let Err(error) = app.render_current() {
+                    show_error(hwnd, &app.state, &error);
+                }
                 return LRESULT(0);
             }
             WM_CLOSE => {
@@ -646,7 +769,52 @@ unsafe extern "system" fn surface_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        unsafe {
+            BeginPaint(hwnd, &mut paint);
+            let _ = EndPaint(hwnd, &paint);
+            if let Ok(parent) = GetParent(hwnd) {
+                let _ = PostMessageW(parent, WM_APP_RENDER, WPARAM(0), LPARAM(0));
+            }
+        }
+        return LRESULT(0);
+    }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn native_surface_config(hwnd: HWND) -> Result<SurfaceConfig, ShellError> {
+    let mut rect = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rect) }.map_err(platform_error)?;
+    let width_px = (rect.right - rect.left).max(1) as u32;
+    let height_px = (rect.bottom - rect.top).max(1) as u32;
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let scale = f64::from(dpi) / 96.0;
+    SurfaceConfig::new(
+        f64::from(width_px) / scale,
+        f64::from(height_px) / scale,
+        scale,
+    )
+    .map_err(|error| ShellError::Platform(error.to_string()))
+}
+
+fn viewport_render_config(
+    surface: SurfaceConfig,
+    appearance: Appearance,
+) -> Result<ViewportRenderConfig, ShellError> {
+    let width = surface.logical_width() as f32;
+    let height = surface.logical_height() as f32;
+    let scene = Rect::new(0.0, 0.0, width, height)
+        .map_err(|error| ShellError::Platform(error.to_string()))?;
+    Ok(ViewportRenderConfig::new(
+        ViewportSpan::new(0.0, height),
+        BODY_FONT_SIZE,
+        scene,
+        appearance.text(),
+    )
+    .with_background(appearance.background())
+    .with_raster_scale(surface.scale() as f32)
+    .with_appearance(appearance))
 }
 
 unsafe fn create_child_static(parent: HWND, text: &str) -> Result<HWND, ShellError> {

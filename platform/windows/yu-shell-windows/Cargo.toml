@@ -10,10 +10,15 @@ repository.workspace = true
 
 [dependencies]
 yu-editor = { path = "../../../crates/yu-editor" }
+yu-font = { path = "../../../crates/yu-font" }
+yu-render = { path = "../../../crates/yu-render" }
+yu-scene = { path = "../../../crates/yu-scene" }
 yu-storage = { path = "../../../crates/yu-storage" }
 yu-workspace = { path = "../../../crates/yu-workspace" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+yu-font-windows = { path = "../yu-font-windows" }
+yu-render-windows = { path = "../yu-render-windows" }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Globalization",

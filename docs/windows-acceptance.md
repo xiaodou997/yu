@@ -67,3 +67,68 @@
 - TSF / `ITextStoreACP`、IME、完整键鼠编辑链：第四组。
 - UI Automation / Narrator / 高对比度完整验收：第六组。
 - MSIX、Store metadata、最终 exe icon/resource 与签名：第七组。
+
+## 第三组：DirectWrite + D3D11 / DXGI
+
+状态：**实现与 Windows x64 目标构建已完成；真实 Windows GPU/窗口 render smoke
+仍必须在 Windows runner/真机执行。**
+
+本组把第二组留下的 editor surface HWND 接成真正的 Yu 渲染链：
+
+`DocumentEditorSession → ViewportFrameBuilder → RenderPlan → D3DRenderer → DXGI swapchain`。
+
+没有引入 RichEdit、DirectWrite TextLayout 或 GDI 正文绘制；Markdown 正文依然只有
+共享 Rust scene/render 一条路径。
+
+### 已完成
+
+- `yu-font-windows` 接入真实 DirectWrite COM：
+  - `AnalyzeScript` / `AnalyzeBidi`；
+  - first-strong paragraph base direction；
+  - `IDWriteFontFallback::MapCharacters`；
+  - `GetGlyphs` / `GetGlyphPlacements`；
+  - many-to-many cluster、RTL 原生 glyph 顺序、UTF-16 → UTF-8 source 映射；
+  - fallback `mapped_scale` 进入 face identity、metrics 与 rasterization，避免
+    fallback 字体“排版尺寸对、位图尺寸错”。
+- `DirectWriteGlyphRasterizer` 与 shaper 共用同一张 `SharedFaceTable`；
+  普通文字以 DirectWrite 1x1 alpha texture 进入共享 glyph atlas，不建立一套
+  Windows 私有 ClearType atlas。
+- 新增 `yu-render-windows`：
+  - D3D11 feature level 11_0；
+  - DXGI flip-discard 双缓冲 swapchain；
+  - glyph atlas / image texture residency；
+  - FillRect、RoundedFillRect/Shadow、Glyph、Image、Polyline 的 GPU command；
+  - resize 后重建 backbuffer target；
+  - DXGI device removed/reset 显式上报并由 shell 重建 renderer。
+- D3D 只消费共享 `yu-render::build_draw_commands` 的 `DrawCommand`。
+  `GpuCommand` 只负责常量缓冲布局，不重新解释 Markdown、布局或场景语义。
+- editor surface HWND 的 `WM_PAINT` 不走 GDI 绘制，只触发 Rust/D3D 重绘；
+  surface class 也没有背景 brush，避免出现第二条视觉路径。
+- DPI 改变时同时更新 `SurfaceConfig`、`ViewportRenderConfig` 与 glyph
+  `raster_scale`；跨 DPI 时重建 shaper/atlas/renderer，防止混用旧 DPI 位图。
+
+### 自动判据
+
+- 非 Windows 主机：
+  - `yu-font-windows` 的 14 条 cluster/run 翻译测试；
+  - `yu-render-windows` 的 D3D constant-buffer 映射与 16-byte alignment 测试；
+  - 共享 render backend、workspace、layout 的全仓测试继续作为语义 oracle。
+- Windows：
+  - 真实 `DirectWriteShaper` 跑 `yu_core::shaping_conformance::audit`；
+  - 显式 shape Hebrew / Arabic / Devanagari；
+  - shaper 铸出的 face id 必须被它自己的 rasterizer 解回并成功取 metrics/bitmap；
+  - `--window-self-check` 会创建 HWND、DirectWrite shaper、D3D device/swapchain，
+    构建一帧并 Present，然后自动关闭。
+- macOS 开发 Runner 使用 `cargo-xwin` 对
+  `x86_64-pc-windows-msvc` 做 check、all-targets clippy 与最终 PE 链接。
+
+### 明确留到后续组
+
+- TSF / IME / 完整键鼠编辑链：第四组。
+- 图片、公式、Mermaid 等资源从产品调度器到 Windows GPU cache 的完整产品接线：
+  第五组；D3D backend 的 texture upload/residency API 已存在，当前 shell 在没有
+  publication 时仍按共享 RenderPlan 规则画 fallback，不会白屏或阻塞。
+- UI Automation / Narrator / Contrast Theme 完整验收：第六组。
+- 彩色 emoji 的 Windows color-glyph 专用栅格路径也放在产品功能对齐组；本组先
+  保证 Unicode shaping、cluster/caret 几何与普通 glyph atlas 正确，不把
+  ClearType/color-font 私有格式塞进共享 glyph seam。

@@ -60,7 +60,7 @@ Windows 第二平台的产品壳状态见 [Windows acceptance](docs/windows-acce
 | S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 已完成 |
 | S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 已完成 |
 | S6 | 语义 extension 化：每种语法收敛为一个 extension | 已完成 |
-| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生产品壳与 x64 目标构建已建立，D3D/输入/辅助功能继续推进） |
+| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生壳、DirectWrite 与 D3D11/DXGI 已接入，输入/辅助功能继续推进） |
 
 ## 仓库结构
 
@@ -86,9 +86,10 @@ platform/macos/yu-render-macos  Metal device、CAMetalLayer、render plan 编码
 platform/macos/yu-storage-macos FSEvents 文件通知适配
 platform/macos/yu-shell-macos   Swift 产品壳：NSWindow / 菜单 /
                                 NSTextInputClient / Accessibility
-platform/windows/yu-font-windows DirectWrite cluster/run 翻译与 Windows 字体后端地基
+platform/windows/yu-font-windows DirectWrite analysis/fallback/shaping/rasterization
+platform/windows/yu-render-windows D3D11 device、DXGI swapchain、RenderPlan 命令消费
 platform/windows/yu-shell-windows Rust + windows-rs 产品壳：Win32 窗口 / 菜单 /
-                                  DPI / 主题 / 文件生命周期 / renderer surface host
+                                  DPI / 主题 / 文件生命周期 / D3D surface host
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的参考 workload
 ```
