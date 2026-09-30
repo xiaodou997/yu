@@ -82,8 +82,8 @@ pub enum CoreTextShapeError {
     FontUnavailable,
     MissingRunFont,
     NonMonotonicGlyphIndices,
-    /// 一簇多形：两个字形指着同一个文本起点。契约（`yu_core::ShapingProvider`
-    /// 的 C3 + C4）要的是一簇一形，做不到就报错，不许拿空区间或重复起点凑数。
+    /// 一簇多形：两个字形指着同一个文本起点。共享 shaping 契约现在允许这种
+    /// many-to-many 形状；这个错误只表示 **CoreText adapter 尚未完成该映射**。
     MultiGlyphCluster,
     FaceIdOverflow,
     FaceTablePoisoned,
@@ -1384,7 +1384,7 @@ fn shape_run(
     ))
 }
 
-/// 把 CoreText 的「每个字形的起始 UTF-16 下标」翻成契约要的
+/// 把 CoreText 的「每个字形的起始 UTF-16 下标」翻成旧 adapter 当前能消费的
 /// 「每个字形一个非空、首尾相接、铺满 run 的区间」。
 ///
 /// **这是 `shape_run` 里唯一一段真逻辑**，其余都是把 CoreText 的数组抄进
@@ -1393,16 +1393,17 @@ fn shape_run(
 /// 语料实测，两个字形同一个起点一次都没出现过），于是留在 `shape_run` 里
 /// 的分支**没有任何输入能触发**，也就没有反向验证的手段。
 ///
-/// 第二端会一字不差地要写同一件事：DirectWrite 的 `clusterMap` 反过来就是
-/// 这张表，而它的一簇多形是**常态**不是例外。
+/// Windows 第一组已经证明第二端不能照抄这一限制：DirectWrite 的 `clusterMap`
+/// 会正常表达一簇多形，共享 `ShapingProvider` 契约与 `yu-layout` 已升级为
+/// many-to-many。这里保留报错只是 macOS 后端当前的覆盖面限制。
 ///
 /// 三条规则，每一条对应契约上的一条：
 ///
 /// - 起点必须落在 `[run_start, run_end)` 里——越界就是 CoreText 给了一个
 ///   不属于这个 run 的下标；
-/// - 起点必须严格递增。**相等就是一簇多形**：契约要一簇一形，而三种凑法
-///   （重复起点 / 空区间 / 并成一形）分别是重画、panic、丢字形，所以这里
-///   报错而不是挑一种（`yu_core::ShapingProvider` 的「做不到就报错」）；
+/// - 起点必须严格递增。**相等就是一簇多形**：共享契约允许它，但这个旧
+///   CoreText 翻译器还没有 cluster-group 表达，因此明确返回覆盖面错误，不用
+///   空区间或丢 glyph 的方式伪造；
 /// - 每个区间的终点是下一个起点，最后一个到 `run_end`。
 #[cfg(target_os = "macos")]
 fn cluster_spans(
@@ -1847,8 +1848,8 @@ mod tests {
         // 代理对：起点跳两格。
         assert_eq!(cluster_spans(&[0, 2], 0, 3), Ok(vec![(0, 2), (2, 3)]));
 
-        // 一簇多形：两个字形同一个起点。**这是第二端的常态**，而三种凑法
-        // 分别是重画、panic、丢字形，所以只能报错。
+        // 一簇多形：共享契约已经允许；这里仍报错只钉住 macOS adapter 当前
+        // 尚未升级 cluster-group 翻译，不能用空区间或丢 glyph 的方式伪造。
         assert_eq!(
             cluster_spans(&[0, 0, 1], 0, 2),
             Err(CoreTextShapeError::MultiGlyphCluster)

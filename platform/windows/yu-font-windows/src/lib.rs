@@ -29,5 +29,5 @@
 pub mod cluster;
 pub mod run;
 
-pub use cluster::{ClusterMapError, GlyphSpan, glyph_spans};
+pub use cluster::{ClusterMapError, GlyphCluster, glyph_clusters};
 pub use run::{RunAssemblyError, ShapedArrays, assemble_run};

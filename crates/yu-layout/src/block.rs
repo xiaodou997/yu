@@ -818,6 +818,7 @@ impl LineCursor {
 struct GlyphRecord {
     face: FontFaceId,
     glyph: GlyphId,
+    advance: f32,
     x_offset: f32,
     y_offset: f32,
     size_scale: f32,
@@ -832,8 +833,9 @@ struct Measured {
     visual: VisualRange,
     style: StyleId,
     advance: f32,
-    /// shaping 那条路上这个簇画出来是哪个字形。按度量排时是 `None`。
-    glyph: Option<GlyphRecord>,
+    /// shaping 那条路上这个簇画出来的字形。many-to-many 时可以有多个；
+    /// 按度量排或强制换行时为空。
+    glyphs: Vec<GlyphRecord>,
     inline_before: f32,
     inline_after: f32,
     /// 这个 grapheme 本身就是一个强制换行（UAX #14 的 BK / CR / LF / NL）。
@@ -1551,7 +1553,7 @@ impl BlockLayout {
     /// 字形跟着它的簇走。位置在重排**之后**才算——重排改的就是簇的 x，
     /// 在那之前算等于把 RTL 的字形画在逻辑位置上，不报错，只是画反。
     fn place_glyphs(&mut self, measured: &[Measured]) -> Result<(), LayoutError> {
-        if measured.iter().all(|cluster| cluster.glyph.is_none()) {
+        if measured.iter().all(|cluster| cluster.glyphs.is_empty()) {
             return Ok(());
         }
         // 一个 Measured 恰好推出一个 ClusterBox，同序。
@@ -1561,32 +1563,46 @@ impl BlockLayout {
             ));
         }
         let mut glyphs = Vec::new();
-        for (cluster, record) in self.clusters.iter().zip(measured) {
-            let Some(record) = record.glyph else {
+        for (cluster, measured) in self.clusters.iter().zip(measured) {
+            if measured.glyphs.is_empty() {
                 continue;
-            };
+            }
             let line = self
                 .lines
                 .get(cluster.line)
                 .ok_or(LayoutError::OffsetOverflow)?;
-            // 字形的绘制原点是推进盒的**左**边缘，与文字方向无关：RTL 的
-            // 字形也从左边缘往右画，方向只决定盒子按什么顺序摆。
-            let origin = LayoutPoint::new(
-                cluster.x + record.x_offset,
-                line.bounds.y() + line.baseline + record.y_offset,
-            );
-            if !origin.is_finite() {
-                return Err(LayoutError::InvalidPoint);
+            // 一个 cluster 的多个字形共享同一个 ClusterBox。LTR 的笔从左往右，
+            // RTL 的笔从右往左；字形数组内部保持字体后端给出的原生绘制顺序。
+            let rtl = cluster.is_rtl();
+            let mut pen = if rtl {
+                cluster.x + cluster.width
+            } else {
+                cluster.x
+            };
+            for record in &measured.glyphs {
+                if rtl {
+                    pen -= record.advance;
+                }
+                let origin = LayoutPoint::new(
+                    pen + record.x_offset,
+                    line.bounds.y() + line.baseline + record.y_offset,
+                );
+                if !origin.is_finite() {
+                    return Err(LayoutError::InvalidPoint);
+                }
+                glyphs.push(GlyphBox {
+                    face: record.face,
+                    glyph: record.glyph,
+                    visual: cluster.visual,
+                    line: cluster.line,
+                    origin,
+                    style: cluster.style,
+                    size_scale: record.size_scale,
+                });
+                if !rtl {
+                    pen += record.advance;
+                }
             }
-            glyphs.push(GlyphBox {
-                face: record.face,
-                glyph: record.glyph,
-                visual: cluster.visual,
-                line: cluster.line,
-                origin,
-                style: cluster.style,
-                size_scale: record.size_scale,
-            });
         }
         self.glyphs = glyphs;
         Ok(())
@@ -2173,7 +2189,7 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
                 visual,
                 style: run.style(),
                 advance,
-                glyph: None,
+                glyphs: Vec::new(),
                 inline_before: 0.0,
                 inline_after: 0.0,
                 mandatory_break,
@@ -2186,11 +2202,12 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
     Ok(measured)
 }
 
-/// 第一遍的 shaping 版本：把每个 run 交给 shaper，一个字形一个簇。
+/// 第一遍的 shaping 版本：把每个 run 交给 shaper，一个 source cluster 一个
+/// `Measured`；一个 cluster 可以承载多个 glyph。
 ///
 /// 与按度量走的 [`measure`] 有一处**有意**的不同：那一版按 grapheme 切，
-/// 这一版按 shaper 给出的字形切。连字因此不会被劈开——劈开画出来是两个不
-/// 相干的字形，不 panic 也不报错。
+/// 这一版按 shaper 给出的 source cluster 切。连字与复杂脚本 cluster 因此不会
+/// 被劈开；many-to-many 时同一个 `Measured` 里保留多个 glyph。
 ///
 /// run 的文本交给 shaper 时带的是一个**零基局部空间**的 range，返回的字形
 /// range 按这个空间读。布局层没有源码坐标，也不该有（不变量 D4）。
@@ -2266,26 +2283,30 @@ fn measured_from_shaped(
         ));
     }
     let base = run_start + piece_start;
-    let mut cursor = 0_usize;
+    let mut run_cursor = 0_usize;
     for glyph_run in shaped.runs() {
+        let run_from = usize::try_from(glyph_run.source().start().get())
+            .map_err(|_| LayoutError::OffsetOverflow)?;
+        let run_to = usize::try_from(glyph_run.source().end().get())
+            .map_err(|_| LayoutError::OffsetOverflow)?;
+        if run_from != run_cursor || run_to < run_from || run_to > piece.len() {
+            return Err(LayoutError::Shaping(
+                "glyph runs must tile the shaped request in logical order".into(),
+            ));
+        }
+
+        let mut clusters = Vec::<(usize, usize, Vec<GlyphRecord>)>::new();
+        let mut previous_cluster = None;
         for glyph in glyph_run.glyphs() {
             let from = usize::try_from(glyph.source().start().get())
                 .map_err(|_| LayoutError::OffsetOverflow)?;
             let to = usize::try_from(glyph.source().end().get())
                 .map_err(|_| LayoutError::OffsetOverflow)?;
-            // 字形必须按逻辑顺序、无缝、不越界地铺满这个 run。缺一段
-            // 就是丢字，重一段就是重画——两样都不 panic。
-            if from != cursor || to > piece.len() {
+            if from < run_from || to > run_to {
                 return Err(LayoutError::Shaping(
-                    "glyph ranges must tile the run in logical order".into(),
+                    "glyph source cluster must stay inside its glyph run".into(),
                 ));
             }
-            // 空区间**过得了**上面那道门（`from != cursor` 对它恒不成立），
-            // 而它是「一簇多形」被反转成一形一区间时最自然的填法：多出来
-            // 的字形贴在簇尾拿一个零长度区间。放进来的后果不是画错，是
-            // 下面 `bidi.levels[base + from]` 在 run 末尾**越界 panic**
-            // （S7 第七刀 spike 实测），落在中间则凭空多算一段 advance。
-            // 契约里这是 C4，见 `yu_core::ShapingProvider`。
             if to == from {
                 return Err(LayoutError::Shaping(
                     "glyph source ranges must not be empty".into(),
@@ -2294,34 +2315,67 @@ fn measured_from_shaped(
             if !piece.is_char_boundary(from) || !piece.is_char_boundary(to) {
                 return Err(LayoutError::RunNotOnCharBoundary);
             }
-            cursor = to;
-            let cluster_text = &piece[from..to];
-            let mandatory_break =
-                !cluster_text.is_empty() && cluster_text.chars().all(is_mandatory_break_char);
-            let advance = if mandatory_break {
-                0.0
-            } else {
-                glyph.advance()
-            };
-            if !advance.is_finite() || advance < 0.0 {
-                return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+            if !glyph.advance().is_finite() || glyph.advance() < 0.0 {
+                return Err(LayoutError::InvalidMetrics(glyph.advance().to_bits()));
             }
             if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
                 return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
             }
+
+            let cluster = (from, to);
+            let record = GlyphRecord {
+                face: glyph_run.face(),
+                glyph: glyph.id(),
+                advance: glyph.advance(),
+                x_offset: glyph.x_offset(),
+                y_offset: glyph.y_offset() - attrs.baseline_offset(),
+                size_scale: attrs.size_scale(),
+            };
+            if previous_cluster == Some(cluster) {
+                clusters
+                    .last_mut()
+                    .expect("same cluster requires a previous group")
+                    .2
+                    .push(record);
+            } else {
+                if clusters.iter().any(|(existing_from, existing_to, _)| {
+                    (*existing_from, *existing_to) == cluster
+                }) {
+                    return Err(LayoutError::Shaping(
+                        "a source cluster may not reappear after another cluster".into(),
+                    ));
+                }
+                clusters.push((from, to, vec![record]));
+                previous_cluster = Some(cluster);
+            }
+        }
+
+        // 后端字形数组可以是 RTL 原生绘制顺序；layout 的 ClusterBox 必须保持
+        // 逻辑 source 顺序，所以只重排 cluster groups，不动组内 glyph 顺序。
+        clusters.sort_by_key(|(from, to, _)| (*from, *to));
+        let mut cluster_cursor = run_from;
+        for (from, to, glyphs) in clusters {
+            if from != cluster_cursor || to <= from || to > run_to {
+                return Err(LayoutError::Shaping(
+                    "source clusters must tile the glyph run in logical order".into(),
+                ));
+            }
+            cluster_cursor = to;
+            let cluster_text = &piece[from..to];
+            let mandatory_break = cluster_text.chars().all(is_mandatory_break_char);
+            let total_advance = glyphs.iter().try_fold(0.0_f32, |sum, glyph| {
+                let next = sum + glyph.advance;
+                next.is_finite()
+                    .then_some(next)
+                    .ok_or(LayoutError::InvalidMetrics(next.to_bits()))
+            })?;
             out.push(Measured {
                 visual: visual_range(base + from, base + to)?,
                 style,
-                advance,
+                advance: if mandatory_break { 0.0 } else { total_advance },
                 // 强制换行符不进字形流：它没有可画的形状，画出来是一个
                 // 豆腐块。它仍然是一个簇，仍然占视觉字节。
-                glyph: (!mandatory_break).then_some(GlyphRecord {
-                    face: glyph_run.face(),
-                    glyph: glyph.id(),
-                    x_offset: glyph.x_offset(),
-                    y_offset: glyph.y_offset() - attrs.baseline_offset(),
-                    size_scale: attrs.size_scale(),
-                }),
+                glyphs: if mandatory_break { Vec::new() } else { glyphs },
                 inline_before: 0.0,
                 inline_after: 0.0,
                 mandatory_break,
@@ -2329,10 +2383,16 @@ fn measured_from_shaped(
                 level: bidi.levels[base + from].number(),
             });
         }
+        if cluster_cursor != run_to {
+            return Err(LayoutError::Shaping(
+                "source clusters must tile the glyph run in logical order".into(),
+            ));
+        }
+        run_cursor = run_to;
     }
-    if cursor != piece.len() {
+    if run_cursor != piece.len() {
         return Err(LayoutError::Shaping(
-            "glyph ranges must tile the run in logical order".into(),
+            "glyph runs must tile the shaped request in logical order".into(),
         ));
     }
     Ok(())
@@ -2386,7 +2446,7 @@ fn substitute_run<S: ShapingProvider>(
         }
         let base = run_start + local;
         let mandatory_break = cluster_text.chars().all(is_mandatory_break_char);
-        // 强制换行本来就不进字形流（`glyph: None`），它没有被「换成替代字形」
+        // 强制换行本来就不进字形流（`glyphs` 为空），它没有被「换成替代字形」
         // ——把它算进去会让这个判据虚高，而这个数正是「降级看得见」那条断言
         // 依据的东西。
         if !mandatory_break {
@@ -2400,13 +2460,18 @@ fn substitute_run<S: ShapingProvider>(
             } else {
                 replacement.advance
             },
-            glyph: (!mandatory_break).then_some(GlyphRecord {
-                face: replacement.face,
-                glyph: replacement.glyph,
-                x_offset: 0.0,
-                y_offset: -attrs.baseline_offset(),
-                size_scale: attrs.size_scale(),
-            }),
+            glyphs: if mandatory_break {
+                Vec::new()
+            } else {
+                vec![GlyphRecord {
+                    face: replacement.face,
+                    glyph: replacement.glyph,
+                    advance: replacement.advance,
+                    x_offset: 0.0,
+                    y_offset: -attrs.baseline_offset(),
+                    size_scale: attrs.size_scale(),
+                }]
+            },
             inline_before: 0.0,
             inline_after: 0.0,
             mandatory_break,
@@ -3169,6 +3234,36 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// 一个 source cluster 可以保留多个真实 glyph，而不是把后续 glyph 丢掉或
+    /// 伪造成空 source range。ClusterBox 仍然只有一个，宽度是簇内 advance 之和。
+    #[test]
+    fn a_source_cluster_may_carry_several_glyphs() {
+        let layout = shaped_with("abc", &[(0, 1), (0, 1), (1, 3)]).expect("many-to-many");
+        assert_eq!(layout.clusters().len(), 2);
+        assert_eq!(layout.glyphs().len(), 3);
+        assert_eq!(layout.clusters()[0].visual(), visual(0, 1));
+        assert_eq!(layout.clusters()[0].width(), 2.0);
+        assert_eq!(layout.glyphs()[0].visual(), visual(0, 1));
+        assert_eq!(layout.glyphs()[1].visual(), visual(0, 1));
+        assert_eq!(layout.glyphs()[0].origin().x(), 0.0);
+        assert_eq!(layout.glyphs()[1].origin().x(), 1.0);
+        assert_eq!(layout.glyphs()[2].origin().x(), 2.0);
+    }
+
+    /// RTL cluster 内的 glyph 使用同一个视觉 cluster，但笔位从 cluster 的右边缘
+    /// 向左推进；不能把后端原生 glyph 数组当成 LTR 从左往右摆。
+    #[test]
+    fn multi_glyph_rtl_cluster_advances_from_the_right_edge() {
+        let text = "אב";
+        let layout = shaped_with(text, &[(0, 4), (0, 4)]).expect("rtl many-to-many");
+        assert_eq!(layout.clusters().len(), 1);
+        assert!(layout.clusters()[0].is_rtl());
+        assert_eq!(layout.clusters()[0].width(), 2.0);
+        assert_eq!(layout.glyphs().len(), 2);
+        assert_eq!(layout.glyphs()[0].origin().x(), 1.0);
+        assert_eq!(layout.glyphs()[1].origin().x(), 0.0);
     }
 
     /// RTL 行里字形跟着重排走。在重排之前算 origin 会把它们画在逻辑位置上。

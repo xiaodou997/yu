@@ -14,11 +14,14 @@
 //! - **UTF-16 → UTF-8**：DirectWrite 的索引单位是 code unit，`Glyph::source`
 //!   要的是字节。代理对低位不是一个字节边界，落在那里必须失败而不是就近取整
 //!   ——把一个字符劈成两半不报错。这一步交给 [`Utf16Map`]。
+//! - **many-to-many**：一个 source cluster 可能对应多个字形，这些字形共享同一个
+//!   非空 `Glyph::source`。RTL 时字形数组保持 DirectWrite 的原生顺序，不为了
+//!   凑逻辑源码顺序重新排序。
 
 use yu_core::{Glyph, GlyphId, GlyphRun, Script, TextDirection, TextRange, TextStyle};
 use yu_font::{FontFaceId, Utf16Map};
 
-use crate::cluster::{ClusterMapError, glyph_spans};
+use crate::cluster::{ClusterMapError, glyph_clusters};
 
 /// 拼装失败的原因。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,16 +102,23 @@ pub fn assemble_run(
         });
     }
 
-    let spans = glyph_spans(arrays.cluster_map, glyph_count)?;
+    let clusters = glyph_clusters(arrays.cluster_map, glyph_count, direction)?;
     let utf16 = Utf16Map::new(text);
-    let mut glyphs = Vec::with_capacity(glyph_count);
-    for (index, span) in spans.iter().enumerate() {
+    let mut glyph_sources = vec![None; glyph_count];
+    for cluster in clusters {
         let range = utf16
-            .range(span.start_utf16, span.end_utf16, source)
+            .range(cluster.start_utf16, cluster.end_utf16, source)
             .ok_or(RunAssemblyError::NotAUtf16Boundary {
-                start: span.start_utf16,
-                end: span.end_utf16,
+                start: cluster.start_utf16,
+                end: cluster.end_utf16,
             })?;
+        for slot in &mut glyph_sources[cluster.glyph_start..cluster.glyph_end] {
+            *slot = Some(range);
+        }
+    }
+    let mut glyphs = Vec::with_capacity(glyph_count);
+    for (index, range) in glyph_sources.into_iter().enumerate() {
+        let range = range.ok_or(ClusterMapError::UnmappedGlyph { glyph: index })?;
         let advance = arrays.advances[index];
         let (x_offset, y_offset) = arrays.offsets[index];
         if !advance.is_finite() || !x_offset.is_finite() || !y_offset.is_finite() {
@@ -246,23 +256,48 @@ mod tests {
         );
     }
 
-    /// 一簇多形从 [`crate::cluster`] 一路传上来，不在这里被吞掉。
+    /// 一簇多形保留全部字形，字形共享同一个非空 source cluster。
     #[test]
-    fn a_multi_glyph_cluster_stays_an_error_at_this_layer_too() {
-        assert!(matches!(
-            assemble_run(
-                FontFaceId::from_raw(1),
-                "a",
-                source(0, 1),
-                TextStyle::Plain,
-                TextDirection::Ltr,
-                Script::Devanagari,
-                arrays(&[0], &[1, 2], &[5.0, 5.0], &[(0.0, 0.0); 2]),
-            ),
-            Err(RunAssemblyError::ClusterMap(
-                ClusterMapError::MultiGlyphCluster { .. }
-            ))
-        ));
+    fn a_multi_glyph_cluster_keeps_every_glyph() {
+        let run = assemble_run(
+            FontFaceId::from_raw(1),
+            "a",
+            source(0, 1),
+            TextStyle::Plain,
+            TextDirection::Ltr,
+            Script::Devanagari,
+            arrays(&[0], &[1, 2], &[2.0, 3.0], &[(0.0, 0.0); 2]),
+        )
+        .expect("multi-glyph cluster");
+        assert_eq!(run.glyphs().len(), 2);
+        assert!(
+            run.glyphs()
+                .iter()
+                .all(|glyph| glyph.source() == source(0, 1))
+        );
+        assert_eq!(run.advance(), 5.0);
+    }
+
+    /// RTL 保留 DirectWrite 字形数组的原生顺序，但每个 glyph 仍指回正确的逻辑
+    /// source cluster。布局层依据 bidi level 决定 cluster 的物理位置。
+    #[test]
+    fn rtl_native_glyph_order_maps_back_to_logical_clusters() {
+        let run = assemble_run(
+            FontFaceId::from_raw(1),
+            "אב",
+            source(10, 4),
+            TextStyle::Plain,
+            TextDirection::Rtl,
+            Script::Unknown,
+            arrays(&[1, 0], &[20, 21], &[4.0, 5.0], &[(0.0, 0.0); 2]),
+        )
+        .expect("rtl run");
+        let ranges: Vec<(u64, u64)> = run
+            .glyphs()
+            .iter()
+            .map(|glyph| (glyph.source().start().get(), glyph.source().end().get()))
+            .collect();
+        assert_eq!(ranges, vec![(12, 14), (10, 12)]);
     }
 
     /// 非有限的度量不许进 run——它一路飘到布局里会变成 NaN 宽度。
