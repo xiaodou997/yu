@@ -24,6 +24,7 @@ members = [
     "platform/macos/yu-font-macos",
     "platform/macos/yu-render-macos",
     "platform/windows/yu-font-windows",
+    "platform/windows/yu-render-windows",
     "platform/windows/yu-shell-windows",
     "tools/yu-bench",
     "tools/yu-inspect",

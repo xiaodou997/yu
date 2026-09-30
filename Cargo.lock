@@ -3971,7 +3971,9 @@ dependencies = [
 name = "yu-font-windows"
 version = "0.1.0"
 dependencies = [
+ "unicode-bidi",
  "windows",
+ "windows-core",
  "yu-core",
  "yu-font",
 ]
@@ -4051,6 +4053,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-render-windows"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "windows-core",
+ "yu-assets",
+ "yu-core",
+ "yu-font",
+ "yu-render",
+ "yu-scene",
+ "yu-workspace",
+]
+
+[[package]]
 name = "yu-scene"
 version = "0.1.0"
 dependencies = [
@@ -4065,6 +4081,11 @@ version = "0.1.0"
 dependencies = [
  "windows",
  "yu-editor",
+ "yu-font",
+ "yu-font-windows",
+ "yu-render",
+ "yu-render-windows",
+ "yu-scene",
  "yu-storage",
  "yu-workspace",
 ]

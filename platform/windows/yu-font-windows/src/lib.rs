@@ -27,7 +27,11 @@
 //! 在这里帮了大忙：Yu 不用 `IDWriteTextLayout`，两端职责一样。
 
 pub mod cluster;
+#[cfg(target_os = "windows")]
+mod directwrite;
 pub mod run;
 
 pub use cluster::{ClusterMapError, GlyphCluster, glyph_clusters};
+#[cfg(target_os = "windows")]
+pub use directwrite::{DirectWriteError, DirectWriteGlyphRasterizer, DirectWriteShaper};
 pub use run::{RunAssemblyError, ShapedArrays, assemble_run};

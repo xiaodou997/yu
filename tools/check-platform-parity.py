@@ -57,7 +57,7 @@ def main() -> int:
     if windows_script.is_file():
         script = windows_script.read_text(encoding="utf-8")
         for required in [
-            "cargo test -p yu-shell-windows",
+            "cargo test -p yu-font-windows -p yu-render-windows -p yu-shell-windows",
             "cargo check -p yu-shell-windows",
             "cargo run -p yu-shell-windows -- --window-self-check",
         ]:
