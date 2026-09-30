@@ -1,5 +1,27 @@
 # 第六组：macOS 发布收尾（6A → 6F）
 
+## 当前交付状态（2026-09-30）
+
+用户后来选择先提交 Mac App Store；版本标签和 Windows/macOS 联合 GitHub
+Release 等 Windows 就绪后创建。下面的 6A–6F 表格和 DMG 实施记录保留为
+当时的直接分发计划，当前 App Store 提交以
+[商店检查表](mac-app-store-draft-20260929.md) 为准。
+
+直接分发路线的最终 `0.1.2 / build 3` 已完成干净源码构建、公证和软件验收。
+本机 `artifacts/releases/0.1.2-3-final-r2/release-manifest.json` 的阶段是
+`ready-to-publish`；提交为 `af50c40d0bac7290a5ad2e0de72ae9d2cba1aae4`，
+最终 DMG SHA256 为
+`ff1bdafacdc5da2ac1af3e8f2314bea6fb64d5903067a9e71403cfd12319aa61`。
+安装/保存重开、外部 AX、软件恢复、升级和失败保全的报告均保留在
+主工作区 `artifacts/group6-final-acceptance/`。这些证据对应当时的 DMG。
+
+国际化和沙盒修复后的 App Store 正式包来自提交
+`ec726f9905a82c7a045fe03804fc44362c49ec29`，仍为 `0.1.2 / build 3`。
+正式包的完整清单、Apple Distribution 签名、helper 沙盒继承、Hardened
+Runtime、安全时间戳和安装包签名已复核。真实系统打印到 PDF 通过；三种
+商店语言对应的资源已包含在五语言包中。提交包已生成，Apple 验证/上传、
+构建关联和审核提交仍待完成；商店资料保持草稿、免费及审核后手动发布。
+
 更新：2026-09-29。范围依据用户决定：**实机验收使用 macOS 27 / Apple Silicon，不以 macOS 26 专机作为本组阻塞项。** 最低部署目标仍为 26.0；这不等于已经验证 26 的运行兼容性。用户随后将真实注销、重启及同类会打断本机使用的系统场景移出第六组结项门槛；本组聚焦软件和发行包，不调整非必要系统设置。第五组结论保持原有范围。
 
 ## 交付路线与完成条件
