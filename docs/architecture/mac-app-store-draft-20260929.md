@@ -1,11 +1,13 @@
 # Mac App Store release checklist
 
-The App Store Connect record is saved as a draft:
+Current state, September 30: the App Store Connect submission is **Waiting for
+Review**. The formal package passed Apple validation and upload. Submission ID:
+`6500fafc-8775-4ff9-9151-91f6149c17c5`.
 
 - App Store Connect ID: `6817272771`
 - Team ID: `V6M88BQG7C`
 - Bundle ID: `io.github.xiaodou997.yu`
-- macOS version: `0.1.2` (`Prepare for Submission`)
+- macOS version: `0.1.2` / build `3` (`Waiting for Review`)
 - Price: free (`$0.00` in the United States and other listed regions)
 - Release after review: manual
 - Review login: not required
@@ -13,12 +15,14 @@ The App Store Connect record is saved as a draft:
 - English (US): `Yu — Markdown Editor` / `Native WYSIWYG Writing`
 - Traditional Chinese: `Yu: Markdown 寫作` / `所見即所得，專注寫作`
 - Primary category: Productivity; age rating: 4+
-- No build uploaded and no review submitted
+- Build delivery ID: `c964828f-ef8a-4394-b017-688ce0fbc901`
+- Submitted to Apple App Review on September 30, 2026; approval and manual release remain pending
 - Traditional Chinese version description, promotional text, keywords, and support URL saved
 - Review contact fields are now populated in App Store Connect; values remain in Apple’s system
 
-Group 7 internationalization was merged into this branch. Complete the store
-listing, screenshots, privacy information, regional availability, and submission.
+Group 7 internationalization was merged into this branch. The three store
+localizations, screenshots, privacy information, regional availability, and
+review submission are now configured.
 The user will manage App Review contact details personally. Do not create
 a Git tag or a GitHub Release until the Windows build is ready for a joint
 release.
@@ -26,7 +30,10 @@ release.
 The App Store sandbox candidate is signed with Apple Distribution, including
 separate app and helper entitlements. The Mac Installer Distribution certificate
 is installed, and the packaging pipeline has produced and verified an Apple-signed
-`.pkg`. No package has been uploaded yet.
+`.pkg`. The formal package from commit `ec726f99` has been uploaded and submitted.
+
+The sections below retain the acceptance history of earlier candidates. Use
+the final submission record at the end of this document for current state.
 
 ## Sandbox document acceptance
 
@@ -176,14 +183,12 @@ documentation or upload tooling changes.
 
 App Store Connect now has availability saved for all 175 countries/regions.
 Current regional prices are zero, and the version retains manual release.
-The first Simplified Chinese screenshot was accepted at 2880 x 1800; it uses
-the actual signed app window with a caption around it. Apple currently inherits
-this primary-language image for English and Traditional Chinese. Dedicated
-localized screenshots remain to be captured because the desktop automation
-only sees background-window thumbnails until the user brings Yu forward.
-Review notes explaining local-file use and the scoped image-folder prompt were
-saved. Authenticated build validation/upload and review submission remain
-separate items. No tag or GitHub Release has been created.
+All three localizations now have their own 2880 x 1800 JPEG screenshot, showing
+actual signed-app document content with localized captions. The application
+interface remained in the user's current Simplified Chinese language during
+capture; no system language preferences were changed. Review notes explaining
+local-file use and the scoped image-folder prompt were saved. No tag or GitHub
+Release has been created.
 
 `tools/upload-macos-appstore.py` verifies the formal manifest and package hash,
 then performs Apple validation before upload. Run it interactively on the Mac;
@@ -191,3 +196,38 @@ enter an existing App-specific password at its hidden prompt. It passes the
 password through stdin and redacts the account and password from saved output.
 It does not store credentials or submit for review. `--check-only` verifies the
 local package without sending it to Apple.
+
+## Final Apple submission (September 30)
+
+- Apple `validate-app` and `upload-package` both returned exit code 0. Delivery
+  ID: `c964828f-ef8a-4394-b017-688ce0fbc901`; transferred bytes: 45,926,548.
+- Warning 90889 says the bundle lacks a provisioning profile required for
+  TestFlight. The package was successfully processed and submitted for the
+  App Store; this does not claim TestFlight eligibility.
+- Build `0.1.2 (3)` is associated with the store version. The encryption answer
+  is “none of the listed algorithms”: source uses Apple's SHA256 for integrity
+  fingerprints, and the locked Rust dependency sets contain no independent
+  encryption/TLS packages. Apple no longer reports missing export compliance.
+- Content rights are set to necessary rights for third-party resources, based
+  on the audited licenses shipped in the bundle. The English description,
+  promotional text, keywords, and support URL were filled and saved after the
+  preflight found them empty. Traditional and Simplified Chinese fields were
+  independently inspected.
+- Screenshot uploads initially failed because browser screenshot bytes were
+  JPEG with a `.png` filename. The original bytes were saved under matching
+  `.jpg` names, uploaded, and their failed placeholders removed. Read-only
+  Media Manager independently showed `zh-Hans-01.jpg`, `en-01.jpg`, and
+  `zh-Hant-01.jpg` in their respective localizations before final submission.
+- Apple preflight passed, then the final submit action succeeded. Submission
+  `6500fafc-8775-4ff9-9151-91f6149c17c5` shows **Waiting for Review** for
+  `0.1.2 (3)` at September 30, 10:11 (Australia/Perth).
+- Price remains free; availability is 175 countries/regions; release remains
+  manual. The app has not been approved or published. Apple review and the
+  user's later manual release are the next external steps.
+
+Local evidence: `artifacts/appstore-submission-0.1.2-build3-ec726f99/` contains
+the package, manifest, acceptance evidence, redacted validation/upload logs,
+and upload result. `artifacts/appstore-proof/` retains the rendered acceptance
+and browser submission evidence; store images are in
+`artifacts/appstore-screenshots/`. Credentials remain local and were not saved
+by the upload script.
