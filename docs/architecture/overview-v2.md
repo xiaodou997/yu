@@ -3085,8 +3085,10 @@ if from != cursor || to > text.len() { ... }
 if cursor != text.len() { ... }
 ```
 
-意思是：一个 run 的全部 `Glyph::source` 必须构成 `[0, len)` 的**有序划分**
-——首尾相接、不重叠、不留缝。等价于**一簇一形**。
+这是当时的调用方实际契约：一个 run 的全部 `Glyph::source` 必须构成
+`[0, len)` 的**有序划分**——首尾相接、不重叠、不留缝，等价于“一簇一形”。
+**Windows 第一组已经废掉这条限制**；当前规范以 E7 与
+`yu_core::ShapingProvider` 的 cluster-group 契约为准。
 
 而 `yu-core/src/shaping.rs:105` 上 `GlyphRun` 的文档只说「source ranges are
 ordered and may span multiple code points when a shaping engine forms a
@@ -3516,8 +3518,9 @@ tag 序列旗。
 **十条契约写在 `yu_core::ShapingProvider` 的文档上，可执行的那一份是
 `yu_core::shaping_conformance`。** 条文见那里，这里只说三件容易搞错的：
 
-1. **「一簇一形」= C3（铺满）+ C4（非空）**，缺一不可。C3 单独并不排除空
-   区间——`from != cursor` 对它恒不成立。
+1. **Windows 第一组已把 C3 从“一簇一形”升级成 cluster-group 契约。**
+   连续多个 glyph 可以共享同一个非空 source cluster；去重后的 cluster 按逻辑
+   source 铺满 run，RTL glyph 数组允许保持平台原生绘制顺序。C4 继续禁止空区间。
 2. **覆盖面不是契约的一部分。** 一个只排得了拉丁文的后端仍然合规，它对别的
    输入返回 `Err`。语料因此分两档：`Required`（拒了就是不合规）与 `Optional`
    （拒了没事，排出来就要守全部条款）。不分档的话，CoreText 会因为拒掉希伯来
@@ -3545,8 +3548,10 @@ tag 序列旗。
    ranges must not be empty")`）。修之前：落在 run 末尾 **panic**，落在中间
    多算一段 advance。守护测试三条，**中间那种排在最前**——它不 panic，是三条
    里最容易溜过去的那一种。
-2. **`shape_run` 里那段翻译抽成了纯函数 `cluster_spans`**，并且**一簇多形
-   现在报 `MultiGlyphCluster` 而不是靠 `find(> start)` 悄悄跳过**。
+2. **`shape_run` 里那段翻译抽成了纯函数 `cluster_spans`**。当时 macOS
+   adapter 对一簇多形明确报 `MultiGlyphCluster`，避免 `find(> start)` 悄悄
+   跳过 glyph。**这是 macOS adapter 的覆盖面限制，不再是共享契约限制**；
+   Windows 第一组已经让共享 seam 与布局层正式支持 many-to-many。
    抽出来的理由就是第七刀 spike 的第 (4) 条：那段逻辑**没有任何真实输入能
    触发**，留在 `shape_run` 里就没有反向验证的手段。抽出来之后它是
    `(&[usize], run_start, run_end) -> Result<Vec<(usize, usize)>, _>`，
@@ -3642,8 +3647,9 @@ impl，多出来的 39 行几乎全是新用例与那几段「为什么」。
 出来。与 I5「永不白屏、永远可编辑」直接冲突。
 
 插在刀 c 之前而不是留到刀 d，有一条不是「它是缺陷」的理由：**DirectWrite 的
-拒绝集合和 CoreText 不一样**（CoreText 拒 RTL，DirectWrite 不拒但会给一簇多形，
-而契约现在要求那种情况报错）。降级路在第二端落地之前建好，刀 d 直接用；
+拒绝集合和 CoreText 不一样**（CoreText 当前 adapter 拒 RTL，DirectWrite 会正常
+给出一簇多形）。Windows 第一组后来把共享契约补成 many-to-many，因此这类结果
+不再需要降级；真正后端失败时仍走这里的替代字形路径。降级路在第二端落地之前建好，刀 d 直接用；
 不建，刀 d 会在 Windows 上重演同一个洞，而那时候排查成本高得多。
 
 **做之前先做了一次实验，结论改了设计。** 原本的方案是「排不出来就逐簇重试」。
@@ -4132,7 +4138,7 @@ CoreText 函数都挂着它，只有这一个漏了，于是它在非 macOS 上�
 
 | 手段 | 覆盖什么 | 实测 |
 | --- | --- | --- |
-| `cargo test -p yu-font-windows` | 翻译层的纯函数 | 12 条全过 |
+| `cargo test -p yu-font-windows` | 翻译层的纯函数 | **14 条全过**（含 many-to-many / RTL） |
 | `cargo check --target x86_64-pc-windows-msvc` | 类型与签名 | **通过**，`windows` crate 能解析 |
 | `cargo build -p yu-font-windows` | 非 Windows 上也编译得过 | 通过 |
 | 真的调用 DirectWrite | —— | **给不出** |
@@ -4142,25 +4148,29 @@ CoreText 函数都挂着它，只有这一个漏了，于是它在非 macOS 上�
 这一刀更极端——**开发机上根本没有那个后端**。所以翻译逻辑全部挤进纯函数层，
 COM 调用留给 d2。
 
-**`cluster.rs`：方向是反的，而一簇多形没有第三条路。**
+**`cluster.rs`：方向是反的，因此必须保留 cluster，而不是硬切成“一形一区间”。**
 CoreText 的 `CTRunGetStringIndices` 是字形 → 文本；DirectWrite 的 `clusterMap`
 是文本 → 字形，索引单位是 UTF-16 code unit。一簇多形时后续那些字形在
-`clusterMap` 里**根本不出现**，spike 实测过的三种凑法分别赔掉重画、越界 panic、
-丢字形——契约 E7 因此要求报错。六条用例，含一条**一般式**：任何 `Ok` 的结果，
-区间必须首尾相接、非空、末尾正好等于文本长度。
+`clusterMap` 里**根本不出现**。旧实现试过的“重复独立区间 / 空区间 / 丢字形”
+分别会导致错误重画、越界或缺字。Windows 第一组因此把结果改成
+`GlyphCluster { source_utf16, glyph_range }`：一个 source cluster 显式拥有一段
+连续 glyph range。LTR/RTL 分别验证单调方向，任何 `Ok` 结果都必须让所有 glyph
+恰好被一个 cluster 覆盖。
 
 **`run.rs`：平铺数组 → `GlyphRun`。**
-六条用例，其中 **C8 那条用非零基址造**——布局层今天永远传零基，漏掉「把
+七条产品翻译用例，其中 **C8 那条用非零基址造**——布局层今天永远传零基，漏掉「把
 `source.start()` 加回去」在产品链路上一点差别都没有。UTF-16 → UTF-8 交给
 `yu_font::Utf16Map`（刀 b 从 `yu-font-macos` 提上来的，正是为了这一天）：
-代理对低位不是字节边界，落在那里必须失败而不是就近取整。
+代理对低位不是字节边界，落在那里必须失败而不是就近取整。multi-glyph cluster
+中的每个 glyph 共享同一个非空 UTF-8 source range；RTL 保留 DirectWrite 原生 glyph
+顺序，不为了源码顺序重新排列 glyph。
 
 **两层分开是因为它们各自会错得不一样**：反转错了是字形与文本对不上，换算错了
 是把一个字符劈成两半。数组长度对不上也在这一层报——按最短的截断不报错，它产出
 一个「合法」的 run 只是少几个字形，而 `yu-layout` 的 tiling 门会把它报成
 「run 没铺满」，**排查方向指向布局层**。
 
-**d2 要先解决的不是代码，是判据。** `ci.yml` 的 rust 矩阵已含 `windows-latest`
+**d2 的判据已经具备。** `ci.yml` 的 rust 矩阵已含 `windows-latest`
 并跑 `cargo test --workspace`，所以路是现成的，但要推上去才拿得到红绿。
 **不要硬写只过类型检查的 COM 代码**——那是几百行没有任何断言执行过的东西，
 而「全套门禁绿着的谎话」正是刀 a 刚修掉的失败模式。

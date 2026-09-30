@@ -267,25 +267,27 @@ backing scale。两次都不 panic、不报错，只是画错，都要靠真实�
 **E7.** **shaping 的产出契约写在 `yu_core::ShapingProvider` 上，由
 `yu_core::shaping_conformance` 强制，每一个实现都要跑。**
 
-十条条文见那个 trait 的文档。核心是两条合起来的那一条：**一簇一形**——一个 run
-的全部 `Glyph::source` 必须首尾相接、不重叠、**非空**地铺满该 run。
+十条条文见那个 trait 的文档。核心是 **cluster 是源码与 glyph 之间的关联单位，
+不是“一簇一形”**：
 
-- 「铺满」少了「非空」不成立：`from != cursor` 对空区间恒不成立，于是空区间
-  过得了那道门，然后在 run 末尾让布局层**越界 panic**，落在中间则凭空多算
-  一段 advance。这一条是 S7 第七刀 spike 抓出来的，此前整仓都活着。
-- **后端做不到就返回 `Err`，不许伪造区间。** 一簇多形有三种凑法（重复起点 /
-  空区间 / 并成一形），分别是重画、panic、丢字形，没有一种是对的。
+- 同一 source cluster 可以对应一个或多个连续 glyph；这些 glyph 的
+  `Glyph::source` **必须完全相同且非空**。many-to-many shaping 不能靠空区间占位，
+  也不能把多出来的 glyph 丢掉。
+- 去重后的 source cluster 按逻辑源码顺序必须首尾相接、不重叠地铺满所在 run。
+  glyph 数组本身保留平台后端的原生绘制顺序，因此 RTL run 的 cluster 可以按源码
+  逆序出现；同一个 cluster 不能被另一个 cluster 打断后再次出现。
+- 空 `Glyph::source` 仍然是硬错误。它曾在 run 末尾让布局层越界 panic，在中间
+  则凭空多算 advance；现在多字形簇没有任何理由再用空区间表达。
 
-**这一条为什么必须是可执行的**：`ShapingProvider` 今天有六个实现，五个是
-mock，全都一 grapheme 一 glyph——**只有一类实现的接口等于还没被证明**。而契约
-以前只存在于调用方（`yu-layout/src/block.rs` 的 tiling 门）里，类型上一个字
-都看不出来；第二端照着类型写就会撞上。
+**这一条为什么必须是可执行的**：第二个平台把 DirectWrite 的 `clusterMap`
+接进来后，many-to-many 不再是理论边角，而是必须能表达的正常输入。契约以前只
+存在于调用方的“一形一区间” tiling 门里，Windows adapter 只能在“重复区间 /
+空区间 / 丢 glyph”三种错误方案里选。现在 `yu_core::shaping_conformance`
+同时钉住两面：连续 glyph 共享一个非空 cluster **合法**；cluster 被别的 cluster
+打断后再次出现 **非法**。布局层另有 LTR/RTL 多 glyph cluster 的产品链路测试。
 
-**语料压不住的那半要靠故意违约的 mock。** 实测（S7 第七刀 spike，35 个语料）：
-真实的 CoreText 从来没产出过两个字形同一个起点——会出现它的脚本全部先被
-`CTRunStatus` 拒了。所以「一簇多形」这一条**没有任何真实输入能触发**，
-反向验证只能靠合成输入（`yu-font-macos` 的 `cluster_spans` 用例、
-`yu-layout` 的 `Ranges` mock、`yu-core` 自己那几条）。
+macOS 的 CoreText 后端当前仍可以对自己尚未支持的 RTL / multi-glyph run 返回
+`Err`；覆盖面不是 seam 合规的一部分。共享契约已经不再阻止后端以后补齐它们。
 
 **配套的一条：`FontFaceId` 由 shaper 铸、由 rasterizer 消费，两者必须共用
 同一张 `yu_font::SharedFaceTable`。** 各铸各的不 panic、不报错，表现是**屏幕

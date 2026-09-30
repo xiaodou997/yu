@@ -13,10 +13,10 @@
 //! 两档：[`Coverage::Required`] 的必须 shape 得出来，[`Coverage::Optional`]
 //! 的可以拒。
 //!
-//! **不要指望语料压住「一簇多形」。** S7 第七刀的 spike 在本机拿 35 个语料
-//! 跑真的 `CoreTextShaper`，一次都没让两个字形拿到同一个起点——会出现它的
-//! 脚本全部先被 `CTRunStatus` 拒了。压那一条只能靠故意违约的 mock，本模块
-//! 自己的用例就是这么写的。
+//! **many-to-many 不能只靠真实 CoreText 语料压。** S7 第七刀的 spike 在本机
+//! 拿 35 个语料跑真的 `CoreTextShaper`，一次都没让两个字形拿到同一个起点；
+//! Windows/DirectWrite 却会正常产生这种形状。因此这里同时用合成 provider 钉住
+//! “同簇多字形合法”与“同一个簇被别的簇打断后再次出现非法”两面。
 
 use core::fmt;
 
@@ -47,7 +47,7 @@ pub enum Clause {
     SourceIdentity,
     /// C2 run 的 source 必须首尾相接、不重叠地铺满请求的 range。
     RunsTileRequest,
-    /// C3 字形的 source 必须首尾相接、不重叠地铺满它所在的 run。
+    /// C3 去重后的 source cluster 必须首尾相接、不重叠地铺满所在 run。
     GlyphsTileRun,
     /// C4 字形的 source 不得为空。
     EmptyGlyphRange,
@@ -73,7 +73,7 @@ impl Clause {
         match self {
             Self::SourceIdentity => "C1 source identity",
             Self::RunsTileRequest => "C2 runs tile the request",
-            Self::GlyphsTileRun => "C3 glyphs tile the run",
+            Self::GlyphsTileRun => "C3 glyph clusters tile the run",
             Self::EmptyGlyphRange => "C4 no empty glyph range",
             Self::CharBoundary => "C5 char boundary",
             Self::Metrics => "C6 finite metrics",
@@ -153,7 +153,7 @@ const CASES: &[ConformanceCase] = &[
 
 /// 契约语料。
 ///
-/// `Required` 那一档刻意只放「一簇一形一定成立」的东西：拉丁、组合记号、
+/// `Required` 那一档放所有产品后端都必须能处理的基础语料：拉丁、组合记号、
 /// CJK、emoji 序列、空白。`Optional` 那一档放的是 S7 第七刀 spike 实测被
 /// CoreText 拒掉的脚本——它们留在这里是为了「一旦哪天 shape 得出来，条款
 /// 立刻开始管它」，不是为了要求谁支持。
@@ -260,24 +260,17 @@ fn audit_case<P: ShapingProvider>(
                 ),
             );
         }
-        let mut glyph_cursor = run.source().start().get();
+        let mut clusters = Vec::<(u64, u64)>::new();
+        let mut previous_cluster = None;
         for (glyph_index, glyph) in run.glyphs().iter().enumerate() {
             let from = glyph.source().start().get();
             let to = glyph.source().end().get();
-            if from != glyph_cursor {
+            if from < run.source().start().get() || to > run.source().end().get() {
                 push(
                     Clause::GlyphsTileRun,
                     format!(
-                        "run#{index} glyph#{glyph_index} 从 {from} 开始，上一个停在 {glyph_cursor}"
-                    ),
-                );
-            }
-            if to > run.source().end().get() {
-                push(
-                    Clause::GlyphsTileRun,
-                    format!(
-                        "run#{index} glyph#{glyph_index} 到 {to}，run 只到 {}",
-                        run.source().end().get()
+                        "run#{index} glyph#{glyph_index} 的 source={from}..{to} 越出 run {:?}",
+                        run.source()
                     ),
                 );
             }
@@ -286,6 +279,20 @@ fn audit_case<P: ShapingProvider>(
                     Clause::EmptyGlyphRange,
                     format!("run#{index} glyph#{glyph_index} 的 source 是空的（{from}..{to}）"),
                 );
+            }
+            let cluster = (from, to);
+            if previous_cluster != Some(cluster) {
+                if clusters.contains(&cluster) {
+                    push(
+                        Clause::GlyphsTileRun,
+                        format!(
+                            "run#{index} glyph#{glyph_index} 让 cluster {from}..{to} 被别的 cluster 打断后再次出现"
+                        ),
+                    );
+                } else {
+                    clusters.push(cluster);
+                }
+                previous_cluster = Some(cluster);
             }
             for (label, offset) in [("start", from), ("end", to)] {
                 let local = offset.checked_sub(source.start().get());
@@ -320,13 +327,25 @@ fn audit_case<P: ShapingProvider>(
                     ),
                 );
             }
-            glyph_cursor = to;
         }
-        if glyph_cursor != run.source().end().get() {
+        clusters.sort_unstable();
+        let mut cluster_cursor = run.source().start().get();
+        for (cluster_index, (from, to)) in clusters.iter().copied().enumerate() {
+            if from != cluster_cursor || to <= from || to > run.source().end().get() {
+                push(
+                    Clause::GlyphsTileRun,
+                    format!(
+                        "run#{index} cluster#{cluster_index}={from}..{to} 没有从 {cluster_cursor} 开始连续铺满"
+                    ),
+                );
+            }
+            cluster_cursor = to;
+        }
+        if cluster_cursor != run.source().end().get() {
             push(
                 Clause::GlyphsTileRun,
                 format!(
-                    "run#{index} 的字形停在 {glyph_cursor}，run 到 {}",
+                    "run#{index} 的 cluster 停在 {cluster_cursor}，run 到 {}",
                     run.source().end().get()
                 ),
             );
@@ -536,15 +555,29 @@ mod tests {
         );
     }
 
-    /// 一簇多形照 HarfBuzz 的做法反转出来就是「两个字形同一个起点」。
+    /// 一簇多形通过多个连续字形共享同一个非空 source cluster 表达。
     #[test]
-    fn a_repeated_cluster_start_is_a_violation() {
+    fn consecutive_glyphs_may_share_one_source_cluster() {
         let violations = audit(&Scripted(|text| {
             let len = text.len() as u64;
             if len == 0 {
                 return Vec::new();
             }
             vec![(0, len), (0, len)]
+        }));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// 同一个 cluster 不能在另一个 cluster 之后再次出现；否则 glyph 数组无法
+    /// 分成稳定的连续 cluster groups，布局也无法保留后端的簇内绘制顺序。
+    #[test]
+    fn a_cluster_may_not_reappear_after_another_cluster() {
+        let violations = audit(&Scripted(|text| {
+            let len = text.len() as u64;
+            if len < 2 {
+                return (len > 0).then_some((0, len)).into_iter().collect();
+            }
+            vec![(0, 1), (1, len), (0, 1)]
         }));
         assert!(
             clauses(&violations).contains(&Clause::GlyphsTileRun),
