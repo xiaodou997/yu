@@ -974,6 +974,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // A cancelled first save consumes the clipboard command but does not
         // publish source, copy resources or report a successful drag.
         if persistence.isUntitled, !saveDocument() { return false }
+        let access = SandboxDocumentAccess.shared
+        for input in inputs {
+            if case .file(let url) = input { try access.rememberSelection(url) }
+        }
+        let copiesFiles = NativeWritingPreferences.shared.imagePolicy != .reference || inputs.contains {
+            if case .data = $0 { return true }; return false
+        }
+        if copiesFiles, try !access.ensureDirectoryAccess(documentURL.deletingLastPathComponent(), writing: true,
+            message: L10n.tr("Allow access to the document folder to save image files beside the Markdown document.")) { return false }
         try NativeImageResources.withImports(inputs, document: documentURL,
             directory: NativeWritingPreferences.shared.imageDirectory,
             reference: NativeWritingPreferences.shared.imagePolicy == .reference) { images in
@@ -987,6 +996,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         do { try textView.finishCompositionForFileOperation() }
         catch { show(error); return }
         _ = chooseSaveDestination()
+    }
+
+    @objc fileprivate func chooseFilePanelFolderFromMenu(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = L10n.tr("Choose File Sidebar Folder")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = persistence.isUntitled ? nil : documentURL.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try SandboxDocumentAccess.shared.rememberSelection(url)
+            filePanel.setDirectory(url)
+            sidebarTabs.selectedSegment = 0
+            sidebarHidden = false
+            updateSidebarVisibility()
+        } catch { show(error) }
     }
 
     @objc fileprivate func exportHTMLFromMenu(_ sender: Any?) { exportDocument(pdf: false) }
@@ -1015,6 +1041,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             } else if response != .alertFirstButtonReturn { return }
         }
         do {
+            if !persistence.isUntitled, try !SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) { return }
             printing = try NativePrintController(bridge: bridge, owner: window,
                 title: persistence.isUntitled ? L10n.tr("Untitled") : documentURL.deletingPathExtension().lastPathComponent,
                 untitled: persistence.isUntitled, resourceBase: base,
@@ -1040,6 +1067,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             return
         }
         guard let window = view.window else { return }
+        do {
+            if !persistence.isUntitled, try !SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) { return }
+        } catch { show(error); return }
         htmlExport?.cancelAndClose()
         let htmlOptions = pdf || png ? nil : NativeHTMLExportOptions(untitled: persistence.isUntitled)
         let pngOptions = png ? NativePNGExportOptions(untitled: persistence.isUntitled) : nil
@@ -1085,8 +1115,18 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         else { destination = panel.runModal() == .OK ? panel.url : nil }
         guard let url = destination else { return false }
         do {
-            try saveDocumentAs(to: url, replaceExisting: true)
+            let bookmarkError = try SandboxDocumentAccess.shared.saveSelectedFile(url) {
+                try saveDocumentAs(to: url, replaceExisting: true)
+            }
+            if let bookmarkError {
+                let alert = NSAlert(error: bookmarkError)
+                alert.messageText = L10n.tr("Document Saved")
+                alert.informativeText = L10n.tr("The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu.")
+                alert.runModal()
+            }
             return true
+        } catch let error as CocoaError where error.code == .userCancelled {
+            return false
         } catch { show(error); return false }
     }
 
@@ -1095,6 +1135,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     func saveDocumentAs(to url: URL, replaceExisting: Bool) throws {
         try onValidateSaveDestination?(url)
         try textView.finishCompositionForFileOperation()
+        if SandboxDocumentAccess.shared.enabled {
+            let images = try bridge.localImageAccess()
+            guard try SandboxDocumentAccess.shared.ensureImageAccess(images.paths) else { throw CocoaError(.userCancelled) }
+            if images.relative, url.deletingLastPathComponent().standardizedFileURL != documentURL.deletingLastPathComponent().standardizedFileURL {
+                guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(url.deletingLastPathComponent(), writing: true,
+                    message: L10n.tr("Allow access to the destination folder to copy the document’s local images.")) else { throw CocoaError(.userCancelled) }
+            }
+        }
         surfaceCoordinator.detach()
         defer { scheduleVisualSubmit() }
         try persistence.saveAs(url, replaceExisting: replaceExisting)
@@ -3237,6 +3285,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @discardableResult
     private func presentDocument(bridge: StorageBridge, recovered: Bool = false) -> NSWindow {
+        if SandboxDocumentAccess.shared.enabled {
+            do { _ = try SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) }
+            catch { NSAlert(error: error).runModal() }
+        }
         let controller = DocumentViewController(bridge: bridge, recovered: recovered)
         configureDocumentForCheck?(controller)
         let window = NSWindow(contentViewController: controller)
@@ -3329,6 +3381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return existing
         }
         do {
+            let url = try SandboxDocumentAccess.shared.accessibleURL(url)
             if let record = try pendingRecovery(for: url) {
                 consideredRecoveryFiles.insert(record)
                 if let target = try? StorageBridge.recoveryTarget(at: record), identity(target) == identity(url) {
@@ -3430,7 +3483,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls { _ = openDocument(at: url) }
+        for url in urls {
+            do { try SandboxDocumentAccess.shared.rememberSelection(url) }
+            catch { NSAlert(error: error).runModal(); continue }
+            _ = openDocument(at: url)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -3447,10 +3504,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func openFromMenu(_ sender: Any?) {
         let panel = NSOpenPanel()
+        panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls { openDocument(at: url) }
+        for url in panel.urls {
+            do { try SandboxDocumentAccess.shared.rememberSelection(url) }
+            catch { NSAlert(error: error).runModal(); continue }
+            _ = openDocument(at: url)
+        }
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
@@ -3560,6 +3622,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
+        let chooseFolder = NSMenuItem(title: L10n.tr("Choose File Sidebar Folder…"),
+            action: #selector(DocumentViewController.chooseFilePanelFolderFromMenu(_:)), keyEquivalent: "")
+        chooseFolder.target = controller
+        chooseFolder.isEnabled = controller != nil
+        fileMenu.addItem(chooseFolder)
         let exportHTML = NSMenuItem(title: L10n.tr("Export HTML…"), action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
         exportHTML.target = controller
         exportHTML.isEnabled = controller != nil

@@ -66,13 +66,25 @@ impl ProtectedFile {
         }
     }
 }
+/// A host may stage output inside its sandbox and publish with native file APIs.
+/// `replace_existing` is the captured overwrite decision, never a fresh guess.
+pub type HostFileReplacement = dyn Fn(&Path, &Path, bool) -> Result<(), String> + Send + Sync;
+pub struct HostPublication {
+    pub staging_directory: PathBuf,
+    pub replace: Box<HostFileReplacement>,
+}
 pub struct Destination {
     path: PathBuf,
     initial: Option<Stamp>,
     parent: PathBuf,
     parent_identity: Stamp,
+    publication: Option<std::sync::Arc<HostPublication>>,
 }
 impl Destination {
+    pub fn set_publication(&mut self, publication: Option<std::sync::Arc<HostPublication>>) {
+        self.publication = publication;
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -154,6 +166,7 @@ impl Destination {
             initial,
             parent,
             parent_identity,
+            publication: None,
         })
     }
     pub fn validate(&self, protected: &[ProtectedFile]) -> Result<(), String> {
@@ -214,7 +227,11 @@ impl Destination {
         checkpoint()?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".yu-export-")
-            .tempfile_in(&self.parent)
+            .tempfile_in(
+                self.publication
+                    .as_ref()
+                    .map_or(self.parent.as_path(), |p| p.staging_directory.as_path()),
+            )
             .map_err(|_| "不能在目标目录创建导出临时文件")?;
         for part in bytes.chunks(1024 * 1024) {
             checkpoint()?;
@@ -228,7 +245,10 @@ impl Destination {
             .map_err(|_| "同步导出临时文件失败")?;
         self.validate(protected)?;
         checkpoint()?;
-        if self.initial.is_some() {
+        if let Some(publication) = &self.publication {
+            let _commit_guard = begin_commit()?;
+            (publication.replace)(temporary.path(), &self.path, self.initial.is_some())?;
+        } else if self.initial.is_some() {
             let _commit_guard = begin_commit()?;
             temporary
                 .persist(&self.path)

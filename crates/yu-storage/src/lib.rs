@@ -602,6 +602,26 @@ impl DocumentSession {
     /// Saves the canonical source via a same-directory temporary file and
     /// atomic rename. A changed/missing target is never overwritten.
     pub fn save(&mut self) -> Result<SaveOutcome, StorageError> {
+        self.save_with_writer(atomic_replace)
+    }
+
+    /// Saves through a platform-owned replacement operation. The canonical
+    /// bytes, conflict check, revision and fingerprint still belong to Rust.
+    /// The Mac App Sandbox uses this with a staging file inside its container.
+    pub fn save_with_replacer(
+        &mut self,
+        staging_dir: &Path,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
+        self.save_with_writer(|path, bytes, expected| {
+            atomic_replace_with_replacer(path, bytes, expected, staging_dir, replace)
+        })
+    }
+
+    fn save_with_writer(
+        &mut self,
+        writer: impl FnOnce(&Path, &[u8], Option<&FileFingerprint>) -> Result<(), StorageError>,
+    ) -> Result<SaveOutcome, StorageError> {
         match self.disk_state()? {
             DiskState::Unchanged => {}
             DiskState::Changed => {
@@ -627,7 +647,7 @@ impl DocumentSession {
         }
 
         let bytes = serialize_source(self.editor.snapshot().as_str(), self.bom);
-        atomic_replace(&self.storage_path, &bytes, self.expected_file.as_ref())?;
+        writer(&self.storage_path, &bytes, self.expected_file.as_ref())?;
         let metadata = fs::metadata(&self.storage_path)
             .map_err(|source| StorageError::io("stat", &self.storage_path, source))?;
         self.expected_file = Some(FileFingerprint::from_bytes(&bytes, &metadata));
@@ -985,6 +1005,14 @@ impl DocumentEditorSession {
         self.document.save()
     }
 
+    pub fn save_with_replacer(
+        &mut self,
+        staging_dir: &Path,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
+        self.document.save_with_replacer(staging_dir, replace)
+    }
+
     pub fn reload(&mut self) -> Result<ReloadOutcome, StorageError> {
         let outcome = self.document.reload()?;
         self.composition_generation = self.composition_generation.wrapping_add(1);
@@ -1118,6 +1146,59 @@ fn atomic_replace(
     fs::rename(&temp_path, path)
         .map_err(|source| StorageError::io("atomic rename", path, source))?;
     guard.disarm();
+    Ok(())
+}
+
+fn atomic_replace_with_replacer(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<&FileFingerprint>,
+    staging_dir: &Path,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), StorageError> {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = staging_dir.join(format!(
+        "yu-sandbox-save-{}-{counter}.tmp",
+        std::process::id()
+    ));
+    let mut guard = TempFileGuard::new(temporary.clone());
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|source| StorageError::io("create staged save", &temporary, source))?;
+    file.write_all(bytes)
+        .map_err(|source| StorageError::io("write staged save", &temporary, source))?;
+    file.sync_all()
+        .map_err(|source| StorageError::io("sync staged save", &temporary, source))?;
+    drop(file);
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&temporary, metadata.permissions())
+            .map_err(|source| StorageError::io("set staged permissions", &temporary, source))?;
+    }
+    let current = current_fingerprint(path)?;
+    if current.as_ref() != expected {
+        return Err(StorageError::ExternalChange {
+            path: path.to_path_buf(),
+            state: if current.is_none() {
+                ExternalFileState::Missing
+            } else {
+                ExternalFileState::Changed
+            },
+        });
+    }
+    replace(&temporary, path)
+        .map_err(|source| StorageError::io("replace staged save", path, source))?;
+    guard.disarm();
+    let published =
+        fs::read(path).map_err(|source| StorageError::io("verify staged save", path, source))?;
+    if published != bytes {
+        return Err(StorageError::io(
+            "verify staged save",
+            path,
+            io::Error::new(io::ErrorKind::InvalidData, "replacement bytes differ"),
+        ));
+    }
     Ok(())
 }
 

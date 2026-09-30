@@ -34,6 +34,8 @@
 	<string>Copyright © 2026 Yu contributors. Apache License 2.0.</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

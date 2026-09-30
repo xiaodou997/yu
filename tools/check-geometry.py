@@ -43,6 +43,7 @@ CORE = "crates/yu-core/src/geometry.rs"
 # 只有两类可以登记：跨 C ABI 的平铺结构体（那一侧没有泛型），以及不是 f32
 # 视觉坐标的整数量（纹理坐标、图片自身的像素尺寸）。
 REGISTERED: dict[str, str] = {
+    "crates/yu-storage-ffi/src/lib.rs:YuStorageSourceBounds": "Document 逻辑坐标，AX 文本范围边界随 C ABI 平铺",
     "crates/yu-storage-ffi/src/lib.rs:YuStorageTaskCheckboxHit": "Document 逻辑坐标，随 C ABI 平铺",
     "crates/yu-storage-ffi/src/lib.rs:YuStorageTableResizeAccessibilityDivider": (
         "Document 逻辑坐标，AX 分隔线几何随 C ABI 平铺"

@@ -1,11 +1,12 @@
 //! File identity changes preserve the canonical editor and its undo history.
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use super::{
     CloseStateMachine, DocumentEditorSession, DocumentSession, ExternalFileState, FileFingerprint,
-    RecoveryRecord, SaveOutcome, StorageError, atomic_replace, canonical_storage_path,
-    current_fingerprint, serialize_source,
+    RecoveryRecord, SaveOutcome, StorageError, atomic_replace, atomic_replace_with_replacer,
+    canonical_storage_path, current_fingerprint, serialize_source,
 };
 
 impl DocumentSession {
@@ -16,6 +17,27 @@ impl DocumentSession {
         &mut self,
         path: impl Into<PathBuf>,
         replace_existing: bool,
+    ) -> Result<SaveOutcome, StorageError> {
+        self.save_as_with_writer(path, replace_existing, atomic_replace)
+    }
+
+    pub fn save_as_with_replacer(
+        &mut self,
+        path: impl Into<PathBuf>,
+        replace_existing: bool,
+        staging_dir: &Path,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
+        self.save_as_with_writer(path, replace_existing, |path, bytes, expected| {
+            atomic_replace_with_replacer(path, bytes, expected, staging_dir, replace)
+        })
+    }
+
+    fn save_as_with_writer(
+        &mut self,
+        path: impl Into<PathBuf>,
+        replace_existing: bool,
+        writer: impl FnOnce(&Path, &[u8], Option<&FileFingerprint>) -> Result<(), StorageError>,
     ) -> Result<SaveOutcome, StorageError> {
         let path = path.into();
         let name = path
@@ -35,7 +57,7 @@ impl DocumentSession {
         };
         if self.expected_file.is_some() && storage_path == self.storage_path {
             // "Save As" to this document must not bypass its conflict check.
-            return self.save();
+            return self.save_with_writer(writer);
         }
         let expected = current_fingerprint(&storage_path)?;
         if expected.is_some() && !replace_existing {
@@ -53,7 +75,7 @@ impl DocumentSession {
         )?;
         let bytes = serialize_source(self.editor.snapshot().as_str(), self.bom);
         resources.validate_before_publish()?;
-        atomic_replace(&storage_path, &bytes, expected.as_ref())?;
+        writer(&storage_path, &bytes, expected.as_ref())?;
         resources.commit();
         let metadata = fs::metadata(&storage_path)
             .map_err(|error| StorageError::io("stat saved destination", &storage_path, error))?;
@@ -79,6 +101,17 @@ impl DocumentEditorSession {
         replace_existing: bool,
     ) -> Result<SaveOutcome, StorageError> {
         self.document.save_as(path, replace_existing)
+    }
+
+    pub fn save_as_with_replacer(
+        &mut self,
+        path: impl Into<PathBuf>,
+        replace_existing: bool,
+        staging_dir: &Path,
+        replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<SaveOutcome, StorageError> {
+        self.document
+            .save_as_with_replacer(path, replace_existing, staging_dir, replace)
     }
 
     /// Recovery restores the original disk baseline, never the fingerprint of
