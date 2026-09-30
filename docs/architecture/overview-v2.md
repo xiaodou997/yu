@@ -4175,6 +4175,30 @@ CoreText 的 `CTRunGetStringIndices` 是字形 → 文本；DirectWrite 的 `clu
 **不要硬写只过类型检查的 COM 代码**——那是几百行没有任何断言执行过的东西，
 而「全套门禁绿着的谎话」正是刀 a 刚修掉的失败模式。
 
+#### Windows 第二组：原生产品壳
+
+第二平台的产品壳已经按前面的 spike 结论落成 **Rust + `windows-rs`**，没有新增
+C++/C# 胶水层。它直接持有 `DocumentEditorSession`，因此 canonical source、
+dirty、history 与 close state 不经过第二份 ABI mirror。
+
+本组只建立平台壳：Win32 主窗口与原生菜单、accelerator、Per-Monitor DPI V2、
+系统 Light/Dark 事实、Windows 11 DWM backdrop、`IFileOpenDialog` /
+`IFileSaveDialog`、五种发布语言，以及一个专用 editor surface host。这个 surface
+**不是 RichEdit/TextBox fallback**；第三组把 D3D renderer 接到同一个 HWND。
+
+关闭未命名文档暴露出一条共享生命周期缺口：原来的 `save_close` 只能保存现有
+identity，壳如果先单独 `save_as` 再自己宣布关闭，就把 close state machine 拆成
+两份。现在 `DocumentEditorSession::save_as_close` 在 Prompting 状态里完成
+Save As + Close，同一次 Rust transition 负责成功、外部变化强化和失败保持。
+
+Windows target 不是只做 cfg 语法检查。macOS Runner 使用 `cargo-xwin` 下载的
+Windows SDK/CRT 与 Rust llvm-tools 的 `llvm-lib` 模式，已经对
+`x86_64-pc-windows-msvc` 完成 `check`、`clippy -D warnings` 与最终 PE 链接；
+产物 subsystem 已验证为 `IMAGE_SUBSYSTEM_WINDOWS_GUI`。仓库另有独立
+`windows-shell` job 与 `--window-self-check`，用于在真实 Windows 会话创建
+HWND 后自动关闭。当前开发 Runner 是 macOS，因此这一条真实窗口 smoke 仍必须在
+Windows runner/真机补绿；完整记录见 [Windows acceptance](../windows-acceptance.md)。
+
 #### 深色模式 —— 已完成
 
 **S7 里第一个不属于「第 N 刀」的产品缺陷。** 它从第四刀的人工验收就登记着

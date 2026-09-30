@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 use std::ffi::{OsStr, OsString};
 use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -337,7 +339,7 @@ impl AppWindow {
             strings.app_name(),
             MB_YESNOCANCEL | MB_ICONWARNING,
         );
-        use windows::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO, IDYES};
+        use windows::Win32::UI::WindowsAndMessaging::{IDNO, IDYES};
         if result == IDYES {
             let transition = if self.state.document().is_untitled() {
                 let Some(path) = save_file_dialog(self.hwnd, self.state.document())? else {
@@ -354,9 +356,6 @@ impl AppWindow {
                 self.state.document_mut().discard_close()?,
                 CloseTransition::Closed
             ))
-        } else if result == IDCANCEL {
-            let _ = self.state.document_mut().cancel_close();
-            Ok(false)
         } else {
             let _ = self.state.document_mut().cancel_close();
             Ok(false)
@@ -371,15 +370,12 @@ impl AppWindow {
             strings.app_name(),
             MB_YESNO | MB_ICONWARNING,
         );
-        use windows::Win32::UI::WindowsAndMessaging::{IDNO, IDYES};
+        use windows::Win32::UI::WindowsAndMessaging::IDYES;
         if result == IDYES {
             Ok(matches!(
                 self.state.document_mut().discard_close()?,
                 CloseTransition::Closed
             ))
-        } else if result == IDNO {
-            let _ = self.state.document_mut().cancel_close();
-            Ok(false)
         } else {
             let _ = self.state.document_mut().cancel_close();
             Ok(false)
