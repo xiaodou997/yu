@@ -117,7 +117,7 @@ final class NativeDocumentPersistence {
             return
         }
         do {
-            try bridge.save()
+            try saveBridge()
             try bridge.clearRecovery(in: locations.recovery)
             notice = nil
         } catch {
@@ -134,15 +134,62 @@ final class NativeDocumentPersistence {
     func save() throws {
         guard !isUntitled else { throw CocoaError(.fileWriteInvalidFileName) }
         try? flushRecovery()
-        try bridge.save()
+        try saveBridge()
         needsRecoveryReview = false
         clearSavedRecovery()
+    }
+
+    /// File-panel access covers the selected document, not arbitrary siblings.
+    /// Stage canonical Rust bytes in the app container, then let Foundation
+    /// replace the document inside a coordinated write.
+    private func saveBridge() throws {
+        guard SandboxDocumentAccess.shared.enabled else {
+            try bridge.save()
+            return
+        }
+        let staging = locations.root.appendingPathComponent("SaveStaging", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinationError: NSError?
+        var result: Result<Void, Error>?
+        coordinator.coordinate(writingItemAt: URL(fileURLWithPath: bridge.path),
+                               options: .forReplacing, error: &coordinationError) { _ in
+            result = Result { try bridge.save(stagingDirectory: staging) }
+        }
+        if let coordinationError { throw coordinationError }
+        guard let result else { throw CocoaError(.fileWriteUnknown) }
+        try result.get()
     }
 
     func saveAs(_ url: URL, replaceExisting: Bool) throws {
         let oldRecord = try? bridge.recoveryURL(in: locations.recovery)
         try? flushRecovery()
-        try bridge.saveAs(url, replaceExisting: replaceExisting)
+        if SandboxDocumentAccess.shared.enabled {
+            let staging = locations.root.appendingPathComponent("SaveStaging", isDirectory: true)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            // Use NSSavePanel's grant directly for a new file; coordinate
+            // replacement only when there is an existing destination.
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try bridge.saveAs(url, replaceExisting: replaceExisting,
+                    stagingDirectory: staging)
+            } else {
+                let coordinator = NSFileCoordinator(filePresenter: nil)
+                var coordinationError: NSError?
+                var result: Result<Void, Error>?
+                coordinator.coordinate(writingItemAt: url, options: .forReplacing,
+                                       error: &coordinationError) { _ in
+                    result = Result { try bridge.saveAs(url, replaceExisting: replaceExisting,
+                        stagingDirectory: staging) }
+                }
+                if let coordinationError { throw coordinationError }
+                guard let result else { throw CocoaError(.fileWriteUnknown) }
+                try result.get()
+            }
+        } else {
+            try bridge.saveAs(url, replaceExisting: replaceExisting)
+        }
         isUntitled = false
         needsRecoveryReview = false
         notice = nil

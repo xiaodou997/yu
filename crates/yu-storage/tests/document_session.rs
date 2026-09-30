@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,6 +15,96 @@ use yu_storage::{
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn staged_replacement_failure_keeps_original_and_retry_saves_same_revision() {
+    let path = TestPath::new("staged-replacement");
+    let original = bom_bytes("# First\n");
+    fs::write(path.as_path(), &original).expect("fixture");
+    let staging = std::env::temp_dir().join(format!(
+        "yu-stage-test-{}-{}",
+        std::process::id(),
+        TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging).expect("staging directory");
+    let mut session = DocumentSession::open(path.as_path()).expect("open");
+    let caret = place_caret_at_end(&session.editor().snapshot());
+    session.editor_mut().set_selection(caret).expect("caret");
+    session
+        .editor_mut()
+        .execute(EditorCommand::insert_text("Second"))
+        .expect("edit");
+    let revision = session.revision();
+    assert!(matches!(
+        session.save_with_replacer(&staging, |_, _| Err(io::Error::from(
+            io::ErrorKind::PermissionDenied
+        ))),
+        Err(StorageError::Io { .. })
+    ));
+    assert_eq!(fs::read(path.as_path()).expect("original"), original);
+    assert!(session.is_dirty());
+    assert_eq!(fs::read_dir(&staging).expect("staging").count(), 0);
+
+    session
+        .save_with_replacer(&staging, |temporary, target| fs::rename(temporary, target))
+        .expect("retry");
+    assert_eq!(session.saved_revision(), revision);
+    assert!(!session.is_dirty());
+    assert_eq!(
+        fs::read(path.as_path()).expect("published"),
+        bom_bytes("# First\nSecond")
+    );
+    fs::remove_dir(&staging).expect("remove empty staging directory");
+}
+
+#[test]
+fn staged_save_as_failure_preserves_document_identity_and_retry_moves_to_destination() {
+    let original = TestPath::new("staged-save-as-original");
+    let destination = TestPath::new("staged-save-as-destination");
+    fs::write(original.as_path(), "first").expect("original");
+    let staging = std::env::temp_dir().join(format!(
+        "yu-stage-as-test-{}-{}",
+        std::process::id(),
+        TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging).expect("staging directory");
+    let mut session = DocumentEditorSession::open(original.as_path()).expect("open");
+    session
+        .set_selection(place_caret_at_end(&session.snapshot()))
+        .expect("caret");
+    session
+        .execute(EditorCommand::insert_text(" second"))
+        .expect("edit");
+    assert!(matches!(
+        session.save_as_with_replacer(destination.as_path(), false, &staging, |_, _| Err(
+            io::Error::from(io::ErrorKind::PermissionDenied)
+        )),
+        Err(StorageError::Io { .. })
+    ));
+    assert_eq!(session.path(), original.as_path());
+    assert!(session.is_dirty());
+    assert!(!destination.as_path().exists());
+
+    session
+        .save_as_with_replacer(
+            destination.as_path(),
+            false,
+            &staging,
+            |temporary, target| fs::rename(temporary, target),
+        )
+        .expect("save as retry");
+    assert_eq!(session.path(), destination.as_path());
+    assert!(!session.is_dirty());
+    assert_eq!(
+        fs::read_to_string(destination.as_path()).expect("saved"),
+        "first second"
+    );
+    assert_eq!(
+        fs::read_to_string(original.as_path()).expect("original"),
+        "first"
+    );
+    fs::remove_dir(&staging).expect("remove empty staging directory");
+}
 
 #[test]
 fn source_mode_save_preserves_bom_crlf_and_shared_undo() {

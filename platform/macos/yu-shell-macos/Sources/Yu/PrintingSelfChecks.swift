@@ -32,6 +32,9 @@ func runPrintingSelfCheck(input: String, directory: String) -> Never {
         task.cancel(); throw NSError(domain: "Yu.Print.Check", code: 2)
     }
     do {
+        // Reuse only prior user-selected Powerbox grants in signed sandbox checks.
+        _ = try SandboxDocumentAccess.shared.accessibleURL(root)
+        _ = try SandboxDocumentAccess.shared.accessibleURL(URL(fileURLWithPath: input))
         try require(!fm.fileExists(atPath: root.path), "Refusing existing print evidence")
         try fm.createDirectory(at: root, withIntermediateDirectories: false); ownsRoot = true
         let original = try Data(contentsOf: URL(fileURLWithPath: input))

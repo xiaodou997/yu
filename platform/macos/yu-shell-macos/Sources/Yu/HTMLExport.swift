@@ -224,7 +224,12 @@ final class NativeHTMLExportController: NSObject, NSWindowDelegate {
         alert.beginSheetModal(for: owner) { [weak self] response in
             guard let self, !self.closed, let task = self.task else { return }
             if response == .alertSecondButtonReturn {
-                do { self.committed = true; try task.commit(allowWarnings: !status.warnings.isEmpty) }
+                do {
+                    guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(self.destination.deletingLastPathComponent(), writing: true,
+                        message: L10n.tr("Allow access to the output folder to create the numbered PNG images.")) else { self.cancelAndClose(); return }
+                    self.committed = true
+                    try task.commit(allowWarnings: !status.warnings.isEmpty)
+                }
                 catch { task.cancel(); self.finishFailure(error.localizedDescription) }
             } else { self.cancelAndClose() }
         }

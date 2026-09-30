@@ -1,5 +1,13 @@
 # 第六组：空文档、安装、软件恢复与 A→B 升级
 
+当前状态（2026-09-30）：本文保留候选包的原始验收记录。后续最终 DMG
+已通过安装/保存重开、外部 AX、恢复、A→B 升级和失败保全，报告保存在
+主工作区 `artifacts/group6-final-acceptance/`，最终 manifest 阶段为
+`ready-to-publish`。用户随后选择 App Store 首发；国际化和沙盒修复后的
+正式 `.pkg` 已生成，商店提交情况见
+[App Store 检查表](mac-app-store-draft-20260929.md)。本文中的“待最终包
+复核”及“剩余收尾”是较早阶段记录，不作为当前未完成清单。
+
 日期：2026-09-29。用户要求软件优先，不调整非必要系统设置。本轮保持 Gatekeeper、系统权限、登录项和系统版本不变，不执行注销/重启，不启用自动更新、不公开发行。
 
 ## 结果
@@ -30,11 +38,11 @@
 ## 候选身份与公证
 
 - `io.github.xiaodou997.yu`；0.1.1 / build 2；arm64；最低目标 26.0，本轮实机 27.0。
-- app/helper：Developer ID Application，Team `V6M88BQG7C`，Hardened Runtime，安全时间戳，无额外 entitlements。
+- app/helper：Developer ID Application，Hardened Runtime，安全时间戳，无额外 entitlements。
 - 签后 Yu SHA256：`24f10ecb2b669b721554224cdc422b8eac8622a1cba331426130e9bd8a80d39f`。
 - 签后 helper SHA256：`6aed5660028f84fe542e1761b471b392c21bfb2f47262f8f24207018fd5fbca4`。
-- app 公证：`365db6f4-d5e0-473b-9a5d-a450416253e1`，Accepted；staple/validate 通过。
-- DMG 公证：`b7960504-b713-4d66-a2e4-3b6501707b5a`，Accepted；staple/validate 与签名检查通过。
+- app 公证：（编号见本机 manifest），Accepted；staple/validate 通过。
+- DMG 公证：（编号见本机 manifest），Accepted；staple/validate 与签名检查通过。
 - 最终 DMG SHA256：`36046348f3f429afb55b346d04f422bc962bb1d9ffcb56490b8dbaa308eb83ed`。
 
 证据目录：`artifacts/releases/group6-0.1.1-2-candidate/`。工作区尚未冻结为干净提交，manifest 明确 candidate=true；没有创建公开 Release 或把候选签名包称为正式发布。

@@ -23,6 +23,9 @@ func runPNGExportSelfCheck(input: String, directory: String) -> Never {
         return [w,h]
     }
     do {
+        // Reuse only prior user-selected Powerbox grants in signed sandbox checks.
+        _ = try SandboxDocumentAccess.shared.accessibleURL(root)
+        _ = try SandboxDocumentAccess.shared.accessibleURL(URL(fileURLWithPath: input))
         try require(!fm.fileExists(atPath:root.path),"Refusing existing PNG evidence")
         try fm.createDirectory(at:root,withIntermediateDirectories:false);owns=true
         let inputURL=URL(fileURLWithPath:input), original=try Data(contentsOf:inputURL)
@@ -69,7 +72,7 @@ func runPNGExportSelfCheck(input: String, directory: String) -> Never {
                 let status=try task.status()
                 if ["completed","completed_with_warnings","failed","cancelled"].contains(status.phase){final=status;break}
                 if status.phase=="split" {
-                    splitSeen=true;try require(!fm.fileExists(atPath:parts.path)&&Data(contentsOf:target)==oldBytes,"Split published without consent")
+                    splitSeen=true;try require((mode=="directory-exists" || !fm.fileExists(atPath:parts.path))&&Data(contentsOf:target)==oldBytes,"Split published without consent")
                     if mode=="split-cancel"{task.cancel()}else if !submitted{try task.commit(allowWarnings:false);submitted=true}
                 }else if status.phase=="ready" && !submitted{try task.commit(allowWarnings:false);submitted=true}
                 else if status.phase=="warnings"{throw NSError(domain:"Yu.PNG.Warnings",code:1,userInfo:[NSLocalizedDescriptionKey:status.warnings.joined(separator:"\n")])}

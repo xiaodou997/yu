@@ -1,12 +1,12 @@
 Traceback (most recent call last):
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 246, in main
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 246, in main
     exercise(soak)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 189, in exercise
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 189, in exercise
     documents = lifetime(soak, sentinel, documents, number)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 144, in lifetime
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 144, in lifetime
     soak.install(doc, bad, 'error')
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 276, in install
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 276, in install
     self.expect(text)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 177, in expect
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 177, in expect
     raise AssertionError('Exact focused-document source mismatch; evidence retained')
 AssertionError: Exact focused-document source mismatch; evidence retained

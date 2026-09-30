@@ -10,6 +10,7 @@
 //! result structs; its TextKit mirror is disposable and never canonical.
 
 use std::ffi::c_void;
+use std::io;
 use std::path::PathBuf;
 use std::ptr;
 #[cfg(target_os = "macos")]
@@ -1724,6 +1725,62 @@ pub unsafe extern "C" fn yu_storage_session_html_export_start(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (target, config);
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Configure native sandbox publication before commit. The callback may run on
+/// a worker thread and must remain callable for the task lifetime. It must move
+/// the staged file, obey the captured overwrite flag, and retain no pointers.
+/// # Safety
+/// Live task; readable UTF-8 staging path; a thread-safe callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_html_export_set_publisher(
+    task: *const YuStorageHtmlExport,
+    staging: *const u8,
+    staging_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize, u8) -> i32>,
+) -> i32 {
+    let Some(task) = (unsafe { task.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let staging = match read_utf8(staging, staging_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let publication = yu_export::portable::HostPublication {
+            staging_directory: staging,
+            replace: Box::new(move |source, target, overwrite| {
+                let source = source.to_str().ok_or("Invalid staging path")?;
+                let target = target.to_str().ok_or("Invalid destination path")?;
+                let result = replace(
+                    source.as_ptr(),
+                    source.len(),
+                    target.as_ptr(),
+                    target.len(),
+                    u8::from(overwrite),
+                );
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("Native export publication failed ({result})"))
+                }
+            }),
+        };
+        match task.job.set_publication(publication) {
+            Ok(()) => YU_STORAGE_OK,
+            Err(_) => YU_STORAGE_INVALID_STATE,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (task, staging, replace);
         YU_STORAGE_RENDER_HOST_UNAVAILABLE
     }
 }
@@ -3988,6 +4045,39 @@ pub unsafe extern "C" fn yu_storage_session_image_properties(
     YU_STORAGE_OK
 }
 
+/// Local image paths come from the canonical Markdown model, including reference
+/// and HTML images. Hosts use them to request sandbox access without parsing text.
+/// # Safety
+/// Live session; writable output buffer/count following the size-query protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_local_image_access(
+    session: *const YuStorageSession,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let images = match session.session.document().editor().image_references() {
+        Ok(images) => images,
+        Err(error) => return status_from_editor_error(error),
+    };
+    let mut paths = std::collections::BTreeSet::new();
+    let mut relative = false;
+    for image in images {
+        if let Ok(location) =
+            yu_assets::ImageLocation::resolve(session.session.path(), &image.destination_text)
+        {
+            paths.insert(location.path().to_string_lossy().into_owned());
+            relative |= yu_assets::ImageLocation::resolve("document.md", &image.destination_text)
+                .is_ok_and(|path| !path.path().is_absolute());
+        }
+    }
+    let json = serde_json::json!({"paths":paths,"relative":relative}).to_string();
+    write_bytes(json.as_bytes(), output, capacity, written)
+}
+
 /// Query the resource state of an exact, revision-bound image identity.
 /// # Safety
 /// Session and info must be live; output must be writable.
@@ -5203,6 +5293,73 @@ pub unsafe extern "C" fn yu_storage_session_save_as(
         Err(status) => return status,
     };
     if let Err(error) = session.session.save_as(path, replace_existing != 0) {
+        return status_from_error(error);
+    }
+    session.table_resize_gesture = None;
+    session.table_resize_override = None;
+    #[cfg(target_os = "macos")]
+    {
+        session.macos_render_host = None;
+        session.macos_embedded_resources = MacosEmbeddedResourceState::new();
+    }
+    YU_STORAGE_OK
+}
+
+/// Save As through a host-owned sandbox replacement. The host callback must
+/// consume the staged file before returning success and must not retain paths.
+/// # Safety
+/// Live session; readable UTF-8 path and staging directory byte buffers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_save_as_with_replacer(
+    session: *mut YuStorageSession,
+    path: *const u8,
+    path_length: usize,
+    replace_existing: u8,
+    staging_dir: *const u8,
+    staging_dir_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize) -> i32>,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if replace_existing > 1 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if session.session.composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let staging_dir = match read_utf8(staging_dir, staging_dir_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    if let Err(error) = session.session.save_as_with_replacer(
+        path,
+        replace_existing != 0,
+        &staging_dir,
+        |source, target| {
+            let source = source
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let status = replace(source.as_ptr(), source.len(), target.as_ptr(), target.len());
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status))
+            }
+        },
+    ) {
         return status_from_error(error);
     }
     session.table_resize_gesture = None;
@@ -9478,6 +9635,69 @@ pub unsafe extern "C" fn yu_storage_session_save(
         SaveOutcome::Unchanged { revision } => (revision.get(), 0, 0),
     };
     // SAFETY: all output pointers were checked above.
+    unsafe {
+        *revision_output = revision;
+        *bytes_written_output = bytes_written;
+        *changed_output = changed;
+    }
+    YU_STORAGE_OK
+}
+
+/// Saves canonical Rust bytes through a host-provided atomic replacement.
+/// The staging directory must be writable by the caller (the app container
+/// for a sandboxed Mac app). The callback must not retain either path pointer.
+/// # Safety
+/// Live session and writable output pointers; root must be readable UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_save_with_replacer(
+    session: *mut YuStorageSession,
+    staging_dir: *const u8,
+    staging_dir_length: usize,
+    replace: Option<extern "C" fn(*const u8, usize, *const u8, usize) -> i32>,
+    revision_output: *mut u64,
+    bytes_written_output: *mut usize,
+    changed_output: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if revision_output.is_null() || bytes_written_output.is_null() || changed_output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let Some(replace) = replace else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let staging_dir = match read_utf8(staging_dir, staging_dir_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let outcome = match session
+        .session
+        .save_with_replacer(&staging_dir, |source, target| {
+            let source = source
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let status = replace(source.as_ptr(), source.len(), target.as_ptr(), target.len());
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status))
+            }
+        }) {
+        Ok(outcome) => outcome,
+        Err(error) => return status_from_error(error),
+    };
+    let (revision, bytes_written, changed) = match outcome {
+        SaveOutcome::Saved {
+            revision,
+            bytes_written,
+        } => (revision.get(), bytes_written, 1),
+        SaveOutcome::Unchanged { revision } => (revision.get(), 0, 0),
+    };
     unsafe {
         *revision_output = revision;
         *bytes_written_output = bytes_written;
@@ -16998,6 +17218,49 @@ mod tests {
         );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn local_image_access_catalog_uses_canonical_references_and_ignores_code_and_remote() {
+        let path = std::env::temp_dir().join(format!("yu-image-access-{}.md", temp_id()));
+        let source = "![one](assets/a%20b.png)\n\n![ref][p]\n\n[p]: photo.png\n\n<img src=\"html.png\">\n\n![remote](https://example.com/a.png)\n\n`![code](ignored.png)`\n";
+        fs::write(&path, source).expect("valid image access fixture");
+        let session = new_storage_session(
+            DocumentEditorSession::open(&path).expect("valid image access fixture"),
+        );
+        let mut size = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_local_image_access(&*session, ptr::null_mut(), 0, &mut size)
+            },
+            YU_STORAGE_OK
+        );
+        let mut bytes = vec![0; size];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_local_image_access(
+                    &*session,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut size,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let data: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("valid image access fixture");
+        let paths = data["paths"]
+            .as_array()
+            .expect("valid image access fixture");
+        assert_eq!(paths.len(), 3);
+        for name in ["assets/a b.png", "photo.png", "html.png"] {
+            assert!(paths.contains(&serde_json::json!(
+                path.parent().expect("valid image access fixture").join(name).to_string_lossy()
+            )));
+        }
+        assert_eq!(data["relative"], true);
+        assert_eq!(session.session.snapshot().as_str(), source);
+        fs::remove_file(path).expect("valid image access fixture");
     }
 
     #[test]

@@ -4,6 +4,53 @@ import Foundation
 import UniformTypeIdentifiers
 import YuStorageFFI
 
+private let sandboxExportReplacement: YuStorageExportReplaceCallback = { stagedBytes, stagedLength, targetBytes, targetLength, overwrite in
+    guard let stagedBytes, let targetBytes, overwrite <= 1 else { return EINVAL }
+    return autoreleasepool {
+        let staged = URL(fileURLWithPath: String(decoding: UnsafeBufferPointer(start: stagedBytes, count: stagedLength), as: UTF8.self))
+        let target = URL(fileURLWithPath: String(decoding: UnsafeBufferPointer(start: targetBytes, count: targetLength), as: UTF8.self))
+        do {
+            if overwrite == 1 {
+                var coordinationError: NSError?
+                var result: Result<Void, Error>?
+                NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: target,
+                    options: .forReplacing, error: &coordinationError) { coordinated in
+                    result = Result { _ = try FileManager.default.replaceItemAt(coordinated, withItemAt: staged) }
+                }
+                if let coordinationError { throw coordinationError }
+                guard let result else { throw CocoaError(.fileWriteUnknown) }
+                try result.get()
+            } else {
+                // moveItem refuses a destination that appeared after Rust's last check.
+                try FileManager.default.moveItem(at: staged, to: target)
+            }
+            return 0
+        } catch {
+            NSLog("Yu sandbox export publication failed: %@", String(describing: error))
+            return EIO
+        }
+    }
+}
+
+private let sandboxReplacement: YuStorageReplaceCallback = { stagedBytes, stagedLength, targetBytes, targetLength in
+    guard let stagedBytes, let targetBytes else { return EINVAL }
+    let stagedPath = String(decoding: UnsafeBufferPointer(start: stagedBytes, count: stagedLength), as: UTF8.self)
+    let targetPath = String(decoding: UnsafeBufferPointer(start: targetBytes, count: targetLength), as: UTF8.self)
+    do {
+        let staged = URL(fileURLWithPath: stagedPath)
+        let target = URL(fileURLWithPath: targetPath)
+        if FileManager.default.fileExists(atPath: targetPath) {
+            _ = try FileManager.default.replaceItemAt(target, withItemAt: staged)
+        } else {
+            try FileManager.default.moveItem(at: staged, to: target)
+        }
+        return 0
+    } catch {
+        NSLog("Yu sandbox replacement failed: %@", error.localizedDescription)
+        return EIO
+    }
+}
+
 // Rust `yu-storage-ffi` 的 Swift 封装：C ABI 调用、错误码映射，以及
 // 跨边界结构的 Swift 镜像。这里不做任何决策，只做搬运与类型转换。
 
@@ -856,6 +903,18 @@ final class StorageBridge {
         }
     }
 
+    struct LocalImageAccess: Decodable {
+        let paths: [String]
+        let relative: Bool
+    }
+
+    func localImageAccess() throws -> LocalImageAccess {
+        let json = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_local_image_access(handle, output, capacity, written)
+        }
+        return try JSONDecoder().decode(LocalImageAccess.self, from: Data(json.utf8))
+    }
+
     /// Capture on the owner thread. Rust rejects preedit rather than changing it.
     func beginHTMLExport(to url: URL, config: [String: Any]) throws -> NativeHTMLExportTask {
         let options = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
@@ -874,6 +933,22 @@ final class StorageBridge {
                 ? L10n.tr("Two export tasks are already active. Finish or cancel one first.")
                 : L10n.format("Could not start HTML export (%d).", status)
             throw NSError(domain: "Yu.Export", code: Int(status), userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        if SandboxDocumentAccess.shared.enabled {
+            do {
+                let staging = NativeDocumentLocations.current.root.appendingPathComponent("ExportStaging", isDirectory: true)
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+                let bytes = Array(staging.path.utf8)
+                let configured = bytes.withUnsafeBufferPointer {
+                    yu_storage_html_export_set_publisher(task, $0.baseAddress, $0.count, sandboxExportReplacement)
+                }
+                guard configured == StorageStatus.ok else { throw BridgeError.operation(configured) }
+            } catch {
+                yu_storage_html_export_cancel(task)
+                yu_storage_html_export_destroy(task)
+                throw error
+            }
         }
         return NativeHTMLExportTask(handle: task)
     }
@@ -2184,10 +2259,19 @@ final class StorageBridge {
         return String(decoding: bytes.prefix(written), as: UTF8.self)
     }
 
-    func saveAs(_ url: URL, replaceExisting: Bool) throws {
+    func saveAs(_ url: URL, replaceExisting: Bool, stagingDirectory: URL? = nil) throws {
         let bytes = Array(url.path.utf8)
-        let status = bytes.withUnsafeBufferPointer {
-            yu_storage_session_save_as(handle, $0.baseAddress, $0.count, replaceExisting ? 1 : 0)
+        let status = bytes.withUnsafeBufferPointer { target in
+            if let stagingDirectory {
+                let stagingBytes = Array(stagingDirectory.path.utf8)
+                return stagingBytes.withUnsafeBufferPointer { staging in
+                    yu_storage_session_save_as_with_replacer(handle,
+                        target.baseAddress, target.count, replaceExisting ? 1 : 0,
+                        staging.baseAddress, staging.count, sandboxReplacement)
+                }
+            }
+            return yu_storage_session_save_as(handle, target.baseAddress, target.count,
+                replaceExisting ? 1 : 0)
         }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
         openedPath = path
@@ -2252,16 +2336,20 @@ final class StorageBridge {
         _ = yu_storage_session_close_resolve(handle, UInt8(YU_STORAGE_CLOSE_RESOLVE_ABORT))
     }
 
-    func save() throws {
+    func save(stagingDirectory: URL? = nil) throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
         var changed: UInt8 = 0
-        let status = yu_storage_session_save(
-            handle,
-            &revision,
-            &bytes,
-            &changed
-        )
+        let status: Int32
+        if let stagingDirectory {
+            let path = Array(stagingDirectory.path.utf8)
+            status = path.withUnsafeBufferPointer {
+                yu_storage_session_save_with_replacer(handle, $0.baseAddress, $0.count,
+                    sandboxReplacement, &revision, &bytes, &changed)
+            }
+        } else {
+            status = yu_storage_session_save(handle, &revision, &bytes, &changed)
+        }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 

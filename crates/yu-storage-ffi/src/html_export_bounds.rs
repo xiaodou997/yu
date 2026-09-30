@@ -304,3 +304,72 @@ fn png_task_warning_and_file_failure_contracts() {
         }
     }
 }
+
+#[test]
+fn native_publisher_is_used_by_export_job_and_cannot_be_changed_after_commit() {
+    let _serial = EXPORT_TEST_SERIAL.lock().expect("host publication fixture");
+    let root = std::env::temp_dir().join(format!(
+        "yu-host-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host publication fixture")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).expect("host publication fixture");
+    let staging = root.join("staging");
+    std::fs::create_dir(&staging).expect("host publication fixture");
+    let source = root.join("source.md");
+    let output = root.join("output.html");
+    std::fs::write(&source, "# Host publication\n").expect("host publication fixture");
+    let job = HtmlJob::start(
+        TextBuffer::new("# Host publication\n").snapshot(),
+        source.clone(),
+        &output,
+        &json!({"referenceDay":20724}),
+    )
+    .expect("host publication fixture");
+    wait(&job);
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = called.clone();
+    job.set_publication(HostPublication {
+        staging_directory: staging.clone(),
+        replace: Box::new(move |from, to, overwrite| {
+            assert!(!overwrite);
+            flag.store(true, Ordering::SeqCst);
+            std::fs::rename(from, to).map_err(|error| error.to_string())
+        }),
+    })
+    .expect("host publication fixture");
+    job.commit(false).expect("host publication fixture");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status: Value =
+            serde_json::from_str(&job.status_json()).expect("host publication fixture");
+        if status["phase"] == "completed" {
+            break;
+        }
+        assert_ne!(status["phase"], "failed", "{status}");
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(called.load(Ordering::SeqCst));
+    assert!(
+        std::fs::read_to_string(output)
+            .expect("host publication fixture")
+            .contains("Host publication")
+    );
+    assert_eq!(
+        std::fs::read_to_string(source).expect("host publication fixture"),
+        "# Host publication\n"
+    );
+    assert!(
+        job.set_publication(HostPublication {
+            staging_directory: staging,
+            replace: Box::new(|_, _, _| panic!("must not replace the publisher"))
+        })
+        .is_err()
+    );
+    drop(job);
+    std::fs::remove_dir_all(root).expect("host publication fixture");
+}

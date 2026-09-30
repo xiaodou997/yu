@@ -292,3 +292,14 @@
 "Print output failed." = "列印輸出失敗。";
 "Saved print output successfully." = "列印輸出已成功儲存。";
 "The document contains a diagnostic at this position. The original source is preserved and can be edited directly." = "文件在此位置包含需要處理的診斷。原始原始碼已保留，可直接修改。";
+"Choose File Sidebar Folder" = "選擇檔案側邊欄資料夾";
+"Choose File Sidebar Folder…" = "選擇檔案側邊欄資料夾…";
+"Document Saved" = "文件已儲存";
+"The document was saved, but its access permission could not be remembered. You may need to select it again after restarting Yu." = "文件已儲存，但無法記住存取權限。重新啟動 Yu 後，可能需要重新選取該檔案。";
+"Allow Folder Access" = "允許存取檔案夾";
+"Allow Access" = "允許存取";
+"Select the requested folder or a folder containing it." = "請選取指定檔案夾或包含它的上層檔案夾。";
+"Allow access to this folder to load the document’s local images. Cancelling keeps the document open without those images." = "允許存取此檔案夾以載入文件中的本機圖片。取消後仍可開啟文件，但不會載入這些圖片。";
+"Allow access to the document folder to save image files beside the Markdown document." = "允許存取文件檔案夾，以在 Markdown 文件旁儲存圖片檔案。";
+"Allow access to the destination folder to copy the document’s local images." = "允許存取目的地檔案夾，以複製文件使用的本機圖片。";
+"Allow access to the output folder to create the numbered PNG images." = "允許存取輸出檔案夾，以建立依序編號的 PNG 圖片。";
