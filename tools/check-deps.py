@@ -121,6 +121,9 @@ ALLOWED: dict[str, set[str]] = {
     # 第二端的字体后端。与 yu-font-macos 同层同形——它们各自实现同一组
     # trait，互相不认识，也不许有人把它们放进同一个依赖里。
     "yu-font-windows": {"yu-core", "yu-font"},
+    # Windows 产品壳是 Rust + windows-rs：直接持有统一 DocumentEditorSession，
+    # 不复制 Mac 壳的 C ABI 搬运层。第二组尚未接 D3D/DirectWrite。
+    "yu-shell-windows": {"yu-editor", "yu-storage", "yu-workspace"},
     "yu-render-macos": {
         "yu-assets",
         "yu-core",

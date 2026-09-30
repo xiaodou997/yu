@@ -37,6 +37,7 @@ jobs:
       # 本地 tools/verify.sh 必须能跑到这里的每一条命令。删掉一个 crate 时
       # 曾经打断过一个 CI job 而本地全绿——本地门禁给了它无权给的绿灯。
       - run: python3 tools/check-ci-parity.py
+      - run: python3 tools/check-platform-parity.py
       # cargo 只拦得住依赖环，拦不住方向：yu-font 依赖 yu-layout 在 cargo
       # 看来完全合法，而那正是不变量 E2 禁止的反向依赖。
       - run: python3 tools/check-deps.py
@@ -97,4 +98,13 @@ jobs:
           toolchain: 1.98.1
       - run: platform/macos/yu-shell-macos/run-self-checks.sh --build
       - run: platform/macos/yu-shell-macos/build-app.sh --release
+
+  windows-shell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - run: ./platform/windows/yu-shell-windows/run-self-checks.ps1
 
