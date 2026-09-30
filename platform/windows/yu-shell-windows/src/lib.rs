@@ -44,6 +44,12 @@ impl From<yu_storage::StorageError> for ShellError {
     }
 }
 
+impl From<yu_storage::CloseStateError> for ShellError {
+    fn from(error: yu_storage::CloseStateError) -> Self {
+        Self::Storage(yu_storage::StorageError::CloseState(error))
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn run() -> Result<(), ShellError> {
     native::run()

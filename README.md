@@ -49,7 +49,8 @@ Yu 的技术本质是：
 
 v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 必须全绿。
 阶段定义与验收标准见[架构总览 v2 第 8 节](docs/architecture/overview-v2.md)。
-macOS 基础体验的真实窗口验收记录见 [macOS acceptance](docs/macos-acceptance.md)。
+macOS 基础体验的真实窗口验收记录见 [macOS acceptance](docs/macos-acceptance.md)；
+Windows 第二平台的产品壳状态见 [Windows acceptance](docs/windows-acceptance.md)。
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
@@ -59,7 +60,7 @@ macOS 基础体验的真实窗口验收记录见 [macOS acceptance](docs/macos-a
 | S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 已完成 |
 | S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 已完成 |
 | S6 | 语义 extension 化：每种语法收敛为一个 extension | 已完成 |
-| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 基础壳与 retained 滚动已接入；真实窗口性能验收待完成） |
+| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生产品壳与 x64 目标构建已建立，D3D/输入/辅助功能继续推进） |
 
 ## 仓库结构
 
@@ -85,6 +86,9 @@ platform/macos/yu-render-macos  Metal device、CAMetalLayer、render plan 编码
 platform/macos/yu-storage-macos FSEvents 文件通知适配
 platform/macos/yu-shell-macos   Swift 产品壳：NSWindow / 菜单 /
                                 NSTextInputClient / Accessibility
+platform/windows/yu-font-windows DirectWrite cluster/run 翻译与 Windows 字体后端地基
+platform/windows/yu-shell-windows Rust + windows-rs 产品壳：Win32 窗口 / 菜单 /
+                                  DPI / 主题 / 文件生命周期 / renderer surface host
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的参考 workload
 ```
@@ -111,6 +115,9 @@ tools/verify.sh --clean         # 产品壳用干净构建（改动 FFI 边界�
 
 # 构建并（重新）启动 Yu.app
 platform/macos/yu-shell-macos/run-app.sh README.md
+
+# Windows 真机/runner 产品壳自检
+./platform/windows/yu-shell-windows/run-self-checks.ps1
 
 # 其它
 cargo test -p yu-render-macos -- --ignored       # 需要有 Metal device 的 macOS session
