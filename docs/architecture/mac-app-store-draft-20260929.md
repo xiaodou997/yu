@@ -139,7 +139,10 @@ https://developer.apple.com/documentation/bundleresources/entitlements/com.apple
 Signed candidate `artifacts/appstore-resources-v3/Yu.app` passed all eight
 native system-print checks (whole/range/landscape, source/image aliases, write
 denial, target change, cancellation), with zero physical jobs submitted. The
-actual print panel retest is pending because the Mac locked during UI acceptance.
+actual print panel retest subsequently passed on September 30: the user
+completed the system PDF save action, and independent PDF inspection confirmed
+two Letter pages with tables, math, Mermaid, both local images, bidirectional
+text, and the footnote. The 650-byte edited fixture remained intact.
 
 Rust workspace tests passed: 1,615 passed and 7 ignored. All-target clippy passes
 with warnings denied after replacing unchecked test unwraps with assertions.
@@ -158,6 +161,33 @@ Powerbox grants; the sandbox stays enabled. Reports are retained in
 `artifacts/appstore-proof/sandbox-png-v3-report.json` and
 `artifacts/appstore-proof/sandbox-print-v3-report.json`.
 
-Generate the formal package from a clean commit after this entry. Store
-screenshots, build upload, review submission, and the locked-screen UI print
-retest are separate remaining items; do not label the app submitted or published.
+## Formal submission package and store state (September 30)
+
+The formal `0.1.2` build `3` package was generated from clean source commit
+`ec726f9905a82c7a045fe03804fc44362c49ec29`. It is retained at
+`artifacts/appstore-submission-0.1.2-build3-ec726f99/Yu-macOS-AppStore.pkg`.
+Its SHA256 is
+`8a1a60f2684b7a4d35399148ac416457533e6dc0900123fa0840c92f0ceb17b0`.
+Apple installer signing and the trusted timestamp were verified. Expanding the
+package reproduced the entire signed-app inventory. Unsigned main/helper/Metal
+code matches the tested v3 candidate. The manifest and acceptance evidence are
+stored alongside the package; this source identity stays fixed when later
+documentation or upload tooling changes.
+
+App Store Connect now has availability saved for all 175 countries/regions.
+Current regional prices are zero, and the version retains manual release.
+The first Simplified Chinese screenshot was accepted at 2880 x 1800; it uses
+the actual signed app window with a caption around it. Apple currently inherits
+this primary-language image for English and Traditional Chinese. Dedicated
+localized screenshots remain to be captured because the desktop automation
+only sees background-window thumbnails until the user brings Yu forward.
+Review notes explaining local-file use and the scoped image-folder prompt were
+saved. Authenticated build validation/upload and review submission remain
+separate items. No tag or GitHub Release has been created.
+
+`tools/upload-macos-appstore.py` verifies the formal manifest and package hash,
+then performs Apple validation before upload. Run it interactively on the Mac;
+enter an existing App-specific password at its hidden prompt. It passes the
+password through stdin and redacts the account and password from saved output.
+It does not store credentials or submit for review. `--check-only` verifies the
+local package without sending it to Apple.
