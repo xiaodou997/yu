@@ -6,7 +6,7 @@
       "passed": true,
       "result_sha256": "3aabd49d8339457d09cc3f43a68b1ce5d2ec44a1c03b734eb6b62c13b7a8a435",
       "options": {
-        "output": "/Users/luoxiaodou/workspace/yu-workspace/artifacts/group4-local-20260927-08b/unified-1800-light",
+        "output": "/Users/USER/workspace/yu-workspace/artifacts/group4-local-20260927-08b/unified-1800-light",
         "documents": 4,
         "seconds": 1800,
         "idle_seconds": 70,

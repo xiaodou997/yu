@@ -1,14 +1,14 @@
 Traceback (most recent call last):
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 258, in main
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 258, in main
     exercise(soak)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 209, in exercise
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 209, in exercise
     soak.install(sentinel, COLD_SOURCE, 'cold')
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 79, in install
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 79, in install
     self.focus(doc)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 243, in focus
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 243, in focus
     self.run('raise-window', doc.window)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 65, in run
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-residency.py", line 65, in run
     return super().run(*arguments)
-  File "/Users/luoxiaodou/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 156, in run
+  File "/Users/USER/workspace/yu-workspace/platform/macos/yu-shell-macos/run-resource-soak.py", line 156, in run
     raise RuntimeError('Native event failed; exact output retained')
 RuntimeError: Native event failed; exact output retained

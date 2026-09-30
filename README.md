@@ -10,8 +10,8 @@ macOS、Windows 与 Linux 上提供低资源、低延迟的编辑体验。
 macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输入、窗口、Accessibility 等
 能力允许使用 Swift、Objective-C 或其他适合该平台的语言实现。
 
-> **发布状态：** macOS 版本正在完成 Mac App Store 的沙盒、安装包和商店审核验收；
-> Windows 版本随后处理。当前仓库尚未发布正式商店版本或跨平台 Release。
+> **发布状态：** macOS `0.1.2 (3)` 已提交 Mac App Store，正在等待审核，审核通过后手动上架；
+> Windows 版本随后处理，再创建版本标签和双平台 GitHub Release。
 > v1 已在 tag `v1-final` 冻结，完整状态保留在分支 `archive/v1-source-projection`。
 
 ## 支持与隐私

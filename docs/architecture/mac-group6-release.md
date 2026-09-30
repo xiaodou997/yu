@@ -20,8 +20,7 @@ Release 等 Windows 就绪后创建。下面的 6A–6F 表格和 DMG 实施记�
 正式包的完整清单、Apple Distribution 签名、helper 沙盒继承、Hardened
 Runtime、安全时间戳和安装包签名已复核。真实系统打印到 PDF 通过；三种
 商店语言对应的资源已包含在五语言包中。Apple 验证/上传、构建关联、三种
-商店语言的截图和审核提交均已完成。提交 ID 为
-`6500fafc-8775-4ff9-9151-91f6149c17c5`，当前等待审核，免费及审核后手动
+商店语言的截图和审核提交均已完成。当前等待审核，免费及审核后手动
 发布的设置保持有效。审核通过和公开上架尚未发生。
 
 更新：2026-09-29。范围依据用户决定：**实机验收使用 macOS 27 / Apple Silicon，不以 macOS 26 专机作为本组阻塞项。** 最低部署目标仍为 26.0；这不等于已经验证 26 的运行兼容性。用户随后将真实注销、重启及同类会打断本机使用的系统场景移出第六组结项门槛；本组聚焦软件和发行包，不调整非必要系统设置。第五组结论保持原有范围。
@@ -61,8 +60,8 @@ CI 额度/runner 未恢复不阻塞本地签名、公证和本组结项；不能
 python3 tools/release-macos.py build --output artifacts/releases/0.1.2-3
 
 python3 tools/release-macos.py sign --output artifacts/releases/0.1.2-3 \
-  --identity 'Developer ID Application: SHIYU FENG (V6M88BQG7C)' \
-  --team V6M88BQG7C
+  --identity 'Developer ID Application: YOUR_NAME (YOUR_TEAM_ID)' \
+  --team YOUR_TEAM_ID
 
 python3 tools/release-macos.py notarize --output artifacts/releases/0.1.2-3 \
   --profile Yu-notary
@@ -87,7 +86,7 @@ notarize 先验证 Keychain profile，app 通过后 staple，再封装到包含 
 开发者本人在 Apple 账号“登录与安全 → App 专用密码”建立公证用途密码，然后在本机交互终端输入：
 
 ```sh
-xcrun notarytool store-credentials Yu-notary --team-id V6M88BQG7C
+xcrun notarytool store-credentials Yu-notary --team-id YOUR_TEAM_ID
 ```
 
 按提示选择 Apple ID 方式、输入开发者 Apple ID 与 app-specific password；默认向 Apple 验证后保存到钥匙串。密码不放脚本、命令参数、Git、日志或聊天。已有 App Store Connect API key 也可使用，不为本任务默认创建额外密钥。
@@ -135,19 +134,19 @@ xcrun notarytool store-credentials Yu-notary --team-id V6M88BQG7C
 
 ## 2026-09-29 首批实际记录
 
-- 本机 macOS 27.0（26A428），正式证书 Team V6M88BQG7C 已存在；未申请新证书或导出私钥。
+- 本机 macOS 27.0（26A428），正式签名证书已存在；未申请新证书或导出私钥。
 - 新发行入口的 7 项门禁测试通过：拒绝开发/ad-hoc/错误 Team/缺失 runtime/缺失 timestamp 签名、危险 entitlement、阶段间包篡改、额外符号链接及脏工作区正式构建；Gatekeeper 被禁用时不得标为强制策略验收通过。
 - 首次候选构建在既有 `revision_change_cancels_a_running_child_without_waiting_for_its_output` 中失败：3 秒内未观察到模拟 helper 的 started 标记。保留原始失败记录；未改测试或跳过该项。单独复查通过，随后第二次完整 workspace 测试通过。根因未确认，不把复跑通过当作已定位原因。
 - 第二次候选：Rust **1605 passed / 0 failed / 7 ignored**（按全部 test result 汇总），fmt/clippy 通过；构建资源审计通过。已有 7 项 ignored 不计入通过数。
 - 签名前后各 **19 项原生 self-check** 及 Bridge 资源失败路径 **2 项**通过。
-- app/helper 均为 Developer ID Application、Team V6M88BQG7C、runtime、安全时间戳、空 entitlements；helper 先签，app 后签；deep/strict 验证通过。
+- app/helper 均为 Developer ID Application、runtime、安全时间戳、空 entitlements；helper 先签，app 后签；deep/strict 验证通过。
 - 设置 YU_TEST_RENDERER 指向正式签名 helper，真实公式/图表及过期请求拒绝 integration 测试通过。
 - 本机证据：`artifacts/releases/group6-candidate-20260929-r2/`；首次失败目录为 `artifacts/releases/group6-candidate-20260929/`。候选来源是基线提交加本轮未提交变更，manifest 明确 candidate=true，不宣称为干净提交发行。
 
 ### 公证和安装冒烟结果
 
-- app ZIP submission：`777fa912-8a73-424f-8b11-e8f0586d25c9`，**Accepted**，Apple 日志 issues=null；app stapler staple/validate 通过。
-- DMG submission：`7886f7a5-9573-4404-ba89-d3bd32c01cb3`，**Accepted**；DMG staple/validate 与签名检查通过。
+- app ZIP submission：（编号见本机 manifest），**Accepted**，Apple 日志 issues=null；app stapler staple/validate 通过。
+- DMG submission：（编号见本机 manifest），**Accepted**；DMG staple/validate 与签名检查通过。
 - 最终带票据 DMG：`Yu-0.1.0-1-arm64.dmg`；SHA256：`b5f0a0e0911e50c5bea0c62f0237de08f6f2b130a704cb2222709418899f589d`。Apple 日志里的上传哈希是 stapling 前的文件，不能拿来冒充最终下载哈希。
 - **本机 Gatekeeper 已处于 assessments disabled**，不是本任务关闭的。spctl 返回 Notarized Developer ID，同时返回 override=security disabled；不能计作默认策略首启通过。syspolicy_check distribution 返回 0，仍不替代启用 Gatekeeper 环境的实际下载首启。
 - DMG 校验通过；只读挂载含 Yu.app 与 /Applications 快捷方式；复制到本机私有中文路径后逐文件哈希/权限一致，签名和票据仍有效。没有冒充干净 Mac 或系统 Applications 安装。
