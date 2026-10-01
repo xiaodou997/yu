@@ -108,3 +108,5 @@ jobs:
           toolchain: 1.98.1
       - run: ./platform/windows/yu-shell-windows/run-self-checks.ps1
       - run: ./platform/windows/yu-shell-windows/build-package.ps1 -Profile Debug -Smoke -TestPipeline
+      - run: ./platform/windows/yu-shell-windows/build-package.ps1 -Channel GitHub -Profile Debug -Candidate -Smoke -TestPipeline -OutputDirectory artifacts/windows-github-ci
+      - run: ./platform/windows/yu-shell-windows/build-installer.ps1 -ReleaseDirectory artifacts/windows-github-ci -Smoke
