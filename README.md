@@ -60,7 +60,7 @@ Windows 第二平台的产品壳状态见 [Windows acceptance](docs/windows-acce
 | S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 已完成 |
 | S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 已完成 |
 | S6 | 语义 extension 化：每种语法收敛为一个 extension | 已完成 |
-| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生壳、DirectWrite 与 D3D11/DXGI 已接入，输入/辅助功能继续推进） |
+| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生壳、DirectWrite/D3D11 与 TSF/IME 编辑输入链已接入，辅助功能与发布收尾继续推进） |
 
 ## 仓库结构
 

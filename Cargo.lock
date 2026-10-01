@@ -4080,6 +4080,8 @@ name = "yu-shell-windows"
 version = "0.1.0"
 dependencies = [
  "windows",
+ "windows-core",
+ "yu-core",
  "yu-editor",
  "yu-font",
  "yu-font-windows",
@@ -4087,6 +4089,7 @@ dependencies = [
  "yu-render-windows",
  "yu-scene",
  "yu-storage",
+ "yu-text",
  "yu-workspace",
 ]
 

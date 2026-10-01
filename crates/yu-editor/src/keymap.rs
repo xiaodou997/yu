@@ -17,6 +17,8 @@ pub enum EditorKey {
     Right,
     Up,
     Down,
+    Home,
+    End,
     Escape,
 }
 
@@ -125,15 +127,77 @@ pub fn command_for_key(event: KeyEvent) -> Option<EditorCommand> {
         (EditorKey::Delete, KeyModifiers::NONE) => Some(EditorCommand::DeleteForward),
         (EditorKey::Left, KeyModifiers::NONE) => Some(EditorCommand::MoveLeft),
         (EditorKey::Right, KeyModifiers::NONE) => Some(EditorCommand::MoveRight),
+        (EditorKey::Left, KeyModifiers::SHIFT) => Some(EditorCommand::ExtendHorizontal {
+            forward: false,
+            word: false,
+        }),
+        (EditorKey::Right, KeyModifiers::SHIFT) => Some(EditorCommand::ExtendHorizontal {
+            forward: true,
+            word: false,
+        }),
         (EditorKey::Up, KeyModifiers::NONE) => Some(EditorCommand::move_up()),
         (EditorKey::Down, KeyModifiers::NONE) => Some(EditorCommand::move_down()),
         (EditorKey::Up, KeyModifiers::SHIFT) => Some(EditorCommand::move_up_extend()),
         (EditorKey::Down, KeyModifiers::SHIFT) => Some(EditorCommand::move_down_extend()),
+        (EditorKey::Home, KeyModifiers::NONE) => {
+            Some(EditorCommand::move_line_boundary(false, false))
+        }
+        (EditorKey::End, KeyModifiers::NONE) => {
+            Some(EditorCommand::move_line_boundary(true, false))
+        }
+        (EditorKey::Home, KeyModifiers::SHIFT) => {
+            Some(EditorCommand::move_line_boundary(false, true))
+        }
+        (EditorKey::End, KeyModifiers::SHIFT) => {
+            Some(EditorCommand::move_line_boundary(true, true))
+        }
+        (EditorKey::Home, KeyModifiers::COMMAND) => Some(EditorCommand::MoveDocumentBoundary {
+            end: false,
+            extend: false,
+        }),
+        (EditorKey::End, KeyModifiers::COMMAND) => Some(EditorCommand::MoveDocumentBoundary {
+            end: true,
+            extend: false,
+        }),
+        (EditorKey::Home, modifiers)
+            if modifiers == (KeyModifiers::COMMAND | KeyModifiers::SHIFT) =>
+        {
+            Some(EditorCommand::MoveDocumentBoundary {
+                end: false,
+                extend: true,
+            })
+        }
+        (EditorKey::End, modifiers)
+            if modifiers == (KeyModifiers::COMMAND | KeyModifiers::SHIFT) =>
+        {
+            Some(EditorCommand::MoveDocumentBoundary {
+                end: true,
+                extend: true,
+            })
+        }
         (EditorKey::Left, KeyModifiers::OPTION | KeyModifiers::CONTROL) => {
             Some(EditorCommand::move_word_left())
         }
         (EditorKey::Right, KeyModifiers::OPTION | KeyModifiers::CONTROL) => {
             Some(EditorCommand::move_word_right())
+        }
+        (EditorKey::Left, modifiers)
+            if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                || modifiers == (KeyModifiers::OPTION | KeyModifiers::SHIFT) =>
+        {
+            Some(EditorCommand::ExtendHorizontal {
+                forward: false,
+                word: true,
+            })
+        }
+        (EditorKey::Right, modifiers)
+            if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                || modifiers == (KeyModifiers::OPTION | KeyModifiers::SHIFT) =>
+        {
+            Some(EditorCommand::ExtendHorizontal {
+                forward: true,
+                word: true,
+            })
         }
         _ => None,
     }
