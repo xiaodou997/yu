@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
     DestroyWindow, DispatchMessageW, EN_CHANGE, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
     GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, HWND_TOP, IDC_ARROW,
-    IsDialogMessageW, KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, MB_ICONERROR,
+    IsDialogMessageW, KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR,
     MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW,
@@ -2154,11 +2154,16 @@ fn register_classes() -> Result<(), ShellError> {
 fn register_classes_once() -> Result<(), ShellError> {
     let instance = unsafe { GetModuleHandleW(None) }.map_err(platform_error)?;
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.map_err(platform_error)?;
+    // MAKEINTRESOURCE(1) is an integer resource ID encoded in a pointer, never dereferenced.
+    let icon = unsafe { LoadIconW(HINSTANCE(instance.0), PCWSTR(ptr::without_provenance(1))) }
+        .map_err(platform_error)?;
     let main = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(window_proc),
         hInstance: HINSTANCE(instance.0),
+        hIcon: icon,
+        hIconSm: icon,
         hCursor: cursor,
         hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
         lpszClassName: MAIN_CLASS,
@@ -3017,6 +3022,21 @@ mod tests {
             )
             .expect("native surface")
         });
+        // The executable manifest makes tests PMv2-aware too. Keep the intended
+        // 1000 x 1600 DIP fixture viewport so high DPI does not cull the last diagram.
+        let dpi = unsafe { GetDpiForWindow(window.0) }.max(96);
+        unsafe {
+            SetWindowPos(
+                window.0,
+                None,
+                0,
+                0,
+                (1000_u32 * dpi / 96) as i32,
+                (1600_u32 * dpi / 96) as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .expect("resource fixture logical viewport");
+        }
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Fixtures/group5-resources.md");
         let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

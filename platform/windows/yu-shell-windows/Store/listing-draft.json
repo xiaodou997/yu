@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "status": "draft_not_submitted",
+  "identity_source": "Microsoft Partner Center (not configured)",
+  "category_suggestion": "Productivity",
+  "support_url": "https://github.com/xiaodou997/yu/issues",
+  "privacy_url": "https://github.com/xiaodou997/yu/blob/main/PRIVACY-WINDOWS.md",
+  "architecture": "x64",
+  "minimum_windows_version": "10.0.19041.0",
+  "tested_windows_version": "10.0.26100.0",
+  "screenshots": [],
+  "localizations": {
+    "en-US": {
+      "display_name": "Yu",
+      "short_description": "A local Markdown editor for Windows.",
+      "description": "Write and edit Markdown in a native Windows app. Yu supports Unicode text and Windows input methods, local Markdown files, search, an outline, and undo and redo. Preview local images, mathematical formulas, and Mermaid diagrams while keeping Markdown as your document source. Documents stay in the locations you choose; no account is required.",
+      "features": ["Native Windows text input and Unicode editing", "Local Markdown files, search, and outline", "Local image, math, and Mermaid rendering", "UI Automation access to text and document structure"]
+    },
+    "zh-Hans": {
+      "display_name": "Yu",
+      "short_description": "适用于 Windows 的本地 Markdown 编辑器。",
+      "description": "在原生 Windows 应用中编写和编辑 Markdown。Yu 支持 Unicode 文本、Windows 输入法、本地 Markdown 文件、搜索、大纲、撤销与重做。编辑时可预览本地图片、数学公式和 Mermaid 图表，文档源文件保持 Markdown 格式。文档保存在你选择的位置，无需账户。",
+      "features": ["原生 Windows 输入法与 Unicode 编辑", "本地 Markdown 文件、搜索和大纲", "本地图片、公式与 Mermaid 渲染", "通过 UI Automation 访问文本与文档结构"]
+    },
+    "zh-Hant": {
+      "display_name": "Yu",
+      "short_description": "適用於 Windows 的本機 Markdown 編輯器。",
+      "description": "在原生 Windows 應用程式中撰寫及編輯 Markdown。Yu 支援 Unicode 文字、Windows 輸入法、本機 Markdown 檔案、搜尋、大綱、復原與重做。編輯時可預覽本機圖片、數學公式和 Mermaid 圖表，文件來源維持 Markdown 格式。文件儲存在你選擇的位置，無需帳號。",
+      "features": ["原生 Windows 輸入法與 Unicode 編輯", "本機 Markdown 檔案、搜尋和大綱", "本機圖片、公式與 Mermaid 算繪", "透過 UI Automation 存取文字與文件結構"]
+    },
+    "ja-JP": {
+      "display_name": "Yu",
+      "short_description": "Windows 向けのローカル Markdown エディター。",
+      "description": "ネイティブ Windows アプリで Markdown を作成、編集できます。Yu は Unicode テキスト、Windows の入力方式、ローカル Markdown ファイル、検索、アウトライン、元に戻す操作とやり直しに対応しています。Markdown を文書のソースとして保ちながら、ローカル画像、数式、Mermaid 図をプレビューできます。文書は選択した場所に保存され、アカウントは不要です。",
+      "features": ["Windows の入力方式と Unicode テキスト編集", "ローカル Markdown ファイル、検索、アウトライン", "ローカル画像、数式、Mermaid 図の描画", "UI Automation によるテキストと文書構造へのアクセス"]
+    },
+    "ko-KR": {
+      "display_name": "Yu",
+      "short_description": "Windows용 로컬 Markdown 편집기.",
+      "description": "네이티브 Windows 앱에서 Markdown을 작성하고 편집하세요. Yu는 Unicode 텍스트, Windows 입력 방식, 로컬 Markdown 파일, 검색, 개요, 실행 취소 및 다시 실행을 지원합니다. 문서 원본을 Markdown 형식으로 유지하면서 로컬 이미지, 수학 수식, Mermaid 다이어그램을 미리 볼 수 있습니다. 문서는 선택한 위치에 저장되며 계정이 필요하지 않습니다.",
+      "features": ["Windows 입력 방식 및 Unicode 텍스트 편집", "로컬 Markdown 파일, 검색 및 개요", "로컬 이미지, 수식 및 Mermaid 렌더링", "UI Automation을 통한 텍스트 및 문서 구조 접근"]
+    }
+  },
+  "pending": [
+    "Partner Center identity, publisher display name, and reserved product name",
+    "Actual installed-package launch, file association, update, and uninstall acceptance",
+    "Windows App Certification Kit and clean Windows machine validation",
+    "Localized screenshots and human review of listing translations",
+    "Pricing, markets, age rating, privacy declarations, and runFullTrust review",
+    "Production signing configuration for sideload distribution, if that channel is used"
+  ]
+}

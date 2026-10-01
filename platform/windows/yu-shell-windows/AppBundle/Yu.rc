@@ -1,0 +1,32 @@
+// Numeric Win32 constants keep this resource source independent of SDK headers.
+1 ICON "Yu.ico"
+1 24 "Yu.manifest"
+
+1 VERSIONINFO
+FILEVERSION YU_VERSION
+PRODUCTVERSION YU_VERSION
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Yu contributors\0"
+            VALUE "FileDescription", "Yu Markdown Editor\0"
+            VALUE "FileVersion", YU_VERSION_STRING "\0"
+            VALUE "InternalName", "Yu\0"
+            VALUE "OriginalFilename", "yu-shell-windows.exe\0"
+            VALUE "ProductName", "Yu\0"
+            VALUE "ProductVersion", YU_VERSION_STRING "\0"
+            VALUE "LegalCopyright", "Copyright 2026 Yu contributors. Apache License 2.0.\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
