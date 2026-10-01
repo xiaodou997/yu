@@ -339,3 +339,17 @@ EXE 已包含 Yu 图标、版本、PMv2 DPI、Common Controls v6 和权限声明
 文件关联、更新、卸载或 Store 认证已通过。
 完整范围与证据见[第七组原生验收记录](windows-group7-native-acceptance-20261001.md)，
 构建与签名配置见[Windows 打包说明](windows-packaging.md)。
+
+### 发布路线调整：优先 GitHub Release EXE 安装版，另提供便携版
+
+用户已选择 Windows 版先通过 GitHub Release 分发未签名 EXE 安装器与便携 ZIP，用户量增长后再
+考虑 Microsoft Store。新增 `-Channel GitHub` 构建与实际 ZIP 解压验证；发布包同时
+提供 `Yu.exe`、渲染 helper、许可证、说明和 SHA256 校验文件。正式构建要求干净
+Release 源码；本地或 CI 的 Debug / 脏工作区须显式 `-Candidate`。
+
+新增 Inno Setup EXE 打包及独立安装验证。2026-10-02 本机当前用户安装、开始菜单、
+卸载注册、安装后 HWND / 38 项 UIA / 公式与 Mermaid、同版本重装、卸载及文档保留通过。
+此路线无需证书或 Store 身份，MSIX 安装、商店签名及 WACK 不作为当前 GitHub 发布的
+结项条件。普通未签名 EXE 可能受到 SmartScreen、Smart App Control 或企业策略
+限制；软件不修改用户安全设置。跨机器兼容性仍需独立验收。
+完整证据与限制见 [GitHub 分发验收记录](windows-github-release-acceptance-20261002.md)。

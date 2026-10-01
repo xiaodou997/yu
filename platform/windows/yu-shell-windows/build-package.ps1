@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Development','Store')][string]$Channel = 'Development',
+    [ValidateSet('Development','Store','GitHub')][string]$Channel = 'Development',
     [ValidateSet('Release','Debug')][string]$Profile = 'Release',
     [string]$IdentityName,
     [string]$Publisher,
@@ -9,6 +9,7 @@ param(
     [uri]$TimestampUrl,
     [switch]$Smoke,
     [switch]$TestPipeline,
+    [switch]$Candidate,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot ('../../../artifacts/windows-group7/' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)))
 )
 $ErrorActionPreference = 'Stop'
@@ -16,7 +17,10 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 if (Test-Path -LiteralPath $output) { throw "Output already exists; choose a new directory: $output" }
-if ($Channel -eq 'Store') {
+if ($Channel -eq 'GitHub') {
+    if ($Profile -ne 'Release' -and -not $Candidate) { throw 'GitHub release builds require Release profile unless Candidate is explicit.' }
+    if ($CertificateThumbprint -or $TimestampUrl -or $IdentityName -or $Publisher) { throw 'GitHub portable builds use unsigned EXEs and do not require package identity or signing inputs.' }
+} elseif ($Channel -eq 'Store') {
     if (-not $IdentityName -or -not $Publisher) { throw 'Store builds require the exact IdentityName and Publisher assigned by Partner Center.' }
     if ($IdentityName -eq 'Yu.Editor.Development' -or $Publisher -eq 'CN=Yu Development') { throw 'Development identity cannot be used for Store builds.' }
     if ($Profile -ne 'Release') { throw 'Store builds require Release profile.' }
@@ -24,8 +28,10 @@ if ($Channel -eq 'Store') {
     if (-not $IdentityName) { $IdentityName = 'Yu.Editor.Development' }
     if (-not $Publisher) { $Publisher = 'CN=Yu Development' }
 }
-if ($IdentityName -notmatch '^[A-Za-z0-9.-]{3,50}$') { throw 'Invalid package IdentityName.' }
-if (-not $Publisher.StartsWith('CN=')) { throw 'Publisher must be a certificate subject beginning with CN=.' }
+if ($Channel -ne 'GitHub') {
+    if ($IdentityName -notmatch '^[A-Za-z0-9.-]{3,50}$') { throw 'Invalid package IdentityName.' }
+    if (-not $Publisher.StartsWith('CN=')) { throw 'Publisher must be a certificate subject beginning with CN=.' }
+}
 if ($TimestampUrl -and ($TimestampUrl.Scheme -ne 'https' -or $TimestampUrl.UserInfo)) { throw 'TimestampUrl must use HTTPS without embedded credentials.' }
 if ($CertificateThumbprint -and $CertificateThumbprint -notmatch '^[A-Fa-f0-9]{40}$') { throw 'CertificateThumbprint must be a SHA1 certificate-store thumbprint.' }
 Push-Location $root
@@ -33,6 +39,7 @@ try {
     $gitStatus = (git status --porcelain --untracked-files=normal | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source checkout.' }
     if ($Channel -eq 'Store' -and $gitStatus) { throw 'Store builds require a clean checkout.' }
+    if ($Channel -eq 'GitHub' -and $gitStatus -and -not $Candidate) { throw 'GitHub release builds require a clean checkout unless Candidate is explicit.' }
     $commit = (git rev-parse HEAD).Trim()
     $metadata = Read-CargoMetadata $root
     $shellVersion = ($metadata.packages | Where-Object name -EQ 'yu-shell-windows').version
@@ -57,6 +64,7 @@ try {
     Invoke-ReleaseTool 'cargo' $buildArguments (Join-Path $output 'build.log')
     $target = Join-Path $root ('target/x86_64-pc-windows-msvc/' + $Profile.ToLowerInvariant())
     foreach ($name in @('yu-shell-windows.exe','yu-document-renderer.exe')) { Copy-Item -LiteralPath (Join-Path $target $name) -Destination $payload }
+    if ($Channel -eq 'GitHub') { Rename-Item -LiteralPath (Join-Path $payload 'yu-shell-windows.exe') -NewName 'Yu.exe' }
     if ($certificate) {
         $binarySignArguments = @('sign','/fd','SHA256','/sha1',$certificate.Thumbprint)
         if ($TimestampUrl) { $binarySignArguments += @('/tr',$TimestampUrl.AbsoluteUri,'/td','SHA256') }
@@ -65,28 +73,39 @@ try {
             Invoke-ReleaseTool (Find-SdkTool 'signtool') @('verify','/pa','/all','/v',(Join-Path $payload $name)) (Join-Path $output ($name + '-signature.log'))
         }
     }
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'AppBundle/Assets') -Destination $payload -Recurse
     Export-CargoLicenses $metadata (Join-Path $payload 'Licenses') $root
-    [xml]$manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'AppBundle/AppxManifest.xml') -Encoding UTF8 -Raw
-    $manifest.Package.Identity.SetAttribute('Name', $IdentityName)
-    $manifest.Package.Identity.SetAttribute('Publisher', $Publisher)
-    $manifest.Package.Identity.SetAttribute('Version', $Version)
-    $manifest.Package.Properties.PublisherDisplayName = $PublisherDisplayName
-    $manifest.Save((Join-Path $payload 'AppxManifest.xml'))
-    $makepri = Find-SdkTool 'makepri'
-    $config = Join-Path $output 'priconfig.xml'
-    Invoke-ReleaseTool $makepri @('createconfig','/cf',$config,'/dq','en-US','/o') (Join-Path $output 'pri-config.log')
-    Invoke-ReleaseTool $makepri @('new','/pr',$payload,'/cf',$config,'/of',(Join-Path $payload 'resources.pri'),'/o') (Join-Path $output 'pri.log')
-    $package = Join-Path $output "Yu-$Version-x64.msix"
-    Invoke-ReleaseTool (Find-SdkTool 'makeappx') @('pack','/d',$payload,'/p',$package,'/h','SHA256') (Join-Path $output 'makeappx.log')
-    if ($certificate) {
-        $signArguments = @('sign','/fd','SHA256','/sha1',$certificate.Thumbprint)
-        if ($TimestampUrl) { $signArguments += @('/tr',$TimestampUrl.AbsoluteUri,'/td','SHA256') }
-        Invoke-ReleaseTool (Find-SdkTool 'signtool') ($signArguments + @($package)) (Join-Path $output 'sign.log')
-        Invoke-ReleaseTool (Find-SdkTool 'signtool') @('verify','/pa','/all','/v',$package) (Join-Path $output 'signature-verification.log')
+    if ($Channel -eq 'GitHub') {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Portable/README.txt') -Destination $payload
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $package = Join-Path $output "Yu-$shellVersion-windows-x64.zip"
+        [IO.Compression.ZipFile]::CreateFromDirectory($payload, $package, [IO.Compression.CompressionLevel]::Optimal, $false)
+    } else {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'AppBundle/Assets') -Destination $payload -Recurse
+        [xml]$manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'AppBundle/AppxManifest.xml') -Encoding UTF8 -Raw
+        $manifest.Package.Identity.SetAttribute('Name', $IdentityName)
+        $manifest.Package.Identity.SetAttribute('Publisher', $Publisher)
+        $manifest.Package.Identity.SetAttribute('Version', $Version)
+        $manifest.Package.Properties.PublisherDisplayName = $PublisherDisplayName
+        $manifest.Save((Join-Path $payload 'AppxManifest.xml'))
+        $makepri = Find-SdkTool 'makepri'
+        $config = Join-Path $output 'priconfig.xml'
+        Invoke-ReleaseTool $makepri @('createconfig','/cf',$config,'/dq','en-US','/o') (Join-Path $output 'pri-config.log')
+        Invoke-ReleaseTool $makepri @('new','/pr',$payload,'/cf',$config,'/of',(Join-Path $payload 'resources.pri'),'/o') (Join-Path $output 'pri.log')
+        $package = Join-Path $output "Yu-$Version-x64.msix"
+        Invoke-ReleaseTool (Find-SdkTool 'makeappx') @('pack','/d',$payload,'/p',$package,'/h','SHA256') (Join-Path $output 'makeappx.log')
+        if ($certificate) {
+            $signArguments = @('sign','/fd','SHA256','/sha1',$certificate.Thumbprint)
+            if ($TimestampUrl) { $signArguments += @('/tr',$TimestampUrl.AbsoluteUri,'/td','SHA256') }
+            Invoke-ReleaseTool (Find-SdkTool 'signtool') ($signArguments + @($package)) (Join-Path $output 'sign.log')
+            Invoke-ReleaseTool (Find-SdkTool 'signtool') @('verify','/pa','/all','/v',$package) (Join-Path $output 'signature-verification.log')
+        }
     }
     $inventory = Get-PayloadInventory $payload
-    $audit = @{ schema_version=1; channel=$Channel; profile=$Profile; candidate=[bool]$gitStatus; source_commit=$commit; git_status=$gitStatus; version=$Version; identity_name=$IdentityName; publisher=$Publisher; architecture='x64'; signed=[bool]$certificate; certificate_thumbprint=$CertificateThumbprint; package=[IO.Path]::GetFileName($package); package_sha256=(Get-FileHash $package).Hash; files=$inventory; stage='packed' }
+    $audit = @{ schema_version=1; channel=$Channel; profile=$Profile; candidate=($Candidate -or [bool]$gitStatus); source_commit=$commit; git_status=$gitStatus; version=$Version; identity_name=$IdentityName; publisher=$Publisher; architecture='x64'; signed=[bool]$certificate; certificate_thumbprint=$CertificateThumbprint; package=[IO.Path]::GetFileName($package); package_sha256=(Get-FileHash $package).Hash; files=$inventory; stage='packed' }
+    $audit.format = if ($Channel -eq 'GitHub') { 'portable-zip' } else { 'msix' }
+    if ($Channel -eq 'GitHub') {
+        [IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), ($audit.package_sha256.ToLowerInvariant() + '  ' + $audit.package + "`n"), (New-Object Text.UTF8Encoding($false)))
+    }
     $audit.created_at = [DateTime]::UtcNow.ToString('o')
     $audit.cargo_lock_sha256 = (Get-FileHash -LiteralPath (Join-Path $root 'Cargo.lock')).Hash
     $audit.pipeline_sha256 = @{}

@@ -89,6 +89,8 @@ fi
 step "Windows 产品壳 self-check"
 printf "当前主机不是 Windows，跳过执行；Windows CI 执行：./platform/windows/yu-shell-windows/run-self-checks.ps1\n"
 printf "Windows CI 的安装包门禁：./platform/windows/yu-shell-windows/build-package.ps1 -Profile Debug -Smoke -TestPipeline\n"
+printf "Windows CI 的便携 ZIP 门禁：./platform/windows/yu-shell-windows/build-package.ps1 -Channel GitHub -Profile Debug -Candidate -Smoke -TestPipeline -OutputDirectory artifacts/windows-github-ci\n"
+printf "Windows CI 的 EXE 安装器门禁：./platform/windows/yu-shell-windows/build-installer.ps1 -ReleaseDirectory artifacts/windows-github-ci -Smoke\n"
 
 step "macOS 产品壳 self-check"
 if [[ "${1:-}" == "--clean" ]]; then

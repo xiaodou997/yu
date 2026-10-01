@@ -104,3 +104,28 @@ function Export-CargoLicenses($Metadata, [string]$OutputDirectory, [string]$Root
     Copy-Item -LiteralPath (Join-Path $Root 'tools/yu-document-renderer/vendor/xarrow/LICENSE') -Destination (Join-Path $OutputDirectory 'xarrow.txt')
     Copy-Item -LiteralPath (Join-Path $Root 'vendor/mermaid-rs-renderer/LICENSE') -Destination (Join-Path $OutputDirectory 'Mermaid-Vendored-MIT.txt')
 }
+
+function Test-ReleaseRenderer([string]$Directory) {
+    $helperInfo = New-Object Diagnostics.ProcessStartInfo
+    $helperInfo.FileName = Join-Path $Directory 'yu-document-renderer.exe'
+    $helperInfo.UseShellExecute = $false; $helperInfo.CreateNoWindow = $true
+    $helperInfo.RedirectStandardInput = $true; $helperInfo.RedirectStandardOutput = $true
+    $helperInfo.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
+    $helper = [Diagnostics.Process]::Start($helperInfo)
+    $rendered = @()
+    try {
+        foreach ($request in @(@{id=1;document=7;revision=1;kind='math';source='e^{i\pi}+1=0'},@{id=2;document=7;revision=1;kind='mermaid';source="flowchart LR`nA[Image] --> B[Math]"})) {
+            $helper.StandardInput.WriteLine(($request | ConvertTo-Json -Compress))
+            $helper.StandardInput.Flush()
+            $responseTask = $helper.StandardOutput.ReadLineAsync()
+            if (-not $responseTask.Wait(30000)) { throw 'Packaged renderer response timed out.' }
+            $response = $responseTask.Result | ConvertFrom-Json
+            if ($response.id -ne $request.id -or $response.document -ne 7 -or $response.revision -ne 1 -or $response.status -ne 'ready' -or $response.vector.width -le 0 -or $response.vector.height -le 0 -or -not $response.vector.svg.Contains('<svg')) { throw "Packaged renderer failed: $($request.kind)" }
+            $rendered += @{kind=$request.kind; width=$response.vector.width; height=$response.vector.height; svg_bytes=[Text.Encoding]::UTF8.GetByteCount($response.vector.svg)}
+        }
+        $helper.StandardInput.Close()
+        if (-not $helper.WaitForExit(10000) -or $helper.ExitCode -ne 0) { throw 'Packaged renderer did not shut down successfully.' }
+    }
+    finally { if (-not $helper.HasExited) { $helper.Kill(); $helper.WaitForExit() }; $helper.Dispose() }
+    return $rendered
+}
