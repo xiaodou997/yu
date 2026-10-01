@@ -5,8 +5,8 @@
 //! The shell owns Windows windowing, menus, DPI/theme facts and file dialogs.
 //! The canonical Markdown source, dirty state, history and close lifecycle stay
 //! inside `yu_storage::DocumentEditorSession`. The editor viewport is a
-//! dedicated native surface host; it is intentionally not a RichEdit/TextBox
-//! fallback and will be connected to the D3D renderer in the next group.
+//! dedicated native surface host connected to the shared scene/render plan,
+//! DirectWrite glyph atlas and D3D renderer, including background resources.
 
 pub mod locale;
 pub mod model;
@@ -17,6 +17,8 @@ mod text_input;
 mod chrome;
 #[cfg(target_os = "windows")]
 mod native;
+#[cfg(target_os = "windows")]
+mod resources;
 #[cfg(target_os = "windows")]
 mod tsf;
 

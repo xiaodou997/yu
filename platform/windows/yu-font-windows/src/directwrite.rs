@@ -7,7 +7,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 
 use unicode_bidi::{BidiClass, bidi_class};
-use windows::Win32::Foundation::{BOOL, RECT};
+use windows::Win32::Foundation::{BOOL, DWRITE_E_NOCOLOR, RECT};
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::core::{ComObject, PCWSTR, Result as WinResult, implement};
 use yu_core::{GlyphRun, Script, ShapedText, ShapingProvider, TextDirection, TextRange, TextStyle};
@@ -768,6 +768,119 @@ impl fmt::Debug for DirectWriteGlyphRasterizer {
 }
 
 impl DirectWriteGlyphRasterizer {
+    fn color_bitmap(
+        &self,
+        run: &DWRITE_GLYPH_RUN,
+    ) -> Result<Option<(GlyphBitmap, RECT)>, DirectWriteError> {
+        let layers = match unsafe {
+            self.factory.TranslateColorGlyphRun(
+                0.0,
+                0.0,
+                run,
+                None,
+                DWRITE_MEASURING_MODE_NATURAL,
+                None,
+                0,
+            )
+        } {
+            Ok(layers) => layers,
+            Err(error) if error.code() == DWRITE_E_NOCOLOR => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bitmaps = Vec::new();
+        let mut extent: Option<RECT> = None;
+        while unsafe { layers.MoveNext()? }.as_bool() {
+            let current = unsafe { layers.GetCurrentRun()? };
+            if current.is_null() {
+                return Err(DirectWriteError::InvalidAnalysis("null color glyph layer"));
+            }
+            let layer = unsafe { &*current };
+            let analysis = unsafe {
+                self.factory.CreateGlyphRunAnalysis(
+                    &layer.glyphRun,
+                    None,
+                    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                    DWRITE_GRID_FIT_MODE_DEFAULT,
+                    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                    layer.baselineOriginX,
+                    layer.baselineOriginY,
+                )?
+            };
+            let bounds = unsafe { analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)? };
+            let width = (bounds.right - bounds.left).max(0) as usize;
+            let height = (bounds.bottom - bounds.top).max(0) as usize;
+            let count = width
+                .checked_mul(height)
+                .filter(|count| *count <= 16 * 1024 * 1024)
+                .ok_or(DirectWriteError::OffsetOverflow)?;
+            if count == 0 {
+                continue;
+            }
+            let mut coverage = vec![0; count];
+            unsafe {
+                analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut coverage)?;
+            }
+            extent = Some(match extent {
+                None => bounds,
+                Some(old) => RECT {
+                    left: old.left.min(bounds.left),
+                    top: old.top.min(bounds.top),
+                    right: old.right.max(bounds.right),
+                    bottom: old.bottom.max(bounds.bottom),
+                },
+            });
+            // 0xffff denotes the application's foreground. Color glyphs share
+            // a theme-independent atlas; their default foreground is black.
+            let color = if layer.paletteIndex == 0xffff {
+                [0.0, 0.0, 0.0, 1.0]
+            } else {
+                [
+                    layer.runColor.r,
+                    layer.runColor.g,
+                    layer.runColor.b,
+                    layer.runColor.a,
+                ]
+            };
+            bitmaps.push((bounds, coverage, color));
+        }
+        let Some(bounds) = extent else {
+            return Ok(None);
+        };
+        let width = (bounds.right - bounds.left) as u32;
+        let height = (bounds.bottom - bounds.top) as u32;
+        let bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| *n <= 64 * 1024 * 1024)
+            .ok_or(DirectWriteError::OffsetOverflow)?;
+        let mut rgba = vec![0_u8; bytes];
+        for (layer, coverage, color) in bitmaps {
+            let layer_width = (layer.right - layer.left) as usize;
+            for (index, coverage) in coverage.into_iter().enumerate() {
+                let x = (layer.left - bounds.left) as usize + index % layer_width;
+                let y = (layer.top - bounds.top) as usize + index / layer_width;
+                let offset = (y * width as usize + x) * 4;
+                let alpha = coverage as f32 / 255.0 * color[3].clamp(0.0, 1.0);
+                for channel in 0..4 {
+                    let source = if channel == 3 {
+                        alpha
+                    } else {
+                        color[channel].clamp(0.0, 1.0) * alpha
+                    };
+                    rgba[offset + channel] = (source * 255.0
+                        + rgba[offset + channel] as f32 * (1.0 - alpha))
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        Ok(Some((
+            GlyphBitmap::new_rgba(width, height, width * 4, rgba)?,
+            bounds,
+        )))
+    }
+
     fn face(&self, id: FontFaceId) -> Result<DirectWriteFace, DirectWriteError> {
         self.faces
             .with_entry(id, Clone::clone)?
@@ -849,6 +962,15 @@ impl GlyphRasterizer for DirectWriteGlyphRasterizer {
             isSideways: BOOL(0),
             bidiLevel: 0,
         };
+        let color = self.color_bitmap(&run);
+        if !matches!(color, Ok(None)) {
+            unsafe { ManuallyDrop::drop(&mut run.fontFace) };
+            let (bitmap, bounds) =
+                color?.ok_or(DirectWriteError::InvalidAnalysis("missing color bitmap"))?;
+            let metrics =
+                GlyphMetrics::new(bounds.left as f32, -(bounds.top as f32), physical_advance)?;
+            return Ok(RasterizedGlyph::new(key, metrics, bitmap));
+        }
         let analysis = unsafe {
             self.factory.CreateGlyphRunAnalysis(
                 &run,
@@ -996,5 +1118,56 @@ mod tests {
             paragraph_direction("123!?"),
             DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
         );
+    }
+
+    #[test]
+    fn native_color_emoji_retains_palette_and_scales_with_dpi() {
+        let shaper = DirectWriteShaper::new(FontRequest::new("Segoe UI", 24.0).expect("font"))
+            .expect("DirectWrite");
+        let rasterizer = shaper.rasterizer();
+        for text in ["😀", "👩‍💻", "👍🏽"] {
+            let range = TextRange::new(
+                yu_core::ByteOffset::ZERO,
+                yu_core::ByteOffset::new(text.len() as u64),
+            )
+            .expect("range");
+            let shaped = shaper.shape(text, range, TextStyle::Plain).expect("shape");
+            let mut colorful = 0;
+            for run in shaped.runs() {
+                for glyph in run.glyphs() {
+                    let key = GlyphRasterKey::new(run.face(), glyph.id(), 24.0).expect("key");
+                    let raster = rasterizer.rasterize(key).expect("raster");
+                    let bitmap = raster.bitmap();
+                    if bitmap.is_color() {
+                        assert!(
+                            bitmap
+                                .pixels()
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .any(|p| p[3] > 32 && (p[0] != p[1] || p[1] != p[2])),
+                            "palette missing: {text}"
+                        );
+                        assert!(
+                            bitmap
+                                .pixels()
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .all(|p| p[..3].iter().all(|c| *c <= p[3])),
+                            "not premultiplied"
+                        );
+                        let high = rasterizer
+                            .rasterize(key.with_raster_scale(2.0).expect("scale"))
+                            .expect("2x raster");
+                        assert!(high.bitmap().is_color());
+                        assert!(high.bitmap().width() >= bitmap.width() * 3 / 2);
+                        assert!(high.bitmap().height() >= bitmap.height() * 3 / 2);
+                        colorful += 1;
+                    }
+                }
+            }
+            assert!(colorful > 0, "No native color glyph for {text}");
+        }
     }
 }

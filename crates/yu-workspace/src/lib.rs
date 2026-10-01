@@ -2632,11 +2632,8 @@ fn layout_image_resolver<'a>(
         if let Some(publication) = images.iter().find(|image| {
             image.revision() == revision && image.key().fingerprint() == key.fingerprint()
         }) {
-            return ImageIntrinsicSize::new(
-                publication.image().width(),
-                publication.image().height(),
-            )
-            .ok();
+            let dimensions = publication.image().dimensions();
+            return ImageIntrinsicSize::new(dimensions.width(), dimensions.height()).ok();
         }
         let dimensions = intrinsics
             .iter()
@@ -5178,6 +5175,40 @@ mod tests {
         assert_eq!(metadata_image.bounds().width(), 200.0);
         assert_eq!(metadata_image.bounds().height(), 100.0);
         assert!(metadata_only.input().content_height() >= 100.0);
+    }
+
+    #[test]
+    fn thumbnail_pixels_do_not_change_intrinsic_layout_dimensions() {
+        let mut document = EditorDocument::new("![alt](image.png)");
+        let image = document
+            .block_decorations(0)
+            .expect("decorations")
+            .widgets()
+            .iter()
+            .find_map(|widget| match widget {
+                BlockWidget::Image(image) => Some(*image),
+                _ => None,
+            })
+            .expect("image");
+        let mut cache = yu_assets::ImageCache::new();
+        let publication = cache
+            .publish_decoded(
+                yu_assets::ImageRequest::new(document.revision(), image.source(), "image.png")
+                    .expect("request"),
+                document.revision(),
+                yu_assets::DecodedImage::new(20, 10, vec![255; 800])
+                    .expect("thumbnail")
+                    .with_intrinsic(yu_assets::ImageDimensions::new(800, 400).expect("intrinsic")),
+            )
+            .expect("publication");
+        let ready = [publication.clone()];
+        let metadata = [publication.intrinsic_publication()];
+        let pixels =
+            layout_image_resolver(&document, &ready, &[])(image).expect("ready dimensions");
+        let evicted =
+            layout_image_resolver(&document, &[], &metadata)(image).expect("retained dimensions");
+        assert_eq!((pixels.width(), pixels.height()), (800, 400));
+        assert_eq!(pixels, evicted);
     }
 
     /// 高亮真的画到了屏幕上——判据是**场景里的字形颜色**。

@@ -85,6 +85,7 @@ impl WindowMetrics {
 
 #[derive(Debug)]
 pub struct DocumentSlot {
+    identity: u64,
     session: DocumentEditorSession,
     untitled: bool,
 }
@@ -96,9 +97,19 @@ pub enum SaveAction {
 }
 
 impl DocumentSlot {
+    fn next_identity() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub const fn identity(&self) -> u64 {
+        self.identity
+    }
+
     #[must_use]
     pub fn new_untitled() -> Self {
         Self {
+            identity: Self::next_identity(),
             session: DocumentEditorSession::new(PathBuf::from(UNTITLED_PLACEHOLDER), ""),
             untitled: true,
         }
@@ -106,6 +117,7 @@ impl DocumentSlot {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         Ok(Self {
+            identity: Self::next_identity(),
             session: DocumentEditorSession::open(path)?,
             untitled: false,
         })

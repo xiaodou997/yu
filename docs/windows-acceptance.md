@@ -164,12 +164,14 @@ D3D first Present / resize render smoke 已通过，人工交互与 DPI 清单�
 ## 第四组：TSF / IME / 完整编辑输入链
 
 状态：**主体实现、Windows x64 原生构建与 TSF 初始化 smoke 已完成；2026-10-01
-用户确认微软拼音第一至第三轮通过，包括新版候选定位、选区替换、Unicode 邻接输入和搜索框 IME；完整 IME 与 DPI 人工验收
-仍未完成，暂不正式结项。**
+用户确认微软拼音及安排的五笔、日文、韩文基本项目正常，随后要求跳过缩放并进入
+下一阶段、由代理自行验证。已补齐模型输入、Unicode 保存重开及持续原生渲染自动验证，
+按本轮调整后的范围收口并进入第五组；原始全面 IME / DPI 人工矩阵仍保留未验收例外。**
 
 2026-10-01 真机验收计划见 [Windows 第四组真机验收计划](windows-group4-manual-acceptance.md)。
-本轮已确认使用 Windows 11 x64 本机键鼠、单显示器；先覆盖真实 IME 与单屏
-100% / 125% / 150% DPI，跨显示器不同 DPI 迁移仍需补测。计划不构成通过记录。
+本轮已确认使用 Windows 11 x64 本机键鼠、单显示器，当前实测为 200%。
+100% / 125% / 150% 实际缩放按用户要求跳过，跨显示器不同 DPI 迁移仍需补测。
+原始计划不构成通过记录。
 
 同日原生预检发现 DirectWrite RTL shaping 测试失败、窗口 self-check 退出 1；
 详细结果见 [Windows 原生预检记录](windows-group4-preflight-20261001.md)。
@@ -189,9 +191,13 @@ D3D first Present / resize render smoke 已通过，人工交互与 DPI 清单�
 实际切换，未执行项按 NOT_RUN 记录并注明用户选择，不能视为 DPI 全面通过。
 用户随后报告安排的微软五笔、日文与韩文基本输入、转换/组合、候选、取消及 Undo/Redo 正常；
 结果按用户反馈记录，逐种模式/键序及完整 C01–C08 明细未另行采集。
-下一项是保存重开、Unicode 剪贴板、键鼠选择和连续编辑稳定性收尾。
-完整 IME 边界明细未逐项采集，实际 DPI 项按上述用户选择保留未验证例外；
-第四组等待本轮收尾结果，保持未正式结项。
+用户随后要求直接进入下一阶段并自行验证。本轮使用真实 HWND / D3D 自动补测了
+20 次模型 composition 提交、20 次取消、Undo/Redo、中文/空格/emoji 路径保存重开，
+以及 600 秒、2,894 帧连续滚动渲染，全部通过。
+这些是共享编辑模型与原生渲染的集成证据，不是微软 IME 实际键盘操作证据；
+Yu 与记事本互拷、物理关闭对话框三分支及最后一轮完整人工操作未补采集。
+按用户调整后的范围继续第五组，不再以等待人工回复阻塞推进，也不宣布原始全面矩阵通过。
+自动补测详见 [第五组原生验收记录](windows-group5-native-acceptance-20261001.md)。
 
 本组让第三组的 D3D editor surface 从“可显示”进入“可编辑”：Windows 只负责
 把 TSF、键鼠、剪贴板与屏幕几何翻译到共享 Rust 编辑模型，不建立 RichEdit、
@@ -263,3 +269,35 @@ TextBox 或第二份平台私有正文。
   第五组。
 - UI Automation / Narrator / Contrast Theme：第六组。
 - MSIX、Store metadata、最终 exe icon/resource、签名与发布收尾：第七组。
+
+## 第五组：图片 / 公式 / Mermaid / GPU 资源与彩色 emoji
+
+状态：**2026-10-01 Windows x64 产品资源链已实现，本机原生自动验收通过；
+当前 200% 可见窗口已检查。完整图片格式、全部彩色字体格式、实际跨 DPI 和真实驱动
+重置兼容性不包含在本次通过声明中。**
+
+Windows 壳通过有界后台任务加载本地图片，复用共享资源缓存和现有原生公式 / Mermaid
+helper；SVG 栅格化后与图片一起进入已有 D3D texture 路径。资源布局、caret 与输入
+继续使用共享 Rust 文档布局，加载与失败回退均不修改 canonical Markdown。
+DirectWrite COLR 调色板字形进入共享 RGBA atlas，本机 Segoe UI Emoji 的表情、
+ZWJ 与肤色样本已验证彩色呈现。
+
+本轮同时修复普通图片资源类型减法下溢、旧 flip swapchain 未释放导致重建失败、
+切换文档后新 revision 被旧 frame gate 拒绝，以及缩略图改变原始布局尺寸的问题。
+GPU 恢复验证读取实际渲染目标，并要求重建前后像素完全一致。
+
+| 已执行验证 | 实际结果 |
+| --- | --- |
+| 原生 DirectWrite / D3D / shell 测试 | 20 / 4 / 21 项通过；另显式执行 1 项真实资源集成测试通过 |
+| 完整共享 editor / workspace / assets / render / storage 回归 | 777 项通过、0 失败；1 项既有 ignored 用例未执行 |
+| 持续原生资源渲染 | 600 秒、2,894 帧通过；含 20 次模型提交、20 次取消及 Unicode 保存重开 |
+| 实际 GPU 读回、重建、资源重新上传 | 透明 SVG 有效彩色像素及重建前后像素一致性通过 |
+| 丢失图片、非法公式 / Mermaid、缺失 helper、过期回包 | 保留源文、失败后稳定回退及旧 revision 隔离通过 |
+| 可见本机窗口 | PNG、透明 SVG、行内 / 独立公式、中文 Mermaid、彩色 emoji 检查通过，192 DPI |
+| 原生构建与最终窗口 smoke | helper / GUI 构建、check、真实 HWND / Present / clean close 通过 |
+| 质量门禁 | all-targets clippy -D warnings、fmt、diff check 通过；PowerShell 按既有依赖策略核对 27 包 / 114 内部边 |
+
+运行包须同时包含 `yu-shell-windows.exe` 与 `yu-document-renderer.exe`。
+完整证据、复现命令、资源限制和剩余兼容性范围见
+[第五组原生验收记录](windows-group5-native-acceptance-20261001.md)。
+下一阶段为第六组 UI Automation / Narrator / Contrast Theme；签名与发布包装仍为第七组。

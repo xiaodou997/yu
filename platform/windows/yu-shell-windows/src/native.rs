@@ -84,6 +84,7 @@ use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
 use crate::chrome::{
     Chrome, ID_FILES, ID_OUTLINE, ID_QUERY, ID_ROWS, ID_SEARCH, PanelAction, sidebar_width,
 };
+use crate::resources::ResourceHost;
 use crate::text_input::{
     AcpProjection, AcpRange, AcpSelection, canonical_acp_range_to_source, local_selection_utf16,
     replace_local_utf16, selection_from_acp,
@@ -105,6 +106,7 @@ const ID_VIEW_SIDEBAR: u16 = 1201;
 const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
 const DRAG_SCROLL_TIMER_ID: usize = 1;
+const RESOURCE_TIMER_ID: usize = 2;
 const DRAG_SCROLL_TIMER_MS: u32 = 30;
 const TRIPLE_CLICK_WINDOW: Duration = Duration::from_millis(600);
 const TRIPLE_CLICK_RADIUS_PX: i32 = 8;
@@ -206,6 +208,8 @@ struct RenderHost {
     builder: ViewportFrameBuilder<DirectWriteShaper>,
     renderer: D3DRenderer,
     layout: Option<Arc<LayoutSnapshot>>,
+    resources: Option<ResourceHost>,
+    document_identity: Option<u64>,
 }
 
 impl RenderHost {
@@ -226,6 +230,8 @@ impl RenderHost {
             builder,
             renderer,
             layout: None,
+            resources: None,
+            document_identity: None,
         })
     }
 
@@ -244,10 +250,21 @@ impl RenderHost {
         let max_scroll = (content_height - surface.logical_height() as f32).max(0.0);
         let scroll_y = old_viewport.scroll_y().min(max_scroll);
         if (surface.scale() - self.renderer.surface().scale()).abs() > f64::EPSILON {
-            *self = Self::new(surface_hwnd, appearance)?;
-            self.builder
-                .update_config(viewport_render_config(surface, appearance, scroll_y)?)
+            self.renderer
+                .resize(surface)
                 .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let font = FontRequest::new("Segoe UI", BODY_FONT_SIZE)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let shaper = DirectWriteShaper::new(font)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.builder = ViewportFrameBuilder::with_shaper(
+                shaper,
+                viewport_render_config(surface, appearance, scroll_y)?,
+                GlyphAtlasConfig::default(),
+            )
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.layout = None;
+            self.resources = None;
             return Ok(());
         }
         self.renderer
@@ -296,6 +313,50 @@ impl RenderHost {
             session.set_viewport_config(viewport_config)?;
         }
         let revision = state.document().session().revision();
+        let identity = state.document().identity();
+        let path = state.document().session().path().to_path_buf();
+        let appearance = self.builder.config().appearance();
+        if self.document_identity.is_some_and(|old| old != identity) {
+            self.renderer.reset_document();
+            self.builder
+                .reset_document()
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.layout = None;
+            self.builder
+                .update_config(viewport_render_config(
+                    self.renderer.surface(),
+                    appearance,
+                    0.0,
+                )?)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+        }
+        self.document_identity = Some(identity);
+        if self.resources.as_ref().is_none_or(|resources| {
+            resources.identity != identity
+                || resources.path != path
+                || resources.appearance != appearance
+        }) {
+            self.resources = Some(ResourceHost::new(
+                identity,
+                path,
+                appearance,
+                self.builder.config().raster_scale(),
+            )?);
+        }
+        let resources = self
+            .resources
+            .as_mut()
+            .ok_or_else(|| ShellError::Platform("Missing resource host".into()))?;
+        let (images, intrinsics) = resources.prepare(
+            state
+                .document_mut()
+                .session_mut()
+                .document_mut()
+                .editor_mut(),
+            &self.builder,
+        )?;
+        self.builder
+            .set_embedded_publications(resources.embedded_publications());
         let snapshot = state
             .document()
             .session()
@@ -305,7 +366,7 @@ impl RenderHost {
         let mut layout = snapshot.into_layout_context();
         let publication = self
             .builder
-            .publish(&mut layout)
+            .publish_with_images_and_intrinsics(&mut layout, &images, &intrinsics)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         self.layout = Some(publication.layout_snapshot());
         if !state
@@ -320,15 +381,26 @@ impl RenderHost {
             ));
         }
 
-        match self.renderer.render_viewport_frame(
-            revision,
-            publication.frame(),
-            self.builder.atlas(),
-        ) {
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!("yu-windows-resources stats={:?}", resources.diagnostics());
+        }
+        let presented = resources
+            .upload(&mut self.renderer, &images)
+            .and_then(|()| {
+                self.renderer.render_viewport_frame(
+                    revision,
+                    publication.frame(),
+                    self.builder.atlas(),
+                )
+            });
+        match presented {
             Ok(()) => Ok(()),
             Err(D3DRenderError::DeviceLost) => {
-                let surface = self.renderer.surface();
-                self.renderer = D3DRenderer::new(self.surface_hwnd, surface)
+                self.renderer
+                    .recreate(self.surface_hwnd)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                resources
+                    .upload(&mut self.renderer, &images)
                     .map_err(|error| ShellError::Platform(error.to_string()))?;
                 self.renderer
                     .render_viewport_frame(revision, publication.frame(), self.builder.atlas())
@@ -409,6 +481,17 @@ impl AppWindow {
         };
         render.sync_surface(self.surface, self.state.appearance())?;
         let result = render.render(&mut self.state);
+        unsafe {
+            if render
+                .resources
+                .as_ref()
+                .is_some_and(ResourceHost::has_work)
+            {
+                SetTimer(self.hwnd, RESOURCE_TIMER_ID, 50, None);
+            } else {
+                let _ = KillTimer(self.hwnd, RESOURCE_TIMER_ID);
+            }
+        }
         self.render = Some(render);
         result
     }
@@ -2036,6 +2119,23 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
+            WM_TIMER if wparam.0 == RESOURCE_TIMER_ID => {
+                let revision = app.state.document().session().revision();
+                let changed = app
+                    .render
+                    .as_mut()
+                    .and_then(|render| render.resources.as_mut())
+                    .is_some_and(|resources| resources.advance(revision));
+                if changed && let Err(error) = app.render_current() {
+                    unsafe {
+                        let _ = KillTimer(hwnd, RESOURCE_TIMER_ID);
+                    }
+                    show_error(hwnd, &app.state, &error);
+                } else if changed && let Some(tsf) = app.tsf.as_ref() {
+                    tsf.notify_layout_change();
+                }
+                return LRESULT(0);
+            }
             WM_CLOSE => {
                 match app.confirm_replace_current() {
                     Ok(true) => unsafe {
@@ -2555,6 +2655,326 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
     use yu_scene::{EditorDecorationPrimitiveRole, Primitive};
+
+    fn settle_resources(render: &mut RenderHost, state: &mut ShellState) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            render.render(state).expect("native resource Present");
+            if !render
+                .resources
+                .as_ref()
+                .is_some_and(ResourceHost::has_work)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "resource deadline exceeded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the companion helper; run-self-checks.ps1 builds and runs it"]
+    fn native_group5_resources_present_recover_and_preserve_source() {
+        let _com = ComApartment::initialize().expect("COM");
+        let window = Window(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Yu resources regression"),
+                WS_POPUP,
+                0,
+                0,
+                1000,
+                1600,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("native surface")
+        });
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Fixtures/group5-resources.md");
+        let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/debug/yu-document-renderer.exe");
+        assert!(helper.is_file(), "build yu-document-renderer first");
+        let mut state = ShellState::from_path(Locale::English, &fixture).expect("fixture");
+        let source = state.document().session().snapshot().as_str().to_owned();
+        let revision = state.document().session().revision();
+        let mut render = RenderHost::new(window.0, Appearance::Light).expect("D3D");
+        render.resources = Some(
+            ResourceHost::with_helper(
+                state.document().identity(),
+                fixture.clone(),
+                Appearance::Light,
+                render.builder.config().raster_scale(),
+                helper.clone(),
+            )
+            .expect("resource worker"),
+        );
+        settle_resources(&mut render, &mut state);
+        let frame = render.builder.last_publication().expect("frame").frame();
+        assert_eq!(
+            frame
+                .plan()
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, yu_render::RenderCommand::Image { .. }))
+                .count(),
+            2
+        );
+        let embedded = frame.plan().embedded_resources();
+        assert_eq!(
+            embedded
+                .iter()
+                .filter(|resource| resource.kind() == 0)
+                .count(),
+            2,
+            "inline and display formula"
+        );
+        assert_eq!(
+            embedded
+                .iter()
+                .filter(|resource| resource.kind() == 1)
+                .count(),
+            1,
+            "Mermaid"
+        );
+        assert_eq!(state.document().session().revision(), revision);
+        assert_eq!(state.document().session().snapshot().as_str(), source);
+        assert!(!state.document().session().is_dirty());
+
+        let svg_key = yu_assets::ImageKey::new("assets/group5-transparency.svg")
+            .expect("image key")
+            .fingerprint();
+        let svg_bounds = frame
+            .plan()
+            .commands()
+            .iter()
+            .find_map(|command| match command {
+                yu_render::RenderCommand::Image {
+                    resource, bounds, ..
+                } if *resource == svg_key => Some(*bounds),
+                _ => None,
+            })
+            .expect("SVG command");
+        render.renderer.request_frame_capture();
+        render.render(&mut state).expect("captured Present");
+        let capture = render.renderer.take_captured_frame().expect("GPU readback");
+        let scale = render.renderer.surface().scale() as f32;
+        let left = (svg_bounds.x() * scale) as u32;
+        let top = (svg_bounds.y() * scale) as u32;
+        let mut colored = 0;
+        for y in top..(top + (svg_bounds.height() * scale) as u32).min(capture.height()) {
+            for x in left..(left + (svg_bounds.width() * scale) as u32).min(capture.width()) {
+                let offset = (y * capture.width() + x) as usize * 4;
+                let pixel = &capture.pixels()[offset..offset + 4];
+                colored += usize::from(u16::from(pixel[0]) > u16::from(pixel[1]) + 40);
+            }
+        }
+        assert!(
+            colored > 200,
+            "SVG texture did not reach the D3D target: {colored}"
+        );
+        let surface = render.renderer.surface();
+        render.renderer.recreate(window.0).expect("recreate device");
+        settle_resources(&mut render, &mut state);
+        render.renderer.request_frame_capture();
+        render
+            .render(&mut state)
+            .expect("captured recovered Present");
+        let recovered = render
+            .renderer
+            .take_captured_frame()
+            .expect("recovered GPU frame");
+        assert!(
+            recovered.pixels() == capture.pixels(),
+            "resource recovery changed actual GPU pixels"
+        );
+
+        for cycle in 0..20 {
+            state
+                .document_mut()
+                .session_mut()
+                .execute(EditorCommand::MoveDocumentBoundary {
+                    end: true,
+                    extend: false,
+                })
+                .expect("end");
+            let before = state.document().session().snapshot().as_str().to_owned();
+            let end = ByteOffset::new(before.len() as u64);
+            let preedit_selection = Utf16Range::empty(Utf16Offset::new(5));
+            state
+                .document_mut()
+                .session_mut()
+                .begin_composition(TextRange::empty(end), "ceshi", preedit_selection)
+                .expect("composition");
+            render.render(&mut state).expect("preedit Present");
+            assert_eq!(state.document().session().snapshot().as_str(), before);
+            assert!(state.document_mut().session_mut().cancel_composition());
+            assert_eq!(state.document().session().snapshot().as_str(), before);
+            state
+                .document_mut()
+                .session_mut()
+                .begin_composition(TextRange::empty(end), "ceshi", preedit_selection)
+                .expect("composition");
+            state
+                .document_mut()
+                .session_mut()
+                .commit_composition(format!(" 中文😀{cycle}"))
+                .expect("commit");
+            render
+                .render(&mut state)
+                .expect("render during revision changes");
+            state
+                .document_mut()
+                .session_mut()
+                .execute(EditorCommand::Undo)
+                .expect("undo");
+            state
+                .document_mut()
+                .session_mut()
+                .execute(EditorCommand::Redo)
+                .expect("redo");
+        }
+        settle_resources(&mut render, &mut state);
+        assert!(
+            state
+                .document()
+                .session()
+                .snapshot()
+                .as_str()
+                .contains("中文😀19")
+        );
+
+        if let Some(seconds) = std::env::var("YU_GROUP5_SOAK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| (1..=600).contains(seconds))
+        {
+            let started = Instant::now();
+            let mut frames = 0;
+            let stable_source = state.document().session().snapshot().as_str().to_owned();
+            while started.elapsed().as_secs() < seconds {
+                render
+                    .scroll_by(if frames % 2 == 0 { 64.0 } else { -64.0 })
+                    .expect("soak scroll");
+                settle_resources(&mut render, &mut state);
+                assert_eq!(
+                    state.document().session().snapshot().as_str(),
+                    stable_source
+                );
+                frames += 1;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            render.scroll_by(-f32::MAX).expect("restore viewport");
+            settle_resources(&mut render, &mut state);
+            println!(
+                "yu-group5-soak seconds={:.2} frames={frames} commit=20 cancel=20",
+                started.elapsed().as_secs_f64()
+            );
+        }
+
+        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../artifacts/windows-group5/20261001")
+            .join(format!(
+                "roundtrip-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_millis()
+            ));
+        std::fs::create_dir_all(&output).expect("roundtrip directory");
+        let saved = output.join("保存 重开 😀.md");
+        state
+            .document_mut()
+            .save_as(&saved, false)
+            .expect("Unicode Save As");
+        let saved_source = state.document().session().snapshot().as_str().to_owned();
+        assert!(!state.document().session().is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(&saved).expect("saved UTF-8"),
+            saved_source
+        );
+        let old_identity = state.document().identity();
+        state.open_document(&saved).expect("reopen");
+        assert_ne!(state.document().identity(), old_identity);
+        assert_eq!(state.document().session().snapshot().as_str(), saved_source);
+        assert!(saved_source.contains("中文😀19") && saved_source.contains("\\frac{1}{2}"));
+        render.resources = Some(
+            ResourceHost::with_helper(
+                state.document().identity(),
+                saved.clone(),
+                Appearance::Light,
+                render.builder.config().raster_scale(),
+                helper.clone(),
+            )
+            .expect("reopened resources"),
+        );
+        settle_resources(&mut render, &mut state);
+        println!(
+            "yu-group5-roundtrip path={} source_bytes={} cycles=20 commit=20 cancel=20",
+            saved.display(),
+            saved_source.len()
+        );
+        state.set_appearance(Appearance::Dark);
+        render
+            .builder
+            .update_config(
+                viewport_render_config(surface, Appearance::Dark, 0.0).expect("dark config"),
+            )
+            .expect("config");
+        render.resources = Some(
+            ResourceHost::with_helper(
+                state.document().identity(),
+                saved,
+                Appearance::Dark,
+                render.builder.config().raster_scale(),
+                helper,
+            )
+            .expect("dark resources"),
+        );
+        settle_resources(&mut render, &mut state);
+        assert_eq!(
+            render
+                .builder
+                .last_publication()
+                .expect("dark frame")
+                .frame()
+                .plan()
+                .embedded_resources()
+                .len(),
+            3
+        );
+
+        let bad = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Fixtures/group5-errors.md");
+        state.open_document(&bad).expect("error fixture");
+        let original = state.document().session().snapshot().as_str().to_owned();
+        render.resources = Some(
+            ResourceHost::with_helper(
+                state.document().identity(),
+                bad,
+                Appearance::Dark,
+                render.builder.config().raster_scale(),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../target/debug/yu-document-renderer.exe"),
+            )
+            .expect("error resources"),
+        );
+        settle_resources(&mut render, &mut state);
+        let diagnostics = render.resources.as_ref().expect("resources").diagnostics();
+        assert_eq!(
+            diagnostics.3, 3,
+            "missing image, invalid math, invalid Mermaid"
+        );
+        for _ in 0..5 {
+            render.render(&mut state).expect("stable error source");
+        }
+        assert!(!render.resources.as_ref().expect("resources").has_work());
+        assert_eq!(state.document().session().snapshot().as_str(), original);
+        assert!(!state.document().session().is_dirty());
+    }
 
     struct Window(HWND);
 

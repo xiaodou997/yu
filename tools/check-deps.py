@@ -132,10 +132,13 @@ ALLOWED: dict[str, set[str]] = {
     # Windows 产品壳直接持有统一 DocumentEditorSession；第三组再向下接平台字体
     # 与 D3D 后端，不复制 Mac 壳的 C ABI 搬运层。
     "yu-shell-windows": {
+        "yu-assets",
         "yu-core",
+        "yu-embedded-client",
         "yu-editor",
         "yu-font",
         "yu-font-windows",
+        "yu-markdown",
         "yu-render",
         "yu-render-windows",
         "yu-scene",

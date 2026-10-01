@@ -177,6 +177,23 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         self.embedded_publications = publications;
     }
 
+    /// A replacement editor session owns a new revision sequence. Keep native
+    /// faces and glyph pixels, but discard the previous document's frame gate
+    /// and resource-delta identities.
+    pub fn reset_document(&mut self) -> Result<(), BuildError<S>> {
+        let serial = self
+            .publisher
+            .last_publication()
+            .map_or(0, |publication| publication.serial());
+        self.publisher = ViewportFramePublisher::with_next_serial(serial);
+        self.render_plans = RenderPlanBuilder::new();
+        self.render_plans
+            .set_raster_scale(self.config.raster_scale())
+            .map_err(|_| ViewportFrameBuildError::InvalidConfig("invalid raster scale"))?;
+        self.embedded_publications.clear();
+        Ok(())
+    }
+
     /// 准备并发布当前文档的视口。
     pub fn publish(
         &mut self,
@@ -363,8 +380,24 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         &self,
         document: &mut LayoutContext,
     ) -> Result<Vec<(usize, ImageRequestPriority)>, EditorDocumentError> {
-        let snapshot = document
-            .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
+        self.viewport_image_blocks_with_images_and_intrinsics(document, &[], &[])
+    }
+
+    /// Discover resources using the same intrinsic dimensions as publication.
+    /// CPU pixel eviction must not temporarily replace ready image geometry
+    /// with placeholder geometry while selecting the next viewport's jobs.
+    pub fn viewport_image_blocks_with_images_and_intrinsics(
+        &self,
+        document: &mut LayoutContext,
+        images: &[ImagePublication],
+        intrinsics: &[ImageIntrinsicPublication],
+    ) -> Result<Vec<(usize, ImageRequestPriority)>, EditorDocumentError> {
+        let resolver = crate::layout_image_resolver(document, images, intrinsics);
+        let snapshot = document.visible_blocks_with_visual_state_and_shaper_and_image_resolver(
+            self.config.viewport(),
+            &self.shaper,
+            resolver,
+        )?;
         let viewport = self.config.viewport();
         let visible_top = viewport.scroll_y();
         let visible_bottom = visible_top + viewport.height();
