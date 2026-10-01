@@ -49,6 +49,10 @@ pub enum EditorCommand {
         end: bool,
         extend: bool,
     },
+    MoveLineBoundary {
+        end: bool,
+        extend: bool,
+    },
     MoveUp,
     MoveDown,
     MoveUpExtend,
@@ -200,6 +204,11 @@ impl EditorCommand {
     #[must_use]
     pub const fn move_down_extend() -> Self {
         Self::MoveDownExtend
+    }
+
+    #[must_use]
+    pub const fn move_line_boundary(end: bool, extend: bool) -> Self {
+        Self::MoveLineBoundary { end, extend }
     }
 
     #[must_use]

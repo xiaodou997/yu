@@ -5,9 +5,11 @@ use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
 
 use windows::Win32::Foundation::{
-    BOOL, ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    BOOL, ERROR_SUCCESS, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
 };
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
 use windows::Win32::Graphics::Dwm::{
@@ -15,37 +17,57 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, EndPaint, GetSysColorBrush, PAINTSTRUCT,
+    BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetSysColorBrush, PAINTSTRUCT,
+    ScreenToClient,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, CoUninitialize,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
+    VK_UP,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FileOpenDialog,
     FileSaveDialog, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
 };
+use windows::Win32::UI::TextServices::TS_TEXTCHANGE;
 use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyAcceleratorTable, DestroyWindow, DispatchMessageW, FCONTROL, FSHIFT, FVIRTKEY,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU,
-    IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE,
-    WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
+    DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
+    DestroyWindow, DispatchMessageW, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA, GetClientRect,
+    GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, IDC_ARROW, LoadCursorW, MB_ICONERROR,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
-use yu_editor::{EditorCommand, ViewportSpan};
+use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
+use yu_editor::{
+    Bias, EditorCommand, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
+    LayoutPoint, LayoutSnapshot, ViewportSpan,
+};
 use yu_font::{FontRequest, GlyphAtlasConfig};
 use yu_font_windows::DirectWriteShaper;
 use yu_render::SurfaceConfig;
@@ -54,6 +76,11 @@ use yu_scene::Rect;
 use yu_storage::{ClosePrompt, CloseRequest, CloseTransition};
 use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
 
+use crate::text_input::{
+    AcpProjection, AcpRange, AcpSelection, canonical_acp_range_to_source, local_selection_utf16,
+    replace_local_utf16, selection_from_acp,
+};
+use crate::tsf::{TsfHost, WM_APP_TSF_LOCK};
 use crate::{DocumentSlot, Locale, SaveAction, ShellError, ShellState, SidebarMode, WindowMetrics};
 
 const MAIN_CLASS: PCWSTR = w!("YuEditorWindow");
@@ -71,6 +98,7 @@ const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
 
 const CANCELLED_HRESULT: i32 = 0x8007_04c7_u32 as i32;
+const CF_UNICODETEXT_FORMAT: u32 = 13;
 
 struct ComApartment;
 
@@ -91,10 +119,81 @@ impl Drop for ComApartment {
     }
 }
 
+struct ClipboardGuard;
+
+impl ClipboardGuard {
+    fn open(owner: HWND) -> Result<Self, ShellError> {
+        unsafe { OpenClipboard(owner) }.map_err(platform_error)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+fn write_unicode_clipboard(owner: HWND, text: &str) -> Result<(), ShellError> {
+    let _guard = ClipboardGuard::open(owner)?;
+    unsafe { EmptyClipboard() }.map_err(platform_error)?;
+    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = units
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| ShellError::Platform("clipboard text is too large".to_owned()))?;
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }.map_err(platform_error)?;
+    let pointer = unsafe { GlobalLock(memory) };
+    if pointer.is_null() {
+        unsafe {
+            let _ = GlobalFree(memory);
+        }
+        return Err(platform_error(WindowsError::from_win32()));
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(units.as_ptr(), pointer.cast::<u16>(), units.len());
+        let _ = GlobalUnlock(memory);
+    }
+    match unsafe { SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(memory.0)) } {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            unsafe {
+                let _ = GlobalFree(memory);
+            }
+            Err(platform_error(error))
+        }
+    }
+}
+
+fn read_unicode_clipboard(owner: HWND) -> Result<String, ShellError> {
+    let _guard = ClipboardGuard::open(owner)?;
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT_FORMAT) }.map_err(platform_error)?;
+    let memory = HGLOBAL(handle.0);
+    let pointer = unsafe { GlobalLock(memory) };
+    if pointer.is_null() {
+        return Err(platform_error(WindowsError::from_win32()));
+    }
+    let units = unsafe { GlobalSize(memory) } / size_of::<u16>();
+    let source = unsafe { std::slice::from_raw_parts(pointer.cast::<u16>(), units) };
+    let end = source
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(source.len());
+    let text =
+        String::from_utf16(&source[..end]).map_err(|error| ShellError::Platform(error.to_string()));
+    unsafe {
+        let _ = GlobalUnlock(memory);
+    }
+    text
+}
+
 struct RenderHost {
     surface_hwnd: HWND,
     builder: ViewportFrameBuilder<DirectWriteShaper>,
     renderer: D3DRenderer,
+    layout: Option<Arc<LayoutSnapshot>>,
 }
 
 impl RenderHost {
@@ -114,6 +213,7 @@ impl RenderHost {
             surface_hwnd,
             builder,
             renderer,
+            layout: None,
         })
     }
 
@@ -149,6 +249,7 @@ impl RenderHost {
             .builder
             .publish(&mut layout)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.layout = Some(publication.layout_snapshot());
 
         match self.renderer.render_viewport_frame(
             revision,
@@ -169,13 +270,16 @@ impl RenderHost {
     }
 }
 
-struct AppWindow {
+pub(crate) struct AppWindow {
     hwnd: HWND,
     sidebar: HWND,
     surface: HWND,
     status: HWND,
     state: ShellState,
     render: Option<RenderHost>,
+    tsf: Option<TsfHost>,
+    drag_anchor: Option<ByteOffset>,
+    pending_high_surrogate: Option<u16>,
 }
 
 impl AppWindow {
@@ -187,6 +291,9 @@ impl AppWindow {
             status: HWND::default(),
             state,
             render: None,
+            tsf: None,
+            drag_anchor: None,
+            pending_high_surrogate: None,
         }
     }
 
@@ -199,6 +306,14 @@ impl AppWindow {
         self.update_layout();
         self.render = Some(RenderHost::new(self.surface, self.state.appearance())?);
         self.render_current()?;
+        let app = self as *mut Self;
+        self.tsf = Some(
+            TsfHost::new(app, self.surface)
+                .map_err(|error| ShellError::Platform(error.to_string()))?,
+        );
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
         Ok(())
     }
 
@@ -210,6 +325,664 @@ impl AppWindow {
         let result = render.render(&mut self.state);
         self.render = Some(render);
         result
+    }
+
+    pub(crate) fn input_projection(&self) -> Result<AcpProjection, ShellError> {
+        let session = self.state.document().session();
+        let snapshot = session.snapshot();
+        AcpProjection::new(&snapshot, session.selection(), session.composition())
+            .map_err(|error| ShellError::Platform(error.to_string()))
+    }
+
+    pub(crate) fn input_set_selection(
+        &mut self,
+        selection: AcpSelection,
+    ) -> Result<(), ShellError> {
+        let projection = self.input_projection()?;
+        if projection.composition().is_some() {
+            let local = projection
+                .composition_local_range(selection.range)
+                .map_err(|error| ShellError::Platform(error.to_string()))?
+                .ok_or_else(|| {
+                    ShellError::Platform(
+                        "TSF selection escaped the active composition range".to_owned(),
+                    )
+                })?;
+            let text = self
+                .state
+                .document()
+                .session()
+                .composition()
+                .map(|overlay| overlay.text().to_owned())
+                .ok_or_else(|| ShellError::Platform("composition disappeared".to_owned()))?;
+            let utf16 = local_selection_utf16(&text, local)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.state
+                .document_mut()
+                .session_mut()
+                .update_composition(text, utf16)?;
+        } else {
+            let snapshot = self.state.document().session().snapshot();
+            let selection = selection_from_acp(&snapshot, selection)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.state
+                .document_mut()
+                .session_mut()
+                .set_selection(selection)?;
+        }
+        self.render_current()
+    }
+
+    pub(crate) fn input_replace(
+        &mut self,
+        range: AcpRange,
+        text: &str,
+        composing: bool,
+    ) -> Result<TS_TEXTCHANGE, ShellError> {
+        let inserted = i32::try_from(text.encode_utf16().count())
+            .map_err(|_| ShellError::Platform("TSF inserted text exceeds ACP range".to_owned()))?;
+        let change = TS_TEXTCHANGE {
+            acpStart: range.start(),
+            acpOldEnd: range.end(),
+            acpNewEnd: range
+                .start()
+                .checked_add(inserted)
+                .ok_or_else(|| ShellError::Platform("TSF ACP overflow".to_owned()))?,
+        };
+
+        let projection = self.input_projection()?;
+        if composing {
+            if projection.composition().is_some() {
+                let local = projection
+                    .composition_local_range(range)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?
+                    .ok_or_else(|| {
+                        ShellError::Platform(
+                            "TSF edit escaped the active composition range".to_owned(),
+                        )
+                    })?;
+                let old = self
+                    .state
+                    .document()
+                    .session()
+                    .composition()
+                    .map(|overlay| overlay.text().to_owned())
+                    .ok_or_else(|| ShellError::Platform("composition disappeared".to_owned()))?;
+                let (updated, selection) = replace_local_utf16(&old, local, text)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                self.state
+                    .document_mut()
+                    .session_mut()
+                    .update_composition(updated, selection)?;
+            } else {
+                let snapshot = self.state.document().session().snapshot();
+                let source = canonical_acp_range_to_source(&snapshot, range)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                let caret = u64::try_from(inserted)
+                    .map_err(|_| ShellError::Platform("negative ACP insertion".to_owned()))?;
+                let selection = Utf16Range::new(Utf16Offset::new(caret), Utf16Offset::new(caret))
+                    .ok_or_else(|| {
+                    ShellError::Platform("invalid preedit selection".to_owned())
+                })?;
+                self.state.document_mut().session_mut().begin_composition(
+                    source,
+                    text.to_owned(),
+                    selection,
+                )?;
+            }
+        } else {
+            if self.state.document().session().composition().is_some() {
+                return Err(ShellError::Platform(
+                    "permanent TSF edit arrived while composition is active".to_owned(),
+                ));
+            }
+            let snapshot = self.state.document().session().snapshot();
+            let source = canonical_acp_range_to_source(&snapshot, range)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let selection = EditorSelection::range(
+                &snapshot,
+                source.start(),
+                source.end(),
+                CaretAffinity::Downstream,
+            )
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.state
+                .document_mut()
+                .session_mut()
+                .set_selection(selection)?;
+            self.state
+                .document_mut()
+                .session_mut()
+                .execute(EditorCommand::InsertText(Arc::from(text)))?;
+            self.refresh_chrome();
+        }
+        self.render_current()?;
+        Ok(change)
+    }
+
+    pub(crate) fn input_end_composition(&mut self) -> Result<(), ShellError> {
+        let Some(text) = self
+            .state
+            .document()
+            .session()
+            .composition()
+            .map(|overlay| overlay.text().to_owned())
+        else {
+            return Ok(());
+        };
+        self.state
+            .document_mut()
+            .session_mut()
+            .commit_composition(text)?;
+        self.refresh_chrome();
+        self.render_current()
+    }
+
+    fn input_layout(&self) -> Result<&LayoutSnapshot, ShellError> {
+        self.render
+            .as_ref()
+            .and_then(|render| render.layout.as_deref())
+            .ok_or_else(|| ShellError::Platform("Windows input layout is unavailable".to_owned()))
+    }
+
+    fn surface_document_point(&self, mut point: POINT) -> Result<LayoutPoint, ShellError> {
+        if !unsafe { ScreenToClient(self.surface, &mut point) }.as_bool() {
+            return Err(platform_error(WindowsError::from_win32()));
+        }
+        let surface = native_surface_config(self.surface)?;
+        let viewport = self
+            .render
+            .as_ref()
+            .map(|render| render.builder.config().viewport())
+            .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?;
+        Ok(LayoutPoint::new(
+            point.x as f32 / surface.scale() as f32,
+            point.y as f32 / surface.scale() as f32 + viewport.scroll_y(),
+        ))
+    }
+
+    pub(crate) fn input_acp_from_screen(&mut self, point: POINT) -> Result<i32, ShellError> {
+        let point = self.surface_document_point(point)?;
+        let hit = self
+            .input_layout()?
+            .hit_test(point)
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .map(|(block, hit)| {
+                (
+                    hit.source(),
+                    hit.visual(),
+                    block.layout().visual().composition_visual(),
+                )
+            });
+        if let Some((_, visual, Some(composition_visual))) = hit {
+            let projection = self.input_projection()?;
+            if let Some(composition) = projection.composition()
+                && visual >= composition_visual.start()
+                && visual <= composition_visual.end()
+            {
+                let local_bytes = visual
+                    .get()
+                    .saturating_sub(composition_visual.start().get());
+                let preedit = self
+                    .state
+                    .document()
+                    .session()
+                    .composition()
+                    .map(|overlay| overlay.text().to_owned())
+                    .ok_or_else(|| ShellError::Platform("composition disappeared".to_owned()))?;
+                let preedit_snapshot = yu_text::TextBuffer::new(preedit).snapshot();
+                let local_utf16 = preedit_snapshot
+                    .utf16_offset(ByteOffset::new(local_bytes))
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                return composition
+                    .range
+                    .start()
+                    .checked_add(
+                        i32::try_from(local_utf16.get())
+                            .map_err(|_| ShellError::Platform("ACP overflow".to_owned()))?,
+                    )
+                    .ok_or_else(|| ShellError::Platform("ACP overflow".to_owned()));
+            }
+        }
+        let source = hit.map(|(source, _, _)| source).unwrap_or(ByteOffset::ZERO);
+        let snapshot = self.state.document().session().snapshot();
+        let utf16 = snapshot
+            .utf16_offset(source)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        i32::try_from(utf16.get()).map_err(|_| ShellError::Platform("ACP overflow".to_owned()))
+    }
+
+    fn logical_rect_to_screen(
+        &self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    ) -> Result<RECT, ShellError> {
+        let surface = native_surface_config(self.surface)?;
+        let viewport = self
+            .render
+            .as_ref()
+            .map(|render| render.builder.config().viewport())
+            .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?;
+        let scale = surface.scale() as f32;
+        let mut a = POINT {
+            x: (left * scale).floor() as i32,
+            y: ((top - viewport.scroll_y()) * scale).floor() as i32,
+        };
+        let mut b = POINT {
+            x: (right * scale).ceil() as i32,
+            y: ((bottom - viewport.scroll_y()) * scale).ceil() as i32,
+        };
+        unsafe {
+            if !ClientToScreen(self.surface, &mut a).as_bool()
+                || !ClientToScreen(self.surface, &mut b).as_bool()
+            {
+                return Err(platform_error(WindowsError::from_win32()));
+            }
+        }
+        Ok(RECT {
+            left: a.x,
+            top: a.y,
+            right: b.x.max(a.x + 1),
+            bottom: b.y.max(a.y + 1),
+        })
+    }
+
+    pub(crate) fn input_text_ext(&mut self, range: AcpRange) -> Result<RECT, ShellError> {
+        let projection = self.input_projection()?;
+        if let Some(composition) = projection.composition()
+            && range.start() >= composition.range.start()
+            && range.end() <= composition.range.end()
+        {
+            let block = self
+                .input_layout()?
+                .block_for_source(composition.canonical.start())
+                .ok_or_else(|| {
+                    ShellError::Platform("composition block is not measured".to_owned())
+                })?;
+            let visual = block
+                .layout()
+                .visual()
+                .composition_selection_visual()
+                .ok_or_else(|| {
+                    ShellError::Platform("composition geometry is unavailable".to_owned())
+                })?;
+            let caret = block
+                .layout()
+                .caret_for_visual(visual.end(), Bias::After)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let point = block.document_point(caret.point());
+            return self.logical_rect_to_screen(
+                point.x(),
+                point.y(),
+                point.x() + 1.0,
+                point.y() + block.caret_height(caret),
+            );
+        }
+
+        let start = projection
+            .projected_to_canonical(range.start())
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .ok_or_else(|| ShellError::Platform("ACP has no canonical source".to_owned()))?;
+        let end = projection
+            .projected_to_canonical(range.end())
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .ok_or_else(|| ShellError::Platform("ACP has no canonical source".to_owned()))?;
+        let snapshot = self.state.document().session().snapshot();
+        let canonical =
+            AcpRange::new(start, end).map_err(|error| ShellError::Platform(error.to_string()))?;
+        let source = canonical_acp_range_to_source(&snapshot, canonical)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let (left, top, right, bottom) = source_range_bounds(self.input_layout()?, source)?;
+        self.logical_rect_to_screen(left, top, right, bottom)
+    }
+
+    pub(crate) fn input_screen_ext(&mut self) -> Result<RECT, ShellError> {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(self.surface, &mut rect) }.map_err(platform_error)?;
+        let mut top_left = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        unsafe {
+            if !ClientToScreen(self.surface, &mut top_left).as_bool()
+                || !ClientToScreen(self.surface, &mut bottom_right).as_bool()
+            {
+                return Err(platform_error(WindowsError::from_win32()));
+            }
+        }
+        Ok(RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        })
+    }
+
+    fn notify_tsf_after_command(
+        &mut self,
+        before_end: i32,
+        before_selection: EditorSelection,
+        changed: bool,
+    ) -> Result<(), ShellError> {
+        let after = self.input_projection()?;
+        let selection_changed = self.state.document().session().selection() != before_selection;
+        if let Some(tsf) = self.tsf.as_ref() {
+            if changed {
+                tsf.notify_external_change(before_end, after.end_acp(), selection_changed);
+            } else if selection_changed {
+                tsf.notify_selection_change();
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_input_command(&mut self, command: EditorCommand) -> Result<bool, ShellError> {
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let result = self.state.document_mut().session_mut().execute(command)?;
+        self.refresh_chrome();
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, result.changed())?;
+        Ok(true)
+    }
+
+    fn execute_vertical_input(&mut self, up: bool, extend: bool) -> Result<bool, ShellError> {
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let (config, shaper) = {
+            let render = self
+                .render
+                .as_ref()
+                .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?;
+            let config = render
+                .layout
+                .as_ref()
+                .map(|layout| layout.config())
+                .ok_or_else(|| ShellError::Platform("input layout is unavailable".to_owned()))?;
+            (config, render.builder.shaper().clone())
+        };
+        let result = self
+            .state
+            .document_mut()
+            .session_mut()
+            .move_vertical_with_shaper(up, extend, config, &shaper)?;
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, result.changed())?;
+        Ok(true)
+    }
+
+    fn key_modifiers_for(&self, key: usize) -> KeyModifiers {
+        let pressed = |vk| unsafe { GetKeyState(vk) } < 0;
+        let mut modifiers = KeyModifiers::NONE;
+        if pressed(VK_SHIFT.0 as i32) {
+            modifiers = modifiers | KeyModifiers::SHIFT;
+        }
+        if pressed(VK_MENU.0 as i32) {
+            modifiers = modifiers | KeyModifiers::OPTION;
+        }
+        if pressed(VK_CONTROL.0 as i32) {
+            modifiers = modifiers
+                | if matches!(
+                    key,
+                    value if value == VK_HOME.0 as usize
+                        || value == VK_END.0 as usize
+                        || (b'A' as usize..=b'Z' as usize).contains(&value)
+                ) {
+                    KeyModifiers::COMMAND
+                } else {
+                    KeyModifiers::CONTROL
+                };
+        }
+        modifiers
+    }
+
+    fn copy_selection_to_clipboard(&mut self, cut: bool) -> Result<bool, ShellError> {
+        let session = self.state.document().session();
+        let snapshot = session.snapshot();
+        let mut pieces = Vec::new();
+        let mut all_nonempty = true;
+        for selection in session.selections().as_slice() {
+            let range = selection.ordered_range();
+            if range.is_empty() {
+                all_nonempty = false;
+                continue;
+            }
+            let start = usize::try_from(range.start().get())
+                .map_err(|_| ShellError::Platform("selection offset overflow".to_owned()))?;
+            let end = usize::try_from(range.end().get())
+                .map_err(|_| ShellError::Platform("selection offset overflow".to_owned()))?;
+            pieces.push(
+                snapshot
+                    .as_str()
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        ShellError::Platform("selection is not UTF-8 aligned".to_owned())
+                    })?
+                    .to_owned(),
+            );
+        }
+        if pieces.is_empty() {
+            return Ok(true);
+        }
+        write_unicode_clipboard(self.surface, &pieces.join("\n"))?;
+        if cut && all_nonempty {
+            self.execute_input_command(EditorCommand::DeleteBackward)?;
+        }
+        Ok(true)
+    }
+
+    fn paste_from_clipboard(&mut self) -> Result<bool, ShellError> {
+        let text = read_unicode_clipboard(self.surface)?;
+        self.execute_input_command(EditorCommand::PasteClipboardText {
+            text: Arc::from(text),
+            tabular: false,
+        })
+    }
+
+    fn handle_key_down(&mut self, wparam: WPARAM) -> Result<bool, ShellError> {
+        let key = wparam.0;
+        let modifiers = self.key_modifiers_for(key);
+
+        if modifiers == KeyModifiers::COMMAND {
+            match key {
+                value if value == b'C' as usize => {
+                    return self.copy_selection_to_clipboard(false);
+                }
+                value if value == b'X' as usize => {
+                    return self.copy_selection_to_clipboard(true);
+                }
+                value if value == b'V' as usize => {
+                    return self.paste_from_clipboard();
+                }
+                _ => {}
+            }
+        }
+        if key == b'A' as usize && modifiers == KeyModifiers::COMMAND {
+            let snapshot = self.state.document().session().snapshot();
+            let selection = EditorSelection::range(
+                &snapshot,
+                ByteOffset::ZERO,
+                snapshot.len_bytes(),
+                CaretAffinity::Downstream,
+            )
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let before = self.state.document().session().selection();
+            self.state
+                .document_mut()
+                .session_mut()
+                .set_selection(selection)?;
+            self.render_current()?;
+            if before != selection
+                && let Some(tsf) = self.tsf.as_ref()
+            {
+                tsf.notify_selection_change();
+            }
+            return Ok(true);
+        }
+        if key == b'Y' as usize && modifiers == KeyModifiers::COMMAND {
+            return self.execute_input_command(EditorCommand::Redo);
+        }
+        if key == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize
+            && self.state.document().session().composition().is_some()
+        {
+            let _ = self.state.document_mut().session_mut().cancel_composition();
+            self.render_current()?;
+            if let Some(tsf) = self.tsf.as_ref() {
+                tsf.notify_layout_change();
+            }
+            return Ok(true);
+        }
+
+        if key == VK_UP.0 as usize || key == VK_DOWN.0 as usize {
+            let extend = modifiers.contains(KeyModifiers::SHIFT);
+            return self.execute_vertical_input(key == VK_UP.0 as usize, extend);
+        }
+        if key == VK_PRIOR.0 as usize || key == VK_NEXT.0 as usize {
+            let extend = modifiers.contains(KeyModifiers::SHIFT);
+            let lines = self
+                .render
+                .as_ref()
+                .and_then(|render| render.layout.as_ref())
+                .map(|layout| {
+                    let viewport = self
+                        .render
+                        .as_ref()
+                        .expect("render is present")
+                        .builder
+                        .config()
+                        .viewport();
+                    (viewport.height() / layout.config().line_height())
+                        .floor()
+                        .max(1.0) as usize
+                })
+                .unwrap_or(1);
+            for _ in 0..lines {
+                self.execute_vertical_input(key == VK_PRIOR.0 as usize, extend)?;
+            }
+            return Ok(true);
+        }
+
+        let editor_key = match key {
+            value if value == VK_BACK.0 as usize => Some(EditorKey::Backspace),
+            value if value == VK_DELETE.0 as usize => Some(EditorKey::Delete),
+            value if value == VK_LEFT.0 as usize => Some(EditorKey::Left),
+            value if value == VK_RIGHT.0 as usize => Some(EditorKey::Right),
+            value if value == VK_HOME.0 as usize => Some(EditorKey::Home),
+            value if value == VK_END.0 as usize => Some(EditorKey::End),
+            value if value == VK_RETURN.0 as usize => Some(EditorKey::Enter),
+            value if value == VK_TAB.0 as usize => Some(EditorKey::Tab),
+            value if (b'A' as usize..=b'Z' as usize).contains(&value) => {
+                char::from_u32(value as u32).map(EditorKey::Character)
+            }
+            _ => None,
+        };
+        let Some(editor_key) = editor_key else {
+            return Ok(false);
+        };
+
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        match self
+            .state
+            .document_mut()
+            .session_mut()
+            .route_key(KeyEvent::new(editor_key, modifiers))?
+        {
+            KeyRouteResult::Executed(result) => {
+                self.refresh_chrome();
+                self.render_current()?;
+                self.notify_tsf_after_command(
+                    before.end_acp(),
+                    before_selection,
+                    result.changed(),
+                )?;
+                Ok(true)
+            }
+            KeyRouteResult::Unhandled if editor_key == EditorKey::Tab => {
+                self.execute_input_command(EditorCommand::insert_text("\t"))
+            }
+            KeyRouteResult::Unhandled => Ok(false),
+        }
+    }
+
+    fn handle_char(&mut self, unit: u16) -> Result<bool, ShellError> {
+        if matches!(unit, 0x08 | 0x09 | 0x0A | 0x0D) || unit < 0x20 {
+            return Ok(true);
+        }
+        if (0xD800..=0xDBFF).contains(&unit) {
+            self.pending_high_surrogate = Some(unit);
+            return Ok(true);
+        }
+        let character = if (0xDC00..=0xDFFF).contains(&unit) {
+            let Some(high) = self.pending_high_surrogate.take() else {
+                return Ok(true);
+            };
+            char::decode_utf16([high, unit]).next().and_then(Result::ok)
+        } else {
+            self.pending_high_surrogate = None;
+            char::from_u32(u32::from(unit))
+        };
+        let Some(character) = character else {
+            return Ok(true);
+        };
+        self.execute_input_command(EditorCommand::insert_text(character.to_string()))
+    }
+
+    fn mouse_source(&self, x: i32, y: i32) -> Result<ByteOffset, ShellError> {
+        let surface = native_surface_config(self.surface)?;
+        let viewport = self
+            .render
+            .as_ref()
+            .map(|render| render.builder.config().viewport())
+            .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?;
+        let point = LayoutPoint::new(
+            x as f32 / surface.scale() as f32,
+            y as f32 / surface.scale() as f32 + viewport.scroll_y(),
+        );
+        Ok(self
+            .input_layout()?
+            .hit_test(point)
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .map(|(_, hit)| hit.source())
+            .unwrap_or(ByteOffset::ZERO))
+    }
+
+    fn set_mouse_selection(
+        &mut self,
+        x: i32,
+        y: i32,
+        extend: bool,
+        dragging: bool,
+    ) -> Result<(), ShellError> {
+        let focus = self.mouse_source(x, y)?;
+        let snapshot = self.state.document().session().snapshot();
+        let anchor = if dragging {
+            self.drag_anchor.unwrap_or(focus)
+        } else if extend {
+            self.state.document().session().selection().anchor()
+        } else {
+            focus
+        };
+        let selection = EditorSelection::range(&snapshot, anchor, focus, CaretAffinity::Downstream)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.state
+            .document_mut()
+            .session_mut()
+            .set_selection(selection)?;
+        if !dragging {
+            self.drag_anchor = Some(anchor);
+        }
+        self.render_current()?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_selection_change();
+        }
+        Ok(())
     }
 
     fn install_menu(&self) -> Result<(), ShellError> {
@@ -665,11 +1438,32 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
         if result.0 <= 0 {
             break;
         }
-        if unsafe { TranslateAcceleratorW(hwnd, accelerator, &message) } == 0 {
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
+        let app_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut AppWindow;
+        let tsf_ate = if app_ptr.is_null() {
+            false
+        } else {
+            let app = unsafe { &mut *app_ptr };
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN => app
+                    .tsf
+                    .as_ref()
+                    .is_some_and(|tsf| tsf.filter_key_down(message.wParam, message.lParam)),
+                WM_KEYUP | WM_SYSKEYUP => app
+                    .tsf
+                    .as_ref()
+                    .is_some_and(|tsf| tsf.filter_key_up(message.wParam, message.lParam)),
+                _ => false,
             }
+        };
+        if tsf_ate {
+            continue;
+        }
+        if unsafe { TranslateAcceleratorW(hwnd, accelerator, &message) } != 0 {
+            continue;
+        }
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     }
 }
@@ -705,6 +1499,8 @@ unsafe extern "system" fn window_proc(
                 app.update_layout();
                 if let Err(error) = app.render_current() {
                     show_error(hwnd, &app.state, &error);
+                } else if let Some(tsf) = app.tsf.as_ref() {
+                    tsf.notify_layout_change();
                 }
                 return LRESULT(0);
             }
@@ -724,6 +1520,8 @@ unsafe extern "system" fn window_proc(
                 app.update_layout();
                 if let Err(error) = app.render_current() {
                     show_error(hwnd, &app.state, &error);
+                } else if let Some(tsf) = app.tsf.as_ref() {
+                    tsf.notify_layout_change();
                 }
                 return LRESULT(0);
             }
@@ -732,6 +1530,8 @@ unsafe extern "system" fn window_proc(
                 app.refresh_chrome();
                 if let Err(error) = app.render_current() {
                     show_error(hwnd, &app.state, &error);
+                } else if let Some(tsf) = app.tsf.as_ref() {
+                    tsf.notify_layout_change();
                 }
                 return LRESULT(0);
             }
@@ -769,18 +1569,102 @@ unsafe extern "system" fn surface_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let parent = unsafe { GetParent(hwnd) }.ok();
+    let app_ptr = parent
+        .map(|parent| unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) } as *mut AppWindow)
+        .unwrap_or(ptr::null_mut());
+    if !app_ptr.is_null() {
+        let app = unsafe { &mut *app_ptr };
+        match message {
+            WM_GETDLGCODE => {
+                return LRESULT(
+                    (DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB) as isize,
+                );
+            }
+            WM_SETFOCUS => {
+                if let Some(tsf) = app.tsf.as_ref() {
+                    tsf.focus();
+                }
+                return LRESULT(0);
+            }
+            WM_KEYDOWN => match app.handle_key_down(wparam) {
+                Ok(true) => return LRESULT(0),
+                Ok(false) => {}
+                Err(error) => {
+                    show_error(app.hwnd, &app.state, &error);
+                    return LRESULT(0);
+                }
+            },
+            WM_CHAR => match app.handle_char((wparam.0 & 0xffff) as u16) {
+                Ok(true) => return LRESULT(0),
+                Ok(false) => {}
+                Err(error) => {
+                    show_error(app.hwnd, &app.state, &error);
+                    return LRESULT(0);
+                }
+            },
+            WM_LBUTTONDOWN => {
+                unsafe {
+                    let _ = SetFocus(hwnd);
+                    let _ = SetCapture(hwnd);
+                }
+                let (x, y) = mouse_coordinates(lparam);
+                if let Err(error) =
+                    app.set_mouse_selection(x, y, wparam.0 & MK_SHIFT.0 as usize != 0, false)
+                {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE if wparam.0 & MK_LBUTTON.0 as usize != 0 => {
+                let (x, y) = mouse_coordinates(lparam);
+                if let Err(error) = app.set_mouse_selection(x, y, false, true) {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = mouse_coordinates(lparam);
+                if let Err(error) = app.set_mouse_selection(x, y, false, true) {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                app.drag_anchor = None;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                return LRESULT(0);
+            }
+            WM_KILLFOCUS => {
+                app.drag_anchor = None;
+            }
+            WM_APP_TSF_LOCK => {
+                if let Some(tsf) = app.tsf.as_ref() {
+                    tsf.grant_pending_lock();
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
     if message == WM_PAINT {
         let mut paint = PAINTSTRUCT::default();
         unsafe {
             BeginPaint(hwnd, &mut paint);
             let _ = EndPaint(hwnd, &paint);
-            if let Ok(parent) = GetParent(hwnd) {
+            if let Some(parent) = parent {
                 let _ = PostMessageW(parent, WM_APP_RENDER, WPARAM(0), LPARAM(0));
             }
         }
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn mouse_coordinates(lparam: LPARAM) -> (i32, i32) {
+    let raw = lparam.0 as u32;
+    let x = (raw & 0xffff) as u16 as i16 as i32;
+    let y = (raw >> 16) as u16 as i16 as i32;
+    (x, y)
 }
 
 fn native_surface_config(hwnd: HWND) -> Result<SurfaceConfig, ShellError> {
@@ -796,6 +1680,100 @@ fn native_surface_config(hwnd: HWND) -> Result<SurfaceConfig, ShellError> {
         scale,
     )
     .map_err(|error| ShellError::Platform(error.to_string()))
+}
+
+fn include_input_bounds(
+    bounds: &mut Option<(f32, f32, f32, f32)>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> Result<(), ShellError> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width < 0.0
+        || height <= 0.0
+    {
+        return Err(ShellError::Platform("invalid input geometry".to_owned()));
+    }
+    let right = x + width.max(1.0);
+    let bottom = y + height;
+    *bounds = Some(match *bounds {
+        Some((left, top, old_right, old_bottom)) => (
+            left.min(x),
+            top.min(y),
+            old_right.max(right),
+            old_bottom.max(bottom),
+        ),
+        None => (x, y, right, bottom),
+    });
+    Ok(())
+}
+
+fn source_range_bounds(
+    layout: &LayoutSnapshot,
+    source: TextRange,
+) -> Result<(f32, f32, f32, f32), ShellError> {
+    let mut bounds = None;
+    if source.start() < source.end() {
+        for block in layout.blocks() {
+            let block_source = block.metadata().source();
+            if block_source.start() >= source.end() || block_source.end() <= source.start() {
+                continue;
+            }
+            for cluster in block.layout().layout().clusters() {
+                let visual = cluster.visual();
+                let start = block
+                    .layout()
+                    .visual()
+                    .visual_to_source(visual.start(), Bias::After)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                let end = block
+                    .layout()
+                    .visual()
+                    .visual_to_source(visual.end(), Bias::Before)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                let span = TextRange::new(start, end.max(start))
+                    .ok_or_else(|| ShellError::Platform("invalid cluster source".to_owned()))?;
+                if span.start() < source.end() && span.end() > source.start() {
+                    let line = block
+                        .layout()
+                        .layout()
+                        .lines()
+                        .get(cluster.line())
+                        .ok_or_else(|| {
+                            ShellError::Platform("cluster line is missing".to_owned())
+                        })?;
+                    include_input_bounds(
+                        &mut bounds,
+                        cluster.x(),
+                        block.content_y() + line.y(),
+                        cluster.width(),
+                        line.height(),
+                    )?;
+                }
+            }
+        }
+    }
+    for (position, bias) in [(source.start(), Bias::After), (source.end(), Bias::Before)] {
+        if let Some(block) = layout.block_for_source(position) {
+            let caret = block
+                .layout()
+                .caret_for_source(position, bias)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            let point = block.document_point(caret.point());
+            include_input_bounds(
+                &mut bounds,
+                point.x(),
+                point.y(),
+                1.0,
+                block.caret_height(caret),
+            )?;
+        }
+    }
+    bounds.ok_or_else(|| ShellError::Platform("source range is outside measured layout".to_owned()))
 }
 
 fn viewport_render_config(

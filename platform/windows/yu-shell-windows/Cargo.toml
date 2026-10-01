@@ -9,29 +9,36 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+yu-core = { path = "../../../crates/yu-core" }
 yu-editor = { path = "../../../crates/yu-editor" }
 yu-font = { path = "../../../crates/yu-font" }
 yu-render = { path = "../../../crates/yu-render" }
 yu-scene = { path = "../../../crates/yu-scene" }
 yu-storage = { path = "../../../crates/yu-storage" }
+yu-text = { path = "../../../crates/yu-text" }
 yu-workspace = { path = "../../../crates/yu-workspace" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 yu-font-windows = { path = "../yu-font-windows" }
 yu-render-windows = { path = "../yu-render-windows" }
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+    "implement",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

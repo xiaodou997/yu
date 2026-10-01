@@ -472,6 +472,15 @@ impl EditorDocument {
         cancelled
     }
 
+    /// Returns the active transient composition without exposing mutable
+    /// presentation state. Native text-input adapters use this to project the
+    /// text stream they expose to the OS; the canonical source remains owned
+    /// by this document.
+    #[must_use]
+    pub fn composition(&self) -> Option<&CompositionOverlay> {
+        self.presentation.composition.as_ref()
+    }
+
     /// Replaces the source for a newly opened document and resets its revision.
     pub fn reset_source(&mut self, source: impl Into<String>) -> Result<(), EditorDocumentError> {
         if self.presentation.composition.is_some() {
@@ -581,6 +590,7 @@ impl EditorDocument {
             EditorCommand::MoveDocumentBoundary { end, extend } => {
                 self.move_document_boundary(end, extend)
             }
+            EditorCommand::MoveLineBoundary { end, extend } => self.move_line_boundary(end, extend),
             EditorCommand::MoveUp => self.move_up(false),
             EditorCommand::MoveDown => self.move_down(false),
             EditorCommand::MoveUpExtend => self.move_up(true),
@@ -690,7 +700,8 @@ impl EditorDocument {
             }
             EditorCommand::InsertNewline
             | EditorCommand::ExtendHorizontal { .. }
-            | EditorCommand::MoveDocumentBoundary { .. } => true,
+            | EditorCommand::MoveDocumentBoundary { .. }
+            | EditorCommand::MoveLineBoundary { .. } => true,
             EditorCommand::IndentList => {
                 if self.has_html_list_selection() {
                     return self.html_list_command_available(true);
@@ -1626,6 +1637,30 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream,
         )?);
         self.state.history.break_group();
+        Ok(self.command_result(false))
+    }
+
+    fn move_line_boundary(
+        &mut self,
+        end: bool,
+        extend: bool,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let primary = self.presentation.selections.primary_index();
+        let mut targets = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
+            let line = source_line(&snapshot, selection.focus())?;
+            let focus = if end { line.content_end } else { line.start };
+            let anchor = if extend { selection.anchor() } else { focus };
+            targets.push(EditorSelection::range(
+                &snapshot,
+                anchor,
+                focus,
+                crate::CaretAffinity::Downstream,
+            )?);
+        }
+        self.state.history.break_group();
+        self.presentation.selections = Selections::new(&snapshot, targets, primary)?;
         Ok(self.command_result(false))
     }
 
