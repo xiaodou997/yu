@@ -20,6 +20,7 @@ yu-assets = { path = "../yu-assets" }
 base64 = "=0.22.1"
 roxmltree = "=0.21.1"
 tempfile = "=3.27.0"
+same-file = "=1.0.6"
 serde_json = "1"
 
 [lints]

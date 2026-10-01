@@ -425,6 +425,7 @@ pub struct CoreTextShaper {
 enum CoreTextFontSource {
     RequestedFamily,
     SystemUi,
+    #[cfg(target_os = "macos")]
     SystemMono,
 }
 

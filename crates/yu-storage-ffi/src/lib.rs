@@ -8152,6 +8152,7 @@ fn macos_frame_needs_resource_refresh(
 /// build must advance the retry clock and re-submit the request.  Completion
 /// generations are checked by the caller, so a worker result that arrived
 /// since the last build already makes the retained frame ineligible.
+#[cfg(any(target_os = "macos", test))]
 const fn macos_pending_resource_allows_retained_reuse(resource_retry_pending: bool) -> bool {
     !resource_retry_pending
 }
@@ -9868,7 +9869,6 @@ pub unsafe extern "C" fn yu_storage_reading_geometry(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
     use yu_core::ByteOffset;
 
     use super::*;
