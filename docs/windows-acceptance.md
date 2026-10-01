@@ -320,3 +320,22 @@ ignored（其中资源集成已另行执行）；全仓 all-targets clippy、fmt
 完整证据、复现入口和未验范围见
 [第六组原生验收记录](windows-group6-native-acceptance-20261001.md)。
 下一阶段为第七组发布包装；Narrator / 系统主题人工体验仍保留独立验收项。
+
+## 第七组：MSIX / EXE 资源 / Store 元数据 / 发布包装
+
+状态：**2026-10-01 Windows x64 打包软件实现与本机自动验收通过。正式签名、
+安装后的验收、WACK 和 Store 提交待发布身份及证书配置，暂不正式结项。**
+
+EXE 已包含 Yu 图标、版本、PMv2 DPI、Common Controls v6 和权限声明；主窗口的大、
+小图标也已接线。Release MSIX 包含主程序、公式 / Mermaid helper、45 项 payload、
+多缩放 PNG / PRI 和许可证。开发身份与 Partner Center 正式身份分开配置；签名入口
+检查 Publisher、证书有效期、私钥及代码签名用途，支持 HTTPS 时间戳与独立验签。
+
+包内真实 HWND / Present、38 项外部 UIA、公式 / Mermaid helper 和 13 项打包防护
+验证均通过；全 workspace 1,532 项无失败，真实 GPU 资源集成另行通过，clippy、
+格式、依赖方向与 CI parity 通过。五语商店草稿与 Windows 隐私政策已准备。
+
+当前生成物是**未签名开发候选包**；解包后运行验证通过，不代表 MSIX 安装、
+文件关联、更新、卸载或 Store 认证已通过。
+完整范围与证据见[第七组原生验收记录](windows-group7-native-acceptance-20261001.md)，
+构建与签名配置见[Windows 打包说明](windows-packaging.md)。

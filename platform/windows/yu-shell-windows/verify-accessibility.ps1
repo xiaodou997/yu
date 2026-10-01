@@ -19,6 +19,7 @@ public static class YuAccessibilityMessages {
     [DllImport("user32.dll")] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool MoveWindow(IntPtr hwnd, int x, int y, int width, int height, bool repaint);
     [DllImport("user32.dll")] public static extern int ShowWindow(IntPtr hwnd, int command);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll", EntryPoint="GetClassLongPtrW")] public static extern IntPtr GetClassLongPtr(IntPtr hwnd, int index);
 }
 [ComImport, Guid("30cbe57d-d9d0-452a-ab13-7ac5ac4825ee"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface YuNativeAutomation {
@@ -93,6 +94,7 @@ try {
     # client, which replaces this process's native proxy factory table.
     $null = [YuAccessibilityMessages]::SendMessage($process.MainWindowHandle, 0x111, [IntPtr]::new(2003), [IntPtr]::Zero)
     $nativeDpi = [YuAccessibilityMessages]::GetDpiForWindow($process.MainWindowHandle)
+    Check ([YuAccessibilityMessages]::GetClassLongPtr($process.MainWindowHandle, -14) -ne [IntPtr]::Zero -and [YuAccessibilityMessages]::GetClassLongPtr($process.MainWindowHandle, -34) -ne [IntPtr]::Zero) 'main window exposes embedded large and small Yu icons'
     $queryHwnd = [YuAccessibilityMessages]::GetDlgItem($process.MainWindowHandle, 2004)
     Check ([YuNativeProperties]::Read($queryHwnd, 30003) -eq 50004) 'native COM UIA resolves search as Edit control'
     Check (-not [string]::IsNullOrEmpty([YuNativeProperties]::Read($queryHwnd, 30005))) 'native search edit has an accessible name'
