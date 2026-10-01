@@ -24,7 +24,7 @@ use crate::{
     ViewportLayout, ViewportSnapshot, ViewportSpan, ViewportStats, VisualText, VisualTextError,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
-        previous_word_boundary,
+        previous_word_boundary, word_segment_at,
     },
     decorations::hidden_bytes,
     keymap::command_for_key,
@@ -223,6 +223,51 @@ impl EditorDocument {
         self.state.preferred_x = None;
         self.state.history.break_group();
         Ok(())
+    }
+
+    /// Resolves the source selection owned by a pointer double-click.
+    /// Unicode segmentation stays in the shared editor; platform shells only
+    /// provide an already hit-tested canonical source position.
+    pub fn word_selection_at(
+        &self,
+        source: ByteOffset,
+    ) -> Result<EditorSelection, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        snapshot.utf16_offset(source)?;
+        let line = source_line(&snapshot, source)?;
+        let relative = byte_distance(line.start, source)?.min(line.content.len());
+        let (local_start, local_end) = word_segment_at(&line.content, relative);
+        let start = offset_plus(line.start, local_start)?;
+        let end = offset_plus(line.start, local_end)?;
+        Ok(EditorSelection::range(
+            &snapshot,
+            start,
+            end,
+            crate::CaretAffinity::Downstream,
+        )?)
+    }
+
+    /// Resolves the complete physical source line owned by a pointer
+    /// triple-click. The line terminator is included when present.
+    pub fn line_selection_at(
+        &self,
+        source: ByteOffset,
+    ) -> Result<EditorSelection, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        snapshot.utf16_offset(source)?;
+        let line = source_line(&snapshot, source)?;
+        let terminator = u64::try_from(line.terminator.len())
+            .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let end = line
+            .content_end
+            .checked_add(terminator)
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        Ok(EditorSelection::range(
+            &snapshot,
+            line.start,
+            end,
+            crate::CaretAffinity::Downstream,
+        )?)
     }
 
     /// 换一组选区。
@@ -2637,6 +2682,31 @@ mod tests {
         document
             .set_selection(selection)
             .expect("test caret should belong to document");
+    }
+
+    #[test]
+    fn pointer_word_and_line_selection_are_unicode_and_newline_safe() {
+        let source = "hello  世界🙂!\r\nnext\n";
+        let document = EditorDocument::new(source);
+        let word = document
+            .word_selection_at(ByteOffset::new(1))
+            .expect("word selection");
+        assert_eq!(word.ordered_range(), source_range(0, 5));
+
+        let emoji = source.find('🙂').expect("emoji");
+        let emoji_selection = document
+            .word_selection_at(ByteOffset::new(emoji as u64))
+            .expect("emoji selection");
+        assert_eq!(
+            emoji_selection.ordered_range(),
+            source_range(emoji as u64, (emoji + '🙂'.len_utf8()) as u64)
+        );
+
+        let line = document
+            .line_selection_at(ByteOffset::new(2))
+            .expect("line selection");
+        let first_line_end = source.find("next").expect("second line");
+        assert_eq!(line.ordered_range(), source_range(0, first_line_end as u64));
     }
 
     #[test]

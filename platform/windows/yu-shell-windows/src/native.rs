@@ -6,6 +6,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     BOOL, ERROR_SUCCESS, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
@@ -48,19 +49,20 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::TextServices::TS_TEXTCHANGE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    ACCEL, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
     DestroyWindow, DispatchMessageW, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA, GetClientRect,
-    GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, IDC_ARROW, LoadCursorW, MB_ICONERROR,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, IDC_ARROW, KillTimer, LoadCursorW,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
@@ -96,6 +98,10 @@ const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
 const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
+const DRAG_SCROLL_TIMER_ID: usize = 1;
+const DRAG_SCROLL_TIMER_MS: u32 = 30;
+const TRIPLE_CLICK_WINDOW: Duration = Duration::from_millis(600);
+const TRIPLE_CLICK_RADIUS_PX: i32 = 8;
 
 const CANCELLED_HRESULT: i32 = 0x8007_04c7_u32 as i32;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
@@ -199,7 +205,7 @@ struct RenderHost {
 impl RenderHost {
     fn new(surface_hwnd: HWND, appearance: Appearance) -> Result<Self, ShellError> {
         let surface = native_surface_config(surface_hwnd)?;
-        let config = viewport_render_config(surface, appearance)?;
+        let config = viewport_render_config(surface, appearance, 0.0)?;
         let font = FontRequest::new("Segoe UI", BODY_FONT_SIZE)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         let shaper = DirectWriteShaper::new(font)
@@ -223,17 +229,55 @@ impl RenderHost {
         appearance: Appearance,
     ) -> Result<(), ShellError> {
         let surface = native_surface_config(surface_hwnd)?;
+        let old_viewport = self.builder.config().viewport();
+        let content_height = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.content_height())
+            .unwrap_or(old_viewport.height());
+        let max_scroll = (content_height - surface.logical_height() as f32).max(0.0);
+        let scroll_y = old_viewport.scroll_y().min(max_scroll);
         if (surface.scale() - self.renderer.surface().scale()).abs() > f64::EPSILON {
             *self = Self::new(surface_hwnd, appearance)?;
+            self.builder
+                .update_config(viewport_render_config(surface, appearance, scroll_y)?)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
             return Ok(());
         }
         self.renderer
             .resize(surface)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         self.builder
-            .update_config(viewport_render_config(surface, appearance)?)
+            .update_config(viewport_render_config(surface, appearance, scroll_y)?)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         Ok(())
+    }
+
+    fn scroll_by(&mut self, delta: f32) -> Result<bool, ShellError> {
+        if !delta.is_finite() || delta == 0.0 {
+            return Ok(false);
+        }
+        let config = self.builder.config();
+        let viewport = config.viewport();
+        let content_height = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.content_height())
+            .unwrap_or(viewport.height());
+        let max_scroll = (content_height - viewport.height()).max(0.0);
+        let target = (viewport.scroll_y() + delta).clamp(0.0, max_scroll);
+        if (target - viewport.scroll_y()).abs() <= f32::EPSILON {
+            return Ok(false);
+        }
+        let surface = self.renderer.surface();
+        self.builder
+            .update_config(viewport_render_config(
+                surface,
+                config.appearance(),
+                target,
+            )?)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(true)
     }
 
     fn render(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
@@ -279,6 +323,9 @@ pub(crate) struct AppWindow {
     render: Option<RenderHost>,
     tsf: Option<TsfHost>,
     drag_anchor: Option<ByteOffset>,
+    drag_point: Option<(i32, i32)>,
+    last_double_click: Option<(Instant, i32, i32)>,
+    semantic_click: bool,
     pending_high_surrogate: Option<u16>,
 }
 
@@ -293,6 +340,9 @@ impl AppWindow {
             render: None,
             tsf: None,
             drag_anchor: None,
+            drag_point: None,
+            last_double_click: None,
+            semantic_click: false,
             pending_high_surrogate: None,
         }
     }
@@ -501,7 +551,23 @@ impl AppWindow {
         ))
     }
 
-    pub(crate) fn input_acp_from_screen(&mut self, point: POINT) -> Result<i32, ShellError> {
+    pub(crate) fn input_acp_from_screen(
+        &mut self,
+        point: POINT,
+        nearest: bool,
+    ) -> Result<i32, ShellError> {
+        if !nearest {
+            let view = self.input_screen_ext()?;
+            if point.x < view.left
+                || point.x >= view.right
+                || point.y < view.top
+                || point.y >= view.bottom
+            {
+                return Err(ShellError::Platform(
+                    "TSF point is outside the active editor view".to_owned(),
+                ));
+            }
+        }
         let point = self.surface_document_point(point)?;
         let hit = self
             .input_layout()?
@@ -544,7 +610,9 @@ impl AppWindow {
                     .ok_or_else(|| ShellError::Platform("ACP overflow".to_owned()));
             }
         }
-        let source = hit.map(|(source, _, _)| source).unwrap_or(ByteOffset::ZERO);
+        let source = hit
+            .map(|(source, _, _)| source)
+            .ok_or_else(|| ShellError::Platform("TSF point has no measured layout".to_owned()))?;
         let snapshot = self.state.document().session().snapshot();
         let utf16 = snapshot
             .utf16_offset(source)
@@ -934,6 +1002,154 @@ impl AppWindow {
         self.execute_input_command(EditorCommand::insert_text(character.to_string()))
     }
 
+    fn adjust_scroll(&mut self, delta: f32) -> Result<bool, ShellError> {
+        self.render
+            .as_mut()
+            .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?
+            .scroll_by(delta)
+    }
+
+    fn scroll_and_render(&mut self, delta: f32) -> Result<bool, ShellError> {
+        if !self.adjust_scroll(delta)? {
+            return Ok(true);
+        }
+        self.render_current()?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_layout_change();
+        }
+        Ok(true)
+    }
+
+    fn handle_mouse_wheel(&mut self, wparam: WPARAM) -> Result<bool, ShellError> {
+        let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as f32;
+        if delta == 0.0 {
+            return Ok(true);
+        }
+        let line_height = self
+            .render
+            .as_ref()
+            .and_then(|render| render.layout.as_ref())
+            .map(|layout| layout.config().line_height())
+            .unwrap_or(BODY_FONT_SIZE * 1.5);
+        let logical_delta = -(delta / 120.0) * line_height * 3.0;
+        self.scroll_and_render(logical_delta)
+    }
+
+    fn drag_scroll_delta(&self, y: i32) -> Result<f32, ShellError> {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(self.surface, &mut rect) }.map_err(platform_error)?;
+        let outside = if y < rect.top {
+            y - rect.top
+        } else if y > rect.bottom {
+            y - rect.bottom
+        } else {
+            0
+        };
+        if outside == 0 {
+            return Ok(0.0);
+        }
+        let surface = native_surface_config(self.surface)?;
+        let line_height = self
+            .render
+            .as_ref()
+            .and_then(|render| render.layout.as_ref())
+            .map(|layout| layout.config().line_height())
+            .unwrap_or(BODY_FONT_SIZE * 1.5);
+        let overshoot = outside as f32 / surface.scale() as f32;
+        let magnitude = overshoot.abs().max(line_height).min(line_height * 6.0);
+        Ok(magnitude.copysign(overshoot))
+    }
+
+    fn update_drag_scroll_timer(&self, y: i32) {
+        let mut rect = RECT::default();
+        let outside = unsafe { GetClientRect(self.surface, &mut rect) }.is_ok()
+            && (y < rect.top || y > rect.bottom);
+        unsafe {
+            if outside {
+                let _ = SetTimer(
+                    self.surface,
+                    DRAG_SCROLL_TIMER_ID,
+                    DRAG_SCROLL_TIMER_MS,
+                    None,
+                );
+            } else {
+                let _ = KillTimer(self.surface, DRAG_SCROLL_TIMER_ID);
+            }
+        }
+    }
+
+    fn stop_drag_scroll_timer(&self) {
+        unsafe {
+            let _ = KillTimer(self.surface, DRAG_SCROLL_TIMER_ID);
+        }
+    }
+
+    fn drag_scroll_tick(&mut self) -> Result<(), ShellError> {
+        let Some((x, y)) = self.drag_point else {
+            self.stop_drag_scroll_timer();
+            return Ok(());
+        };
+        let delta = self.drag_scroll_delta(y)?;
+        if delta == 0.0 || !self.adjust_scroll(delta)? {
+            return Ok(());
+        }
+        // Publish the newly scrolled viewport before hit-testing the pointer;
+        // otherwise a long drag can select against the previous frame's
+        // measured blocks and lag one scroll step behind.
+        self.render_current()?;
+        self.set_mouse_selection(x, y, false, true)
+    }
+
+    fn record_double_click(&mut self, x: i32, y: i32) {
+        self.last_double_click = Some((Instant::now(), x, y));
+    }
+
+    fn consume_triple_click(&mut self, x: i32, y: i32) -> bool {
+        let Some((when, double_x, double_y)) = self.last_double_click else {
+            return false;
+        };
+        let elapsed = when.elapsed();
+        if elapsed > TRIPLE_CLICK_WINDOW {
+            self.last_double_click = None;
+            return false;
+        }
+        let close = x.abs_diff(double_x) <= TRIPLE_CLICK_RADIUS_PX as u32
+            && y.abs_diff(double_y) <= TRIPLE_CLICK_RADIUS_PX as u32;
+        if close {
+            self.last_double_click = None;
+        }
+        close
+    }
+
+    fn set_semantic_mouse_selection(
+        &mut self,
+        x: i32,
+        y: i32,
+        line: bool,
+    ) -> Result<(), ShellError> {
+        let source = self.mouse_source(x, y)?;
+        let selection = {
+            let editor = self.state.document().session().document().editor();
+            if line {
+                editor.line_selection_at(source)
+            } else {
+                editor.word_selection_at(source)
+            }
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+        };
+        self.state
+            .document_mut()
+            .session_mut()
+            .set_selection(selection)?;
+        self.drag_anchor = Some(selection.anchor());
+        self.drag_point = Some((x, y));
+        self.render_current()?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_selection_change();
+        }
+        Ok(())
+    }
+
     fn mouse_source(&self, x: i32, y: i32) -> Result<ByteOffset, ShellError> {
         let surface = native_surface_config(self.surface)?;
         let viewport = self
@@ -978,6 +1194,7 @@ impl AppWindow {
         if !dragging {
             self.drag_anchor = Some(anchor);
         }
+        self.drag_point = Some((x, y));
         self.render_current()?;
         if let Some(tsf) = self.tsf.as_ref() {
             tsf.notify_selection_change();
@@ -1368,7 +1585,7 @@ fn register_classes() -> Result<(), ShellError> {
     };
     let surface = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(surface_proc),
         hInstance: HINSTANCE(instance.0),
         hCursor: cursor,
@@ -1603,32 +1820,76 @@ unsafe extern "system" fn surface_proc(
                     return LRESULT(0);
                 }
             },
+            WM_LBUTTONDBLCLK => {
+                unsafe {
+                    let _ = SetFocus(hwnd);
+                    let _ = SetCapture(hwnd);
+                }
+                let (x, y) = mouse_coordinates(lparam);
+                app.record_double_click(x, y);
+                app.semantic_click = true;
+                if let Err(error) = app.set_semantic_mouse_selection(x, y, false) {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
             WM_LBUTTONDOWN => {
                 unsafe {
                     let _ = SetFocus(hwnd);
                     let _ = SetCapture(hwnd);
                 }
                 let (x, y) = mouse_coordinates(lparam);
-                if let Err(error) =
+                let triple = app.consume_triple_click(x, y);
+                app.semantic_click = triple;
+                let result = if triple {
+                    app.set_semantic_mouse_selection(x, y, true)
+                } else {
                     app.set_mouse_selection(x, y, wparam.0 & MK_SHIFT.0 as usize != 0, false)
-                {
+                };
+                if let Err(error) = result {
                     show_error(app.hwnd, &app.state, &error);
                 }
                 return LRESULT(0);
             }
             WM_MOUSEMOVE if wparam.0 & MK_LBUTTON.0 as usize != 0 => {
                 let (x, y) = mouse_coordinates(lparam);
+                if app.semantic_click
+                    && app.drag_point.is_some_and(|(start_x, start_y)| {
+                        x.abs_diff(start_x) > 2 || y.abs_diff(start_y) > 2
+                    })
+                {
+                    app.semantic_click = false;
+                }
+                app.drag_point = Some((x, y));
+                app.update_drag_scroll_timer(y);
                 if let Err(error) = app.set_mouse_selection(x, y, false, true) {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
+            WM_MOUSEWHEEL => {
+                if let Err(error) = app.handle_mouse_wheel(wparam) {
+                    show_error(app.hwnd, &app.state, &error);
+                }
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == DRAG_SCROLL_TIMER_ID => {
+                if let Err(error) = app.drag_scroll_tick() {
                     show_error(app.hwnd, &app.state, &error);
                 }
                 return LRESULT(0);
             }
             WM_LBUTTONUP => {
                 let (x, y) = mouse_coordinates(lparam);
-                if let Err(error) = app.set_mouse_selection(x, y, false, true) {
+                if !app.semantic_click
+                    && let Err(error) = app.set_mouse_selection(x, y, false, true)
+                {
                     show_error(app.hwnd, &app.state, &error);
                 }
                 app.drag_anchor = None;
+                app.drag_point = None;
+                app.semantic_click = false;
+                app.stop_drag_scroll_timer();
                 unsafe {
                     let _ = ReleaseCapture();
                 }
@@ -1636,6 +1897,9 @@ unsafe extern "system" fn surface_proc(
             }
             WM_KILLFOCUS => {
                 app.drag_anchor = None;
+                app.drag_point = None;
+                app.semantic_click = false;
+                app.stop_drag_scroll_timer();
             }
             WM_APP_TSF_LOCK => {
                 if let Some(tsf) = app.tsf.as_ref() {
@@ -1779,13 +2043,14 @@ fn source_range_bounds(
 fn viewport_render_config(
     surface: SurfaceConfig,
     appearance: Appearance,
+    scroll_y: f32,
 ) -> Result<ViewportRenderConfig, ShellError> {
     let width = surface.logical_width() as f32;
     let height = surface.logical_height() as f32;
     let scene = Rect::new(0.0, 0.0, width, height)
         .map_err(|error| ShellError::Platform(error.to_string()))?;
     Ok(ViewportRenderConfig::new(
-        ViewportSpan::new(0.0, height),
+        ViewportSpan::new(scroll_y.max(0.0), height),
         BODY_FONT_SIZE,
         scene,
         appearance.text(),

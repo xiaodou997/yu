@@ -168,8 +168,12 @@ TextBox 或第二份平台私有正文。
   `EditorCommand::InsertText`。
 - Windows Unicode clipboard 已接入 Copy / Cut / Paste；正文变更仍经过共享
   `DocumentEditorSession`。
-- 鼠标单击定位、Shift-click 扩选与按住左键拖选已接到共享 layout hit-test，
-  并在选择变化后通知 TSF。
+- 鼠标编辑链已接到共享 layout/editor 语义：单击定位、Shift-click 扩选、
+  按住左键拖选、双击按共享 UAX word boundary 选词、三击选完整物理源行、
+  滚轮滚动与拖选越界自动滚动；viewport scroll 在 resize / DPI 同步时保持并
+  重新 clamp。所有选择变化都会通知 TSF。
+- `ITextStoreACP::GetACPFromPoint` 区分 nearest 请求；普通点命中不会把窗口外或
+  无布局位置静默映射成 ACP 0。
 - 新增 Windows 需要的行首/行尾编辑命令；命令语义仍位于 `yu-editor`，Win32
   只负责 native key → shared command 的映射。
 
@@ -179,7 +183,8 @@ TextBox 或第二份平台私有正文。
   backward selection、composition projection、QueryInsert range 与 chunked
   UTF-16 read 回归。
 - `cargo test -p yu-editor keymap`：5 项通过。
-- `cargo test -p yu-editor`：完整编辑器回归通过，无失败。
+- `cargo test -p yu-editor`：完整编辑器回归通过，无失败；新增覆盖 Unicode 双击选词、
+  emoji 与 CRLF 行选择的回归。
 - `cargo clippy -p yu-editor --all-targets -- -D warnings`：通过。
 - `cargo xwin check -p yu-shell-windows --target x86_64-pc-windows-msvc`：通过。
 - `cargo xwin clippy -p yu-shell-windows --target x86_64-pc-windows-msvc -- -D warnings`：
