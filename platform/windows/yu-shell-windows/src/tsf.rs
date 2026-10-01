@@ -656,18 +656,14 @@ impl ITextStoreACP_Impl for TextStore_Impl {
         Ok(VIEW_COOKIE)
     }
 
-    fn GetACPFromPoint(
-        &self,
-        vcview: u32,
-        ptscreen: *const POINT,
-        _dwflags: u32,
-    ) -> WinResult<i32> {
+    fn GetACPFromPoint(&self, vcview: u32, ptscreen: *const POINT, dwflags: u32) -> WinResult<i32> {
         self.state.require_read_lock()?;
         if vcview != VIEW_COOKIE || ptscreen.is_null() {
             return Err(invalid_arg());
         }
+        let nearest = dwflags & (GXFPF_NEAREST | GXFPF_ROUND_NEAREST) != 0;
         self.state.with_app(|app| {
-            app.input_acp_from_screen(unsafe { *ptscreen })
+            app.input_acp_from_screen(unsafe { *ptscreen }, nearest)
                 .map_err(|_| error(TS_E_NOLAYOUT))
         })
     }

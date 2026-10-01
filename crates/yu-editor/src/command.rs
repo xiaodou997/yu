@@ -398,6 +398,25 @@ pub(crate) fn next_word_boundary(text: &str, offset: usize) -> usize {
     text.len()
 }
 
+/// Returns the UAX word-boundary segment that owns one byte position.
+/// Positions on an interior boundary belong to the segment on the right;
+/// the document end belongs to the final segment.
+pub(crate) fn word_segment_at(text: &str, offset: usize) -> (usize, usize) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    let offset = offset.min(text.len());
+    let mut last = (0, text.len());
+    for (start, segment) in text.split_word_bound_indices() {
+        let end = start + segment.len();
+        last = (start, end);
+        if offset < end {
+            return (start, end);
+        }
+    }
+    last
+}
+
 fn validated_offsets(
     snapshot: &TextSnapshot,
     offset: ByteOffset,
@@ -556,6 +575,18 @@ mod tests {
         assert_eq!(
             next_word_boundary(text, "hello  世界".len()),
             "hello  世界🙂".len()
+        );
+    }
+
+    #[test]
+    fn pointer_word_segment_uses_the_same_unicode_boundaries() {
+        let text = "hello  世界🙂!";
+        assert_eq!(word_segment_at(text, 1), (0, 5));
+        assert_eq!(word_segment_at(text, 5), (5, 7));
+        assert_eq!(word_segment_at(text, 7), (7, 10));
+        assert_eq!(
+            word_segment_at(text, text.len()),
+            (text.len() - 1, text.len())
         );
     }
 
