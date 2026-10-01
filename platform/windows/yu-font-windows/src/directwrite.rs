@@ -926,7 +926,14 @@ mod tests {
         let request = FontRequest::new("Segoe UI", 16.0).expect("font request");
         let shaper = DirectWriteShaper::new(request).expect("DirectWrite");
 
-        for text in ["שלום", "مرحبا", "हिन्दी"] {
+        for text in [
+            "שלום",
+            "مرحبا",
+            "हिन्दी",
+            "שָׁלוֹם",
+            "السَّلَامُ",
+            "abc שלום 😀 مرحبا xyz",
+        ] {
             let shaped = ShapingProvider::shape(&shaper, text, source(text), TextStyle::Plain)
                 .unwrap_or_else(|error| panic!("{text:?}: {error}"));
             assert!(!shaped.runs().is_empty(), "{text:?}");

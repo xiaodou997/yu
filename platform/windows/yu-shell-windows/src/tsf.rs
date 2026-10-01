@@ -743,6 +743,29 @@ pub(crate) struct TsfHost {
     keystroke_mgr: ITfKeystrokeMgr,
     _store: ITextStoreACP,
     state: Rc<TextStoreState>,
+    hwnd: HWND,
+    previous_document_mgr: Option<ITfDocumentMgr>,
+}
+
+fn associate_focus(
+    thread_mgr: &ITfThreadMgr,
+    hwnd: HWND,
+    document_mgr: Option<&ITfDocumentMgr>,
+) -> WinResult<Option<ITfDocumentMgr>> {
+    let mut previous = ptr::null_mut();
+    // AssociateFocus succeeds with a null previous association. The generated
+    // windows-rs wrapper requires a non-null interface and reports Error(S_OK)
+    // in that case, so receive the nullable COM out parameter directly.
+    unsafe {
+        (thread_mgr.vtable().AssociateFocus)(
+            thread_mgr.as_raw(),
+            hwnd,
+            document_mgr.map_or(ptr::null_mut(), Interface::as_raw),
+            &mut previous,
+        )
+        .ok()?;
+        Ok((!previous.is_null()).then(|| ITfDocumentMgr::from_raw(previous)))
+    }
 }
 
 impl TsfHost {
@@ -765,9 +788,9 @@ impl TsfHost {
         let context = context.ok_or_else(|| WindowsError::from_hresult(E_UNEXPECTED))?;
         unsafe {
             document_mgr.Push(&context)?;
-            let _ = thread_mgr.AssociateFocus(hwnd, &document_mgr)?;
         }
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
+        let previous_document_mgr = associate_focus(&thread_mgr, hwnd, Some(&document_mgr))?;
         Ok(Self {
             thread_mgr,
             document_mgr,
@@ -775,6 +798,8 @@ impl TsfHost {
             keystroke_mgr,
             _store: store,
             state,
+            hwnd,
+            previous_document_mgr,
         })
     }
 
@@ -845,9 +870,96 @@ impl TsfHost {
 
 impl Drop for TsfHost {
     fn drop(&mut self) {
+        let _ = associate_focus(
+            &self.thread_mgr,
+            self.hwnd,
+            self.previous_document_mgr.as_ref(),
+        );
         unsafe {
             let _ = self.document_mgr.Pop(TF_POPF_ALL);
             let _ = self.thread_mgr.Deactivate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+    };
+    use windows::core::w;
+
+    struct Apartment;
+
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    struct ThreadManager(ITfThreadMgr);
+
+    impl Drop for ThreadManager {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.0.Deactivate();
+            }
+        }
+    }
+
+    struct Window(HWND);
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_focus_association_accepts_null_and_preserves_previous_manager() -> WinResult<()> {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        }
+        let _apartment = Apartment;
+        let thread_mgr: ITfThreadMgr =
+            unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)? };
+        unsafe {
+            thread_mgr.Activate()?;
+        }
+        let thread_mgr = ThreadManager(thread_mgr);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Yu TSF regression"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )?
+        };
+        let window = Window(hwnd);
+        let first = unsafe { thread_mgr.0.CreateDocumentMgr()? };
+        let second = unsafe { thread_mgr.0.CreateDocumentMgr()? };
+        assert!(associate_focus(&thread_mgr.0, window.0, Some(&first))?.is_none());
+        assert_eq!(
+            associate_focus(&thread_mgr.0, window.0, Some(&second))?,
+            Some(first)
+        );
+        assert_eq!(
+            associate_focus(&thread_mgr.0, window.0, None)?,
+            Some(second)
+        );
+        assert!(associate_focus(&thread_mgr.0, window.0, None)?.is_none());
+        Ok(())
     }
 }

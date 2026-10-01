@@ -5,7 +5,7 @@
 //! [`crate::cluster`] 同一条——真正会错的是**翻译**，而翻译在哪台机器上都能
 //! 跑；调用 COM 的那一步在开发机上根本不存在。
 //!
-//! 契约里有两条只在这一层看得出来：
+//! 契约里有三条只在这一层看得出来：
 //!
 //! - **C8（基址）**：字形区间是 `source.start()` 加上局部偏移。产品链路上
 //!   布局层永远传零基，所以「有没有把起点加回去」在真实调用里没有差别
@@ -15,8 +15,8 @@
 //!   要的是字节。代理对低位不是一个字节边界，落在那里必须失败而不是就近取整
 //!   ——把一个字符劈成两半不报错。这一步交给 [`Utf16Map`]。
 //! - **many-to-many**：一个 source cluster 可能对应多个字形，这些字形共享同一个
-//!   非空 `Glyph::source`。RTL 时字形数组保持 DirectWrite 的原生顺序，不为了
-//!   凑逻辑源码顺序重新排序。
+//!   非空 `Glyph::source`。DirectWrite RTL 数组按逻辑顺序索引；这里转成共享
+//!   布局从左到右的绘制顺序，并将 advance-direction offset 转成 x offset。
 
 use yu_core::{Glyph, GlyphId, GlyphRun, Script, TextDirection, TextRange, TextStyle};
 use yu_font::{FontFaceId, Utf16Map};
@@ -102,7 +102,9 @@ pub fn assemble_run(
         });
     }
 
-    let clusters = glyph_clusters(arrays.cluster_map, glyph_count, direction)?;
+    // DirectWrite indexes glyphs in logical text order even for RTL runs.
+    // Text direction controls drawing, not clusterMap monotonicity.
+    let clusters = glyph_clusters(arrays.cluster_map, glyph_count, TextDirection::Ltr)?;
     let utf16 = Utf16Map::new(text);
     let mut glyph_sources = vec![None; glyph_count];
     for cluster in clusters {
@@ -117,8 +119,12 @@ pub fn assemble_run(
         }
     }
     let mut glyphs = Vec::with_capacity(glyph_count);
-    for (index, range) in glyph_sources.into_iter().enumerate() {
-        let range = range.ok_or(ClusterMapError::UnmappedGlyph { glyph: index })?;
+    for visual_index in 0..glyph_count {
+        let index = match direction {
+            TextDirection::Ltr => visual_index,
+            TextDirection::Rtl => glyph_count - 1 - visual_index,
+        };
+        let range = glyph_sources[index].ok_or(ClusterMapError::UnmappedGlyph { glyph: index })?;
         let advance = arrays.advances[index];
         let (x_offset, y_offset) = arrays.offsets[index];
         if !advance.is_finite() || !x_offset.is_finite() || !y_offset.is_finite() {
@@ -128,7 +134,10 @@ pub fn assemble_run(
             GlyphId::from_raw(u32::from(arrays.glyph_ids[index])),
             range,
             advance,
-            x_offset,
+            match direction {
+                TextDirection::Ltr => x_offset,
+                TextDirection::Rtl => -x_offset,
+            },
             y_offset,
         ));
     }
@@ -278,8 +287,7 @@ mod tests {
         assert_eq!(run.advance(), 5.0);
     }
 
-    /// RTL 保留 DirectWrite 字形数组的原生顺序，但每个 glyph 仍指回正确的逻辑
-    /// source cluster。布局层依据 bidi level 决定 cluster 的物理位置。
+    /// DirectWrite RTL 数组仍按逻辑顺序索引；共享布局需要从左到右的绘制顺序。
     #[test]
     fn rtl_native_glyph_order_maps_back_to_logical_clusters() {
         let run = assemble_run(
@@ -289,7 +297,7 @@ mod tests {
             TextStyle::Plain,
             TextDirection::Rtl,
             Script::Unknown,
-            arrays(&[1, 0], &[20, 21], &[4.0, 5.0], &[(0.0, 0.0); 2]),
+            arrays(&[0, 1], &[20, 21], &[4.0, 5.0], &[(0.0, 0.0); 2]),
         )
         .expect("rtl run");
         let ranges: Vec<(u64, u64)> = run
@@ -298,6 +306,45 @@ mod tests {
             .map(|glyph| (glyph.source().start().get(), glyph.source().end().get()))
             .collect();
         assert_eq!(ranges, vec![(12, 14), (10, 12)]);
+        assert_eq!(run.glyphs()[0].id(), GlyphId::from_raw(21));
+        assert_eq!(run.glyphs()[1].id(), GlyphId::from_raw(20));
+    }
+
+    #[test]
+    fn rtl_multi_glyph_cluster_preserves_native_positions_and_metrics() {
+        let run = assemble_run(
+            FontFaceId::from_raw(1),
+            "א\u{05b0}",
+            source(10, 4),
+            TextStyle::Plain,
+            TextDirection::Rtl,
+            Script::Unknown,
+            arrays(
+                &[0, 0],
+                &[10, 11, 12],
+                &[6.0, 0.0, 4.0],
+                &[(0.25, -3.0), (-1.5, -2.0), (2.0, -1.0)],
+            ),
+        )
+        .expect("RTL combining cluster");
+        let mut pen = 0.0;
+        let origins: Vec<_> = run
+            .glyphs()
+            .iter()
+            .map(|glyph| {
+                assert_eq!(glyph.source(), source(10, 4));
+                let origin = (glyph.id().get(), pen + glyph.x_offset(), glyph.y_offset());
+                pen += glyph.advance();
+                origin
+            })
+            .collect();
+        // Reference: draw DirectWrite's original array from the right edge,
+        // subtract each advance, then subtract its advanceOffset.
+        assert_eq!(
+            origins,
+            vec![(12, -2.0, -1.0), (11, 5.5, -2.0), (10, 3.75, -3.0)]
+        );
+        assert_eq!(run.advance(), 10.0);
     }
 
     /// 非有限的度量不许进 run——它一路飘到布局里会变成 NaN 宽度。

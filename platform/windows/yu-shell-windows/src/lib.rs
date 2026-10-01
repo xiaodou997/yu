@@ -14,6 +14,8 @@ pub mod model;
 mod text_input;
 
 #[cfg(target_os = "windows")]
+mod chrome;
+#[cfg(target_os = "windows")]
 mod native;
 #[cfg(target_os = "windows")]
 mod tsf;
