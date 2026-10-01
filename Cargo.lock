@@ -4062,6 +4062,7 @@ dependencies = [
  "base64 0.22.1",
  "comrak",
  "roxmltree 0.21.1",
+ "same-file",
  "serde_json",
  "tempfile",
  "yu-assets",

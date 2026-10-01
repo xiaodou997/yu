@@ -77,7 +77,7 @@ pub struct Destination {
     path: PathBuf,
     initial: Option<Stamp>,
     parent: PathBuf,
-    parent_identity: Stamp,
+    parent_identity: same_file::Handle,
     publication: Option<std::sync::Arc<HostPublication>>,
 }
 impl Destination {
@@ -160,7 +160,11 @@ impl Destination {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err("无法检查目标文件".into()),
         };
-        let parent_identity = Stamp::from(&fs::metadata(&parent).map_err(|_| "无法检查目标目录")?);
+        // Directory timestamps change when our own staging entries are
+        // created. Keep an OS file identity instead of treating that change
+        // as replacement of the parent directory on Windows.
+        let parent_identity =
+            same_file::Handle::from_path(&parent).map_err(|_| "无法检查目标目录")?;
         Ok(Self {
             path,
             initial,
@@ -171,8 +175,9 @@ impl Destination {
     }
     pub fn validate(&self, protected: &[ProtectedFile]) -> Result<(), String> {
         let parent = self.path.parent().ok_or("目标目录丢失")?;
-        let parent_meta = fs::metadata(parent).map_err(|_| "目标目录已不可访问")?;
-        if !self.parent_identity.same_file(&Stamp::from(&parent_meta)) {
+        let parent_identity =
+            same_file::Handle::from_path(parent).map_err(|_| "目标目录已不可访问")?;
+        if self.parent_identity != parent_identity {
             return Err("导出过程中目标目录已改变".into());
         }
         let current = match fs::symlink_metadata(&self.path) {
@@ -406,6 +411,28 @@ impl FrozenImages {
         {
             let current = fs::metadata(&image.path).map_err(|_| "准备过程中图片消失")?;
             if Stamp::from(&current) != image.stamp {
+                return Err("准备过程中图片改变，请重新导出".into());
+            }
+            // Windows may report the same timestamp for two rapid writes of
+            // equal length. Check the frozen bytes with bounded scratch space
+            // rather than accepting metadata equality as content equality.
+            let mut file = File::open(&image.path).map_err(|_| "准备过程中图片消失")?;
+            let mut buffer = [0; 64 * 1024];
+            for expected in image.bytes.chunks(buffer.len()) {
+                let actual = &mut buffer[..expected.len()];
+                file.read_exact(actual)
+                    .map_err(|_| "准备过程中图片改变，请重新导出")?;
+                if actual != expected {
+                    return Err("准备过程中图片改变，请重新导出".into());
+                }
+            }
+            let mut extra = [0];
+            if file
+                .read(&mut extra)
+                .map_err(|_| "准备过程中图片不可读取")?
+                != 0
+                || Stamp::from(&file.metadata().map_err(|_| "图片身份不可读取")?) != image.stamp
+            {
                 return Err("准备过程中图片改变，请重新导出".into());
             }
         }

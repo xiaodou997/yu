@@ -221,6 +221,28 @@ fn image_snapshot_is_fixed_and_change_is_detected() {
     assert!(images.verify().is_err());
 }
 #[test]
+fn image_snapshot_detects_same_length_rewrite_with_preserved_modified_time() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("image.png");
+    fs::write(&path, b"initial").expect("seed");
+    let modified = fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("modified");
+    let mut images = FrozenImages::new(Some(root.path().join("source.md")), None);
+    images.capture("image.png").expect("capture");
+    assert!(images.verify().is_ok());
+    fs::write(&path, b"changed").expect("same length rewrite");
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("file")
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .expect("restore modified time");
+    assert!(images.verify().is_err());
+    assert_eq!(images.bytes("image.png").expect("frozen"), b"initial");
+}
+#[test]
 fn svg_security_rejects_active_and_external_content() {
     for markup in [
         "<svg><script>x</script></svg>",

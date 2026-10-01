@@ -22,6 +22,28 @@ fn png_directory_publishes_whole_numbered_set() {
     assert!(Destination::capture(&path, false).is_err());
 }
 #[test]
+fn export_destination_rejects_replaced_parent_directory() {
+    let root = tempfile::tempdir().expect("owned root");
+    let parent = root.path().join("parent");
+    fs::create_dir(&parent).expect("parent");
+    let path = parent.join("images");
+    let destination = Destination::capture(&path, false).expect("target");
+    let moved = root.path().join("moved-parent");
+    fs::rename(&parent, &moved).expect("move original directory");
+    fs::create_dir(&parent).expect("replacement directory");
+    fs::write(parent.join("keep"), "KEEP").expect("replacement contents");
+    let result = destination.validate(&[]);
+    assert_eq!(
+        result.expect_err("changed identity"),
+        "导出过程中目标目录已改变"
+    );
+    assert!(!path.exists());
+    assert_eq!(
+        fs::read(parent.join("keep")).expect("external contents"),
+        b"KEEP"
+    );
+}
+#[test]
 fn png_partial_encoding_failure_cleans_only_owned_staging() {
     let root = tempfile::tempdir().expect("root");
     let keep = root.path().join("keep");

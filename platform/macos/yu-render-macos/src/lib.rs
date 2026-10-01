@@ -1802,7 +1802,7 @@ impl MetalCommandQueue {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (device, library);
+            let _ = device;
             Err(MetalRenderError::UnsupportedPlatform)
         }
     }
@@ -1880,7 +1880,7 @@ impl MetalPipeline {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = device;
+            let _ = (device, library);
             Err(MetalRenderError::UnsupportedPlatform)
         }
     }
