@@ -164,7 +164,7 @@ D3D first Present / resize render smoke 已通过，人工交互与 DPI 清单�
 ## 第四组：TSF / IME / 完整编辑输入链
 
 状态：**主体实现、Windows x64 原生构建与 TSF 初始化 smoke 已完成；2026-10-01
-用户确认微软拼音第一轮及新版候选定位、选区取消/替换、Undo/Redo 第二轮通过；完整 IME 与 DPI 人工验收
+用户确认微软拼音第一至第三轮通过，包括新版候选定位、选区替换、Unicode 邻接输入和搜索框 IME；完整 IME 与 DPI 人工验收
 仍未完成，暂不正式结项。**
 
 2026-10-01 真机验收计划见 [Windows 第四组真机验收计划](windows-group4-manual-acceptance.md)。
@@ -180,7 +180,10 @@ D3D first Present / resize render smoke 已通过，人工交互与 DPI 清单�
 `ceshi` 按 Escape 完全取消无残留，Ctrl+Z / Ctrl+Y 正常。
 随后用户确认 `main@fc4558ec` 新版第二轮正常：当前 200% 下候选框靠近光标，
 选区内 composition 取消保留原文、候选仅替换一次、方向键/Enter 和 Undo/Redo 正常。
-这两轮不等于四种 IME 全套通过。其余真实 IME 与 DPI 人工清单待执行，第四组保持未正式结项。
+用户随后确认第三轮 emoji/补充平面字符旁输入与取消、搜索框拼音及焦点返回、
+长文档滚动与最大化/还原后的候选定位正常（当前 200%）。
+这三轮不等于四种 IME 全套或所有 Unicode/键鼠项目通过。
+其余真实 IME 与 DPI 人工清单待执行，第四组保持未正式结项。
 
 本组让第三组的 D3D editor surface 从“可显示”进入“可编辑”：Windows 只负责
 把 TSF、键鼠、剪贴板与屏幕几何翻译到共享 Rust 编辑模型，不建立 RichEdit、

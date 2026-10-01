@@ -37,7 +37,8 @@
 本轮未修改 yu-editor，其前一轮完整回归为 573 passed / 0 failed / 1 ignored。
 本轮控件 DPI 回归不等于真实系统缩放切换；深色控件回归不等于完整系统深色人工验收。
 之前微软拼音人工结果记录在 [真机验收计划](windows-group4-manual-acceptance.md)。
-用户随后确认新版第二轮候选跟随、选区取消/替换及 Undo/Redo 正常（当前 200%）；其余 IME、物理键鼠、
+用户随后确认新版第二、第三轮正常：候选跟随、选区取消/替换、Unicode 邻接输入、
+搜索框 IME、滚动/resize 后候选定位及 Undo/Redo（当前 200%）；其余 IME、物理键鼠、
 单屏实际 DPI 切换和跨屏 DPI 仍按原验收清单推进。彩色 emoji 仍属于第五组。
 
 ## 运行与证据
