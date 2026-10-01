@@ -36,7 +36,7 @@ pub use accessibility::{
     ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED, ACCESSIBILITY_SEMANTIC_FLAG_ORDERED,
     ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE, AccessibilitySemanticKind, AccessibilitySemanticNode,
     AccessibilitySemanticSnapshot, AccessibilityTextError, AccessibilityTextPosition,
-    AccessibilityTextRange, AccessibilityTextSnapshot,
+    AccessibilityTextRange, AccessibilityTextSnapshot, AccessibilityTextUnit,
 };
 pub use blockinput::{
     BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,

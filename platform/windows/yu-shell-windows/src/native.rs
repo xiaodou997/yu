@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -34,14 +34,15 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
+use windows::Win32::UI::Accessibility::{UiaRect, UiaReturnRawElementProvider};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
-    VK_UP,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE,
+    VK_DOWN, VK_END, VK_F6, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -61,11 +62,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
     WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
@@ -81,6 +82,10 @@ use yu_scene::Rect;
 use yu_storage::{ClosePrompt, CloseRequest, CloseTransition};
 use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
 
+use crate::accessibility::{
+    AccessibilityHost, Action as AccessibilityAction, Snapshot as AccessibilitySnapshot,
+    WM_APP_UIA_ACTION,
+};
 use crate::chrome::{
     Chrome, ID_FILES, ID_OUTLINE, ID_QUERY, ID_ROWS, ID_SEARCH, PanelAction, sidebar_width,
 };
@@ -103,6 +108,8 @@ const ID_FILE_EXIT: u16 = 1005;
 const ID_EDIT_UNDO: u16 = 1101;
 const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
+const ID_FOCUS_NEXT: u16 = 1202;
+const ID_FOCUS_PREVIOUS: u16 = 1203;
 const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
 const DRAG_SCROLL_TIMER_ID: usize = 1;
@@ -114,10 +121,10 @@ const TRIPLE_CLICK_RADIUS_PX: i32 = 8;
 const CANCELLED_HRESULT: i32 = 0x8007_04c7_u32 as i32;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 
-struct ComApartment;
+pub(super) struct ComApartment;
 
 impl ComApartment {
-    fn initialize() -> WindowsResult<Self> {
+    pub(super) fn initialize() -> WindowsResult<Self> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         }
@@ -204,6 +211,7 @@ fn read_unicode_clipboard(owner: HWND) -> Result<String, ShellError> {
 }
 
 struct RenderHost {
+    contrast: Option<yu_scene::ContrastPalette>,
     surface_hwnd: HWND,
     builder: ViewportFrameBuilder<DirectWriteShaper>,
     renderer: D3DRenderer,
@@ -227,6 +235,7 @@ impl RenderHost {
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         Ok(Self {
             surface_hwnd,
+            contrast: None,
             builder,
             renderer,
             layout: None,
@@ -316,6 +325,7 @@ impl RenderHost {
         let identity = state.document().identity();
         let path = state.document().session().path().to_path_buf();
         let appearance = self.builder.config().appearance();
+        let contrast = self.contrast;
         if self.document_identity.is_some_and(|old| old != identity) {
             self.renderer.reset_document();
             self.builder
@@ -331,10 +341,14 @@ impl RenderHost {
                 .map_err(|error| ShellError::Platform(error.to_string()))?;
         }
         self.document_identity = Some(identity);
+        self.builder
+            .update_config(self.builder.config().with_contrast_palette(contrast))
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
         if self.resources.as_ref().is_none_or(|resources| {
             resources.identity != identity
                 || resources.path != path
                 || resources.appearance != appearance
+                || resources.contrast != contrast
         }) {
             self.resources = Some(ResourceHost::new(
                 identity,
@@ -342,6 +356,9 @@ impl RenderHost {
                 appearance,
                 self.builder.config().raster_scale(),
             )?);
+            if let Some(resources) = self.resources.as_mut() {
+                resources.contrast = contrast;
+            }
         }
         let resources = self
             .resources
@@ -412,6 +429,8 @@ impl RenderHost {
 }
 
 pub(crate) struct AppWindow {
+    editor_focused: bool,
+    contrast: Option<yu_scene::ContrastPalette>,
     hwnd: HWND,
     sidebar: HWND,
     surface: HWND,
@@ -420,6 +439,7 @@ pub(crate) struct AppWindow {
     state: ShellState,
     render: Option<RenderHost>,
     tsf: Option<TsfHost>,
+    accessibility: Option<AccessibilityHost>,
     drag_anchor: Option<ByteOffset>,
     drag_point: Option<(i32, i32)>,
     last_double_click: Option<(Instant, i32, i32)>,
@@ -431,6 +451,8 @@ impl AppWindow {
     fn new(state: ShellState) -> Self {
         Self {
             hwnd: HWND::default(),
+            editor_focused: false,
+            contrast: None,
             sidebar: HWND::default(),
             surface: HWND::default(),
             status: HWND::default(),
@@ -438,6 +460,7 @@ impl AppWindow {
             state,
             render: None,
             tsf: None,
+            accessibility: None,
             drag_anchor: None,
             drag_point: None,
             last_double_click: None,
@@ -453,6 +476,7 @@ impl AppWindow {
             .map_err(|error| startup_error("install menu", error))?;
         self.create_children()
             .map_err(|error| startup_error("create child windows", error))?;
+        self.accessibility = Some(AccessibilityHost::new(self.surface));
         self.refresh_chrome();
         self.update_layout();
         self.render = Some(
@@ -474,12 +498,14 @@ impl AppWindow {
 
     fn render_current(&mut self) -> Result<(), ShellError> {
         if let Some(chrome) = self.chrome.as_mut() {
+            chrome.set_contrast_palette(self.contrast);
             chrome.refresh(&mut self.state)?;
         }
         let Some(mut render) = self.render.take() else {
             return Ok(());
         };
         render.sync_surface(self.surface, self.state.appearance())?;
+        render.contrast = self.contrast;
         let result = render.render(&mut self.state);
         unsafe {
             if render
@@ -493,7 +519,221 @@ impl AppWindow {
             }
         }
         self.render = Some(render);
-        result
+        result?;
+        self.publish_accessibility()
+    }
+
+    fn publish_accessibility(&mut self) -> Result<(), ShellError> {
+        let Some(host) = self.accessibility.as_ref() else {
+            return Ok(());
+        };
+        let Some(render) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let Some(layout) = render.layout.as_ref() else {
+            return Ok(());
+        };
+        let session = self.state.document().session();
+        let source = session.snapshot();
+        let identity = self.state.document().identity();
+        let previous = host
+            .shared
+            .snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| snapshot.clone());
+        let (semantic, labels) = if let Some(old) = previous
+            .filter(|old| old.identity == identity && old.source.revision() == source.revision())
+        {
+            (old.semantic.clone(), old.labels.clone())
+        } else {
+            let document = session.document().editor();
+            let semantic = Arc::new(
+                yu_editor::AccessibilitySemanticSnapshot::from_document(document)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?,
+            );
+            let labels = semantic
+                .nodes()
+                .iter()
+                .filter(|node| node.index() != 0)
+                .map(|node| {
+                    semantic
+                        .label_text(document, node.index())
+                        .map(|text| (node.index(), text))
+                })
+                .collect::<Result<std::collections::HashMap<_, _>, _>>()
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            (semantic, Arc::new(labels))
+        };
+        let text = yu_editor::AccessibilityTextSnapshot::from_selection(
+            source.clone(),
+            session.selection(),
+        )
+        .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let mut origin = POINT::default();
+        if !unsafe { ClientToScreen(self.surface, &mut origin) }.as_bool() {
+            return Err(platform_error(WindowsError::from_win32()));
+        }
+        let surface = render.renderer.surface();
+        let snapshot = AccessibilitySnapshot {
+            identity,
+            source,
+            text,
+            semantic,
+            labels,
+            layout: layout.clone(),
+            bounds: UiaRect {
+                left: origin.x as f64,
+                top: origin.y as f64,
+                width: surface.pixel_width() as f64,
+                height: surface.pixel_height() as f64,
+            },
+            scale: surface.scale(),
+            scroll_y: render.builder.config().viewport().scroll_y(),
+            focused: self.editor_focused,
+            visible: unsafe {
+                windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.surface)
+            }
+            .as_bool()
+                && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(self.hwnd) }
+                    .as_bool(),
+            caret: session.selection().focus(),
+            name: self
+                .state
+                .document()
+                .display_name(self.state.strings())
+                .to_owned(),
+        };
+        host.publish(snapshot);
+        Ok(())
+    }
+
+    fn accessibility_action(&mut self, action: AccessibilityAction) -> windows::core::Result<()> {
+        if let AccessibilityAction::Focus = action {
+            unsafe {
+                let _ = SetFocus(self.surface);
+            }
+            return Ok(());
+        }
+        let (identity, revision) = match &action {
+            AccessibilityAction::Select {
+                identity, revision, ..
+            }
+            | AccessibilityAction::Scroll {
+                identity, revision, ..
+            }
+            | AccessibilityAction::Toggle {
+                identity, revision, ..
+            } => (*identity, *revision),
+            AccessibilityAction::Focus => unreachable!(),
+        };
+        if identity != self.state.document().identity()
+            || revision != self.state.document().session().revision()
+        {
+            return Err(WindowsError::from_hresult(windows::core::HRESULT(
+                windows::Win32::UI::Accessibility::UIA_E_ELEMENTNOTAVAILABLE as i32,
+            )));
+        }
+        if self.state.document().session().composition().is_some() {
+            return Err(WindowsError::from_hresult(windows::core::HRESULT(
+                windows::Win32::UI::Accessibility::UIA_E_INVALIDOPERATION as i32,
+            )));
+        }
+        let result = (|| -> Result<(), ShellError> {
+            match action {
+                AccessibilityAction::Select { source, .. } => {
+                    let snapshot = self.state.document().session().snapshot();
+                    let selection = EditorSelection::range(
+                        &snapshot,
+                        source.start(),
+                        source.end(),
+                        CaretAffinity::Downstream,
+                    )
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    let before = self.input_projection()?;
+                    let before_selection = self.state.document().session().selection();
+                    self.state
+                        .document_mut()
+                        .session_mut()
+                        .set_selection(selection)?;
+                    self.reveal_panel_selection()?;
+                    self.notify_tsf_after_command(before.end_acp(), before_selection, false)?;
+                }
+                AccessibilityAction::Scroll { source, top, .. } => {
+                    let old_selection = self.state.document().session().selection();
+                    let snapshot = self.state.document().session().snapshot();
+                    let position = if top { source.start() } else { source.end() };
+                    let selection = EditorSelection::range(
+                        &snapshot,
+                        position,
+                        position,
+                        CaretAffinity::Downstream,
+                    )
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    self.state
+                        .document_mut()
+                        .session_mut()
+                        .set_selection(selection)?;
+                    let target = if let Some(render) = self.render.as_ref() {
+                        let config = render.builder.config();
+                        self.state
+                            .document_mut()
+                            .session_mut()
+                            .caret_scroll_request_with_shaper(
+                                config.viewport(),
+                                0.0,
+                                render.builder.shaper(),
+                            )
+                    } else {
+                        self.state
+                            .document_mut()
+                            .session_mut()
+                            .set_selection(old_selection)?;
+                        return Ok(());
+                    };
+                    self.state
+                        .document_mut()
+                        .session_mut()
+                        .set_selection(old_selection)?;
+                    let request = target?;
+                    if let Some(render) = self.render.as_mut() {
+                        let config = render.builder.config();
+                        let caret = request.caret();
+                        let target = if top {
+                            caret.y()
+                        } else {
+                            caret.y() + caret.height() - config.viewport().height()
+                        };
+                        render
+                            .builder
+                            .update_config(viewport_render_config(
+                                render.renderer.surface(),
+                                config.appearance(),
+                                target.max(0.0),
+                            )?)
+                            .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    }
+                    self.render_current()?;
+                    if let Some(tsf) = self.tsf.as_ref() {
+                        tsf.notify_layout_change();
+                    }
+                }
+                AccessibilityAction::Toggle { block, .. } => {
+                    let before = self.input_projection()?;
+                    let before_selection = self.state.document().session().selection();
+                    self.state
+                        .document_mut()
+                        .session_mut()
+                        .execute(EditorCommand::ToggleTask { block })?;
+                    self.refresh_chrome();
+                    self.render_current()?;
+                    self.notify_tsf_after_command(before.end_acp(), before_selection, true)?;
+                }
+                AccessibilityAction::Focus => {}
+            }
+            Ok(())
+        })();
+        result.map_err(|_| WindowsError::from_hresult(windows::Win32::Foundation::E_FAIL))
     }
 
     pub(crate) fn input_projection(&self) -> Result<AcpProjection, ShellError> {
@@ -1445,7 +1685,13 @@ impl AppWindow {
     }
 
     fn apply_system_theme(&mut self) {
-        let dark = system_prefers_dark();
+        self.contrast = crate::contrast::system_contrast();
+        let dark = self.contrast.map_or_else(system_prefers_dark, |c| {
+            u32::from(c.background.red())
+                + u32::from(c.background.green())
+                + u32::from(c.background.blue())
+                < 384
+        });
         self.state.set_appearance(if dark {
             Appearance::YuDark
         } else {
@@ -1459,7 +1705,11 @@ impl AppWindow {
                 ptr::from_ref(&dark_value).cast(),
                 size_of::<BOOL>() as u32,
             );
-            let backdrop = DWMSBT_MAINWINDOW;
+            let backdrop = if self.contrast.is_some() {
+                DWMSBT_NONE
+            } else {
+                DWMSBT_MAINWINDOW
+            };
             let _ = DwmSetWindowAttribute(
                 self.hwnd,
                 DWMWA_SYSTEMBACKDROP_TYPE,
@@ -1471,6 +1721,25 @@ impl AppWindow {
 
     fn handle_command(&mut self, command: u16) -> Result<(), ShellError> {
         match command {
+            ID_FOCUS_NEXT | ID_FOCUS_PREVIOUS => {
+                let mut targets = vec![self.surface];
+                if let Some(chrome) = self.chrome.as_ref() {
+                    targets.extend(chrome.focus_targets());
+                }
+                let focus = unsafe { GetFocus() };
+                let index = targets
+                    .iter()
+                    .position(|target| *target == focus)
+                    .unwrap_or(0);
+                let next = if command == ID_FOCUS_NEXT {
+                    (index + 1) % targets.len()
+                } else {
+                    (index + targets.len() - 1) % targets.len()
+                };
+                unsafe {
+                    let _ = SetFocus(targets[next]);
+                }
+            }
             ID_FILE_NEW => {
                 if self.confirm_replace_current()? {
                     self.state.new_document();
@@ -1874,6 +2143,15 @@ fn run_window(state: ShellState, auto_close: bool) -> Result<(), ShellError> {
 }
 
 fn register_classes() -> Result<(), ShellError> {
+    static REGISTERED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    REGISTERED
+        .get_or_init(|| register_classes_once().map_err(|error| error.to_string()))
+        .as_ref()
+        .copied()
+        .map_err(|message| ShellError::Platform(message.clone()))
+}
+
+fn register_classes_once() -> Result<(), ShellError> {
     let instance = unsafe { GetModuleHandleW(None) }.map_err(platform_error)?;
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.map_err(platform_error)?;
     let main = WNDCLASSEXW {
@@ -1912,6 +2190,16 @@ fn register_classes() -> Result<(), ShellError> {
 
 fn create_accelerators() -> Result<HACCEL, ShellError> {
     let entries = [
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: VK_F6.0,
+            cmd: ID_FOCUS_NEXT,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FSHIFT,
+            key: VK_F6.0,
+            cmd: ID_FOCUS_PREVIOUS,
+        },
         ACCEL {
             fVirt: FCONTROL | FVIRTKEY,
             key: b'N' as u16,
@@ -2099,7 +2387,7 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
-            WM_SETTINGCHANGE => {
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
                 app.apply_system_theme();
                 if let Some(chrome) = app.chrome.as_mut() {
                     chrome.invalidate_font();
@@ -2112,6 +2400,16 @@ unsafe extern "system" fn window_proc(
                     tsf.notify_layout_change();
                 }
                 return LRESULT(0);
+            }
+            WM_MOVE => {
+                let _ = app.publish_accessibility();
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGED => {
+                // WM_SHOWWINDOW precedes the visibility style change. Publish
+                // after DefWindowProc has processed the final window position.
+                let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+                let _ = app.publish_accessibility();
+                return result;
             }
             WM_APP_RENDER => {
                 if let Err(error) = app.render_current() {
@@ -2147,6 +2445,12 @@ unsafe extern "system" fn window_proc(
                 return LRESULT(0);
             }
             WM_DESTROY => {
+                if let Some(chrome) = app.chrome.as_ref() {
+                    chrome.clear_accessibility_annotations();
+                }
+                if let Some(host) = app.accessibility.as_ref() {
+                    host.close();
+                }
                 unsafe {
                     PostQuitMessage(0);
                 }
@@ -2194,15 +2498,33 @@ unsafe extern "system" fn surface_proc(
     if !app_ptr.is_null() {
         let app = unsafe { &mut *app_ptr };
         match message {
+            WM_GETOBJECT => {
+                if let Some(host) = app.accessibility.as_ref() {
+                    return unsafe {
+                        UiaReturnRawElementProvider(hwnd, wparam, lparam, &host.provider)
+                    };
+                }
+            }
+            WM_APP_UIA_ACTION => {
+                if let Some(shared) = app.accessibility.as_ref().map(|host| host.shared.clone())
+                    && let Some(action) = shared.action(wparam.0)
+                {
+                    let result = app.accessibility_action(action);
+                    shared.complete(wparam.0, result);
+                }
+                return LRESULT(0);
+            }
             WM_GETDLGCODE => {
                 return LRESULT(
                     (DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB) as isize,
                 );
             }
             WM_SETFOCUS => {
+                app.editor_focused = true;
                 if let Some(tsf) = app.tsf.as_ref() {
                     tsf.focus();
                 }
+                let _ = app.publish_accessibility();
                 return LRESULT(0);
             }
             WM_KEYDOWN => match app.handle_key_down(wparam) {
@@ -2297,10 +2619,12 @@ unsafe extern "system" fn surface_proc(
                 return LRESULT(0);
             }
             WM_KILLFOCUS => {
+                app.editor_focused = false;
                 app.drag_anchor = None;
                 app.drag_point = None;
                 app.semantic_click = false;
                 app.stop_drag_scroll_timer();
+                let _ = app.publish_accessibility();
             }
             WM_APP_TSF_LOCK => {
                 if let Some(tsf) = app.tsf.as_ref() {
@@ -3116,6 +3440,247 @@ mod tests {
             Appearance::Dark.theme_id()
         );
         assert_eq!(state.document().session().revision(), revision);
+    }
+
+    #[test]
+    fn native_group6_text_provider_actions_contrast_and_lifetime() {
+        use windows::Win32::System::Ole::{SafeArrayDestroy, SafeArrayGetUBound};
+        use windows::Win32::UI::Accessibility::*;
+        use windows::core::{BSTR, Interface};
+        use yu_scene::{ContrastPalette, Rgba8};
+        let _com = ComApartment::initialize().expect("COM");
+        register_classes().expect("process-wide classes");
+        let mut state = ShellState::new(Locale::English);
+        let source =
+            "# Heading\n\nA😀B 👩‍💻 e\u{301} 中文\n\n- [ ] Task\n\n[Link](https://example.com)\n";
+        state
+            .document_mut()
+            .session_mut()
+            .execute(EditorCommand::insert_text(source))
+            .expect("fixture");
+        let mut app = Box::new(AppWindow::new(state));
+        let app_ptr = ptr::from_mut(app.as_mut());
+        let window = Window(
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    MAIN_CLASS,
+                    w!("Yu group6 regression"),
+                    WS_POPUP | WS_CLIPCHILDREN,
+                    60,
+                    60,
+                    1200,
+                    900,
+                    None,
+                    None,
+                    None,
+                    Some(app_ptr.cast()),
+                )
+            }
+            .expect("window"),
+        );
+        app.initialize(window.0).expect("native editor");
+        unsafe {
+            let _ = ShowWindow(
+                window.0,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
+            );
+        }
+        app.publish_accessibility().expect("visible geometry");
+        let provider = app.accessibility.as_ref().expect("host").provider.clone();
+        let text: ITextProvider2 = provider.cast().expect("TextPattern2");
+        let full = unsafe { text.DocumentRange() }.expect("document range");
+        let heading_style = unsafe {
+            full.FindAttribute(
+                UIA_StyleIdAttributeId,
+                &windows::core::VARIANT::from(StyleId_Heading1.0),
+                false,
+            )
+        }
+        .expect("heading in mixed attributes");
+        assert!(
+            unsafe { heading_style.GetText(-1) }
+                .expect("heading source")
+                .to_string()
+                .starts_with("# Heading")
+        );
+        assert_eq!(
+            unsafe { full.GetText(-1) }.expect("text").to_string(),
+            source
+        );
+        assert_eq!(
+            unsafe { text.SupportedTextSelection() }.expect("selection support"),
+            SupportedTextSelection_Single
+        );
+        let emoji = unsafe { full.FindText(&BSTR::from("😀"), false, false) }.expect("find emoji");
+        assert_eq!(
+            unsafe { emoji.GetText(1) }
+                .expect("bounded text")
+                .to_string(),
+            "",
+            "do not truncate a surrogate"
+        );
+        assert_eq!(
+            unsafe { emoji.GetText(2) }
+                .expect("bounded text")
+                .to_string(),
+            "😀"
+        );
+        let copy = unsafe { emoji.Clone() }.expect("clone");
+        assert!(unsafe { copy.Compare(&emoji) }.expect("compare").as_bool());
+        unsafe { emoji.Select() }.expect("native selection marshalled to HWND");
+        let selected = app.state.document().session().selection().ordered_range();
+        assert_eq!(
+            &app.state.document().session().snapshot().as_str()
+                [selected.start().get() as usize..selected.end().get() as usize],
+            "😀"
+        );
+        let rectangles = unsafe { emoji.GetBoundingRectangles() }.expect("geometry");
+        assert!(unsafe { SafeArrayGetUBound(rectangles, 1) }.expect("geometry count") >= 3);
+        unsafe { SafeArrayDestroy(rectangles) }.expect("free geometry");
+        let visible = unsafe { text.GetVisibleRanges() }.expect("visible ranges");
+        assert!(unsafe { SafeArrayGetUBound(visible, 1) }.expect("range count") >= 0);
+        unsafe { SafeArrayDestroy(visible) }.expect("free ranges");
+        let zwj = unsafe { full.FindText(&BSTR::from("👩‍💻"), false, false) }.expect("ZWJ");
+        unsafe { zwj.ExpandToEnclosingUnit(TextUnit_Character) }.expect("grapheme");
+        assert_eq!(
+            unsafe { zwj.GetText(-1) }
+                .expect("grapheme text")
+                .to_string(),
+            "👩‍💻"
+        );
+        assert_eq!(
+            unsafe { zwj.Move(TextUnit_Character, 1) }.expect("character movement"),
+            1
+        );
+        assert_eq!(
+            unsafe { zwj.GetText(-1) }.expect("next unit").to_string(),
+            " "
+        );
+        let fragment: IRawElementProviderFragment = provider.cast().expect("fragment");
+        let heading =
+            unsafe { fragment.Navigate(NavigateDirection_FirstChild) }.expect("semantic heading");
+        let heading: IRawElementProviderSimple = heading.cast().expect("semantic simple");
+        assert_eq!(
+            BSTR::try_from(
+                &unsafe { heading.GetPropertyValue(UIA_NamePropertyId) }.expect("heading name")
+            )
+            .expect("string")
+            .to_string(),
+            "Heading"
+        );
+        assert_eq!(
+            i32::try_from(
+                &unsafe { heading.GetPropertyValue(UIA_HeadingLevelPropertyId) }
+                    .expect("heading level")
+            )
+            .expect("level"),
+            HeadingLevel1.0
+        );
+        let revision = app.state.document().session().revision();
+        let colors = ContrastPalette {
+            background: Rgba8::black(),
+            foreground: Rgba8::new(255, 255, 0, 255),
+            selection: Rgba8::new(0, 0, 255, 255),
+            selected_text: Rgba8::white(),
+        };
+        let word = unsafe { full.FindText(&BSTR::from("中文"), false, false) }.expect("word");
+        unsafe { word.Select() }.expect("select contrast text");
+        app.contrast = Some(colors);
+        app.render
+            .as_mut()
+            .expect("render")
+            .renderer
+            .request_frame_capture();
+        app.render_current().expect("contrast render");
+        let pixels = app
+            .render
+            .as_mut()
+            .expect("render")
+            .renderer
+            .take_captured_frame()
+            .expect("actual GPU capture");
+        let count = |test: fn(&[u8; 4]) -> bool| {
+            pixels
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| test(pixel))
+                .count()
+        };
+        assert!(
+            count(|p| p[0] < 10 && p[1] < 10 && p[2] < 10) > 1000,
+            "opaque black background"
+        );
+        assert!(
+            count(|p| p[0] > 180 && p[1] > 180 && p[2] < 30) > 100,
+            "yellow body text"
+        );
+        assert!(
+            count(|p| p[0] < 30 && p[1] < 30 && p[2] > 180) > 100,
+            "opaque blue selection"
+        );
+        assert!(
+            count(|p| p[0] > 180 && p[1] > 180 && p[2] > 180) > 20,
+            "selected white text survives opaque selection"
+        );
+        assert_eq!(app.state.document().session().revision(), revision);
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
+        app.contrast = None;
+        app.render_current().expect("restore normal colors");
+        assert!(
+            app.render
+                .as_ref()
+                .expect("render")
+                .builder
+                .config()
+                .contrast_palette()
+                .is_none()
+        );
+        app.execute_input_command(EditorCommand::insert_text("X"))
+            .expect("edit");
+        assert_eq!(
+            unsafe { full.GetText(-1) }
+                .expect_err("old range invalidated")
+                .code()
+                .0,
+            UIA_E_ELEMENTNOTAVAILABLE as i32
+        );
+        assert_eq!(
+            unsafe { heading.GetPropertyValue(UIA_NamePropertyId) }
+                .expect_err("old node invalidated")
+                .code()
+                .0,
+            UIA_E_ELEMENTNOTAVAILABLE as i32
+        );
+        let new_range = unsafe { text.DocumentRange() }.expect("new range");
+        assert!(unsafe { new_range.GetText(-1) }.is_ok());
+        unsafe {
+            let _ = ShowWindow(window.0, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+        }
+        app.publish_accessibility().expect("hidden geometry");
+        assert!(
+            bool::try_from(
+                &unsafe { provider.GetPropertyValue(UIA_IsOffscreenPropertyId) }
+                    .expect("hidden state")
+            )
+            .expect("bool")
+        );
+        let invisible = unsafe { text.GetVisibleRanges() }.expect("hidden visible ranges");
+        assert_eq!(
+            unsafe { SafeArrayGetUBound(invisible, 1) }.expect("empty range count"),
+            -1
+        );
+        unsafe { SafeArrayDestroy(invisible) }.expect("free hidden ranges");
+        drop(window);
+        assert_eq!(
+            unsafe { text.DocumentRange() }
+                .expect_err("closed HWND unavailable")
+                .code()
+                .0,
+            UIA_E_ELEMENTNOTAVAILABLE as i32
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ enum Completed {
 }
 
 pub struct ResourceHost {
+    pub contrast: Option<yu_scene::ContrastPalette>,
     jobs: Sender<Job>,
     results: Receiver<Completed>,
     control: RenderControl,
@@ -149,6 +150,7 @@ impl ResourceHost {
             .set_byte_capacity(64 * 1024 * 1024)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         Ok(Self {
+            contrast: None,
             jobs,
             results,
             control,
@@ -358,7 +360,7 @@ impl ResourceHost {
             };
             let style = EmbeddedStyle::new(
                 size,
-                color,
+                self.contrast.map_or(color, |c| c.foreground.packed()),
                 matches!(self.appearance, Appearance::Dark | Appearance::YuDark),
             )
             .ok_or_else(|| ShellError::Platform("Invalid embedded style".into()))?;

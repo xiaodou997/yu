@@ -10,7 +10,9 @@ use windows::Win32::Graphics::Gdi::{
     DrawTextW, FillRect, FillRgn, FrameRgn, HBRUSH, HDC, HFONT, InvalidateRect, RestoreDC, SaveDC,
     ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::SystemServices::SS_OWNERDRAW;
+use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, Name_Property_GUID};
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, EM_SETCUEBANNER, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
 };
@@ -117,6 +119,7 @@ struct Row {
 }
 
 struct Palette {
+    selected_text: COLORREF,
     background: Brush,
     input: Brush,
     selected: Brush,
@@ -135,6 +138,28 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16))
 }
 impl Palette {
+    fn contrast(appearance: Appearance, colors: yu_scene::ContrastPalette) -> Self {
+        let mut palette = Self::new(appearance);
+        let background = crate::contrast::colorref(colors.background);
+        let foreground = crate::contrast::colorref(colors.foreground);
+        let selected = crate::contrast::colorref(colors.selection);
+        let selected_text = crate::contrast::colorref(colors.selected_text);
+        palette.canvas = Brush::new(background);
+        palette.background = Brush::new(background);
+        palette.input = Brush::new(background);
+        palette.track = Brush::new(background);
+        palette.hover = Brush::new(background);
+        palette.border = Brush::new(foreground);
+        palette.selected = Brush::new(selected);
+        palette.nav_selected = Brush::new(selected);
+        palette.text = foreground;
+        palette.muted = foreground;
+        palette.accent = selected_text;
+        palette.selected_text = selected_text;
+        palette.background_color = background;
+        palette.input_color = background;
+        palette
+    }
     fn new(appearance: Appearance) -> Self {
         let dark = matches!(appearance, Appearance::Dark | Appearance::YuDark);
         let background = if dark {
@@ -148,6 +173,11 @@ impl Palette {
             rgb(255, 255, 255)
         };
         Self {
+            selected_text: if dark {
+                rgb(232, 234, 238)
+            } else {
+                rgb(44, 49, 58)
+            },
             canvas: Brush::new(rgb(
                 appearance.background().red(),
                 appearance.background().green(),
@@ -202,6 +232,7 @@ impl Palette {
 }
 
 pub(crate) struct Chrome {
+    accessibility: IAccPropServices,
     canvas: HWND,
     pub(crate) background: HWND,
     pub(crate) status: HWND,
@@ -217,6 +248,7 @@ pub(crate) struct Chrome {
     locale: Locale,
     dpi: u32,
     palette: Palette,
+    contrast: Option<yu_scene::ContrastPalette>,
     appearance: Appearance,
     mode: SidebarMode,
     rows: Vec<Row>,
@@ -227,6 +259,32 @@ pub(crate) struct Chrome {
 }
 
 impl Chrome {
+    pub(crate) fn set_contrast_palette(&mut self, contrast: Option<yu_scene::ContrastPalette>) {
+        if self.contrast == contrast {
+            return;
+        }
+        self.contrast = contrast;
+        self.palette = contrast.map_or_else(
+            || Palette::new(self.appearance),
+            |c| Palette::contrast(self.appearance, c),
+        );
+        for hwnd in self.controls() {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+        }
+    }
+
+    pub(crate) fn focus_targets(&self) -> Vec<HWND> {
+        self.tabs
+            .iter()
+            .copied()
+            .chain([self.query, self.list])
+            .filter(|hwnd| {
+                unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*hwnd) }.as_bool()
+            })
+            .collect()
+    }
     pub(crate) fn new(parent: HWND, state: &ShellState) -> Result<Self, ShellError> {
         let strings = state.strings();
         let canvas = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2014, false)?;
@@ -326,7 +384,22 @@ impl Chrome {
                 LPARAM(cue.as_ptr() as isize),
             );
         }
+        let accessibility: IAccPropServices =
+            unsafe { CoCreateInstance(&CAccPropServices, None, CLSCTX_INPROC_SERVER) }
+                .map_err(error)?;
+        let label = wide(strings.search());
+        unsafe {
+            accessibility.SetHwndPropStr(
+                query,
+                (-4i32) as u32,
+                0,
+                Name_Property_GUID,
+                PCWSTR(label.as_ptr()),
+            )
+        }
+        .map_err(error)?;
         Ok(Self {
+            accessibility,
             canvas,
             background,
             status,
@@ -342,6 +415,7 @@ impl Chrome {
             locale: state.locale(),
             dpi: 0,
             palette: Palette::new(state.appearance()),
+            contrast: None,
             appearance: state.appearance(),
             mode: state.sidebar(),
             rows: Vec::new(),
@@ -472,6 +546,30 @@ impl Chrome {
         self.rows = rows;
         self.caption_text = caption;
         self.empty_text = empty_text;
+        for (hwnd, label) in [
+            (
+                self.list,
+                match mode {
+                    SidebarMode::Files => strings.files(),
+                    SidebarMode::Outline => strings.outline(),
+                    _ => strings.search(),
+                },
+            ),
+            (self.caption, self.caption_text.as_str()),
+            (self.empty, self.empty_text.as_str()),
+        ] {
+            let label = wide(label);
+            unsafe {
+                self.accessibility.SetHwndPropStr(
+                    hwnd,
+                    (-4i32) as u32,
+                    0,
+                    Name_Property_GUID,
+                    PCWSTR(label.as_ptr()),
+                )
+            }
+            .map_err(error)?;
+        }
         unsafe {
             SendMessageW(self.list, WM_SETREDRAW, WPARAM(0), LPARAM(0));
             SendMessageW(self.list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
@@ -550,7 +648,10 @@ impl Chrome {
             }
         }
         if self.appearance != appearance {
-            self.palette = Palette::new(appearance);
+            self.palette = self.contrast.map_or_else(
+                || Palette::new(appearance),
+                |c| Palette::contrast(appearance, c),
+            );
             self.appearance = appearance;
         }
         let (width, height) = (metrics.width_px() as i32, metrics.height_px() as i32);
@@ -684,6 +785,18 @@ impl Chrome {
             self.query_frame,
         ]
     }
+    pub(crate) fn clear_accessibility_annotations(&self) {
+        for hwnd in [self.query, self.list, self.caption, self.empty] {
+            unsafe {
+                let _ = self.accessibility.ClearHwndProps(
+                    hwnd,
+                    (-4i32) as u32,
+                    0,
+                    &[Name_Property_GUID],
+                );
+            }
+        }
+    }
     fn repaint(&self) {
         for hwnd in self.controls() {
             unsafe {
@@ -808,6 +921,7 @@ impl Chrome {
                 String::new()
             } else if hwnd == self.list {
                 if item.itemState.0 & ODS_SELECTED.0 != 0 {
+                    text_color = self.palette.selected_text;
                     let fill = RECT {
                         left: rect.left + px(2),
                         top: rect.top + px(2),
@@ -1107,6 +1221,7 @@ mod tests {
 
     #[test]
     fn native_controls_replace_fonts_and_row_heights_across_dpi() {
+        let _com = crate::native::ComApartment::initialize().expect("COM for annotations");
         let window = window();
         let state = ShellState::new(Locale::English);
         let mut chrome = Chrome::new(window.0, &state).expect("controls");
@@ -1153,6 +1268,7 @@ mod tests {
 
     #[test]
     fn native_panels_use_shared_labels_and_unicode_ranges_after_edits() {
+        let _com = crate::native::ComApartment::initialize().expect("COM for annotations");
         let window = window();
         let mut state = ShellState::new(Locale::SimplifiedChinese);
         let source = "# **中文** 😀\n\n## Child `code`\n\n中文😀 中文😀\n";
