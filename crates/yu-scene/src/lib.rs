@@ -904,7 +904,108 @@ pub struct Scene {
     damage: DamageSet,
 }
 
+/// Native user-selected contrast colors for shared text and editor roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContrastPalette {
+    pub background: Rgba8,
+    pub foreground: Rgba8,
+    pub selection: Rgba8,
+    pub selected_text: Rgba8,
+}
+
 impl Scene {
+    /// Paint opaque selection beneath text while keeping source and geometry.
+    #[must_use]
+    pub fn with_contrast_palette(mut self, colors: ContrastPalette, raster_scale: f32) -> Self {
+        let selected: Vec<Rect> = self
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::EditorDecoration(d)
+                    if d.role == EditorDecorationPrimitiveRole::Selection =>
+                {
+                    Some(d.bounds)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut backgrounds = Vec::new();
+        let mut selections = Vec::new();
+        let mut foregrounds = Vec::new();
+        for mut primitive in self.primitives {
+            match &mut primitive {
+                Primitive::FillRect { color, bounds } => {
+                    *color = if bounds.width() <= 1.0 || bounds.height() <= 1.0 {
+                        colors.foreground
+                    } else {
+                        colors.background
+                    };
+                    backgrounds.push(primitive);
+                }
+                Primitive::RoundedFillRect { color, shadow, .. } => {
+                    *color = colors.background;
+                    *shadow = None;
+                    backgrounds.push(primitive);
+                }
+                Primitive::Image(image) => {
+                    image.fallback = colors.foreground;
+                    backgrounds.push(primitive);
+                }
+                Primitive::EmbeddedSvg(svg) => {
+                    svg.fallback = colors.foreground;
+                    backgrounds.push(primitive);
+                }
+                Primitive::Glyph(glyph) => {
+                    let metrics = glyph.atlas.metrics();
+                    let center = Point::new(
+                        glyph.origin.x()
+                            + (metrics.bearing_x() + glyph.atlas.rect().width() as f32 * 0.5)
+                                / raster_scale,
+                        glyph.origin.y()
+                            + (-metrics.bearing_y() + glyph.atlas.rect().height() as f32 * 0.5)
+                                / raster_scale,
+                    );
+                    glyph.color = if selected.iter().any(|rect| rect.contains(center)) {
+                        colors.selected_text
+                    } else {
+                        colors.foreground
+                    };
+                    foregrounds.push(primitive);
+                }
+                Primitive::Ornament(ornament) => {
+                    ornament.color = colors.foreground;
+                    foregrounds.push(primitive);
+                }
+                Primitive::EditorDecoration(decoration) => {
+                    if decoration.role == EditorDecorationPrimitiveRole::Selection {
+                        decoration.color = colors.selection;
+                        selections.push(primitive);
+                    } else if matches!(
+                        decoration.role,
+                        EditorDecorationPrimitiveRole::SearchMatch
+                            | EditorDecorationPrimitiveRole::SearchCurrent
+                    ) {
+                        decoration.color = colors.foreground;
+                        decoration.bounds = Rect::new(
+                            decoration.bounds.x(),
+                            decoration.bounds.y() + decoration.bounds.height() - 1.0,
+                            decoration.bounds.width(),
+                            1.0,
+                        )
+                        .expect("valid search underline");
+                        foregrounds.push(primitive);
+                    } else {
+                        decoration.color = colors.foreground;
+                        foregrounds.push(primitive);
+                    }
+                }
+            }
+        }
+        backgrounds.extend(selections);
+        backgrounds.extend(foregrounds);
+        self.primitives = backgrounds;
+        self
+    }
     #[must_use]
     pub fn revision(&self) -> Revision {
         self.revision

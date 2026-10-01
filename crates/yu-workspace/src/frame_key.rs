@@ -222,6 +222,7 @@ impl FrameTableResize {
 /// 一次 `Vec` 分配（N 是光标数）换掉一个不报错的漏画，这笔账不用算。
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameBuildKey {
+    contrast: Option<yu_scene::ContrastPalette>,
     revision: u64,
     source_mode: bool,
     focus_mode: bool,
@@ -287,6 +288,7 @@ impl FrameBuildKey {
         Self {
             revision,
             source_mode: false,
+            contrast: None,
             focus_mode: false,
             spelling_generation: 0,
             disclosure_fingerprint: 0,
@@ -315,6 +317,12 @@ pub struct FrameKey {
 }
 
 impl FrameKey {
+    /// Native palette changes invalidate same-revision worker publications.
+    #[must_use]
+    pub fn with_contrast_palette(mut self, palette: Option<yu_scene::ContrastPalette>) -> Self {
+        self.build.contrast = palette;
+        self
+    }
     #[must_use]
     pub fn with_disclosure_fingerprint(mut self, fingerprint: u64) -> Self {
         self.build.disclosure_fingerprint = fingerprint;
@@ -555,6 +563,22 @@ mod tests {
         assert_eq!(old.presentation(), focused.presentation());
         assert!(!FrameBuildRequest::new(old.build().clone(), 1).accepts(focused.build(), 1));
         assert_eq!(old, focused.with_focus_mode(false));
+    }
+
+    #[test]
+    fn contrast_theme_rejects_old_frames_without_editing_source_or_geometry() {
+        use yu_scene::{ContrastPalette, Rgba8};
+        let old = FrameKey::new(7, 0, Vec::new(), 0, None, Appearance::Light, geometry());
+        let contrasted = old.clone().with_contrast_palette(Some(ContrastPalette {
+            background: Rgba8::new(0, 0, 0, 255),
+            foreground: Rgba8::new(255, 255, 0, 255),
+            selection: Rgba8::new(0, 0, 255, 255),
+            selected_text: Rgba8::new(255, 255, 255, 255),
+        }));
+        assert_ne!(old.build(), contrasted.build());
+        assert_eq!(old.presentation(), contrasted.presentation());
+        assert!(!FrameBuildRequest::new(old.build().clone(), 1).accepts(contrasted.build(), 1));
+        assert_eq!(old, contrasted.with_contrast_palette(None));
     }
 
     #[test]

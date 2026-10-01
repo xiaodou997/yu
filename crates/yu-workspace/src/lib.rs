@@ -1988,6 +1988,7 @@ impl ViewportRenderFrame {
 /// Immutable inputs shared by one scene/render frame build.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportRenderConfig {
+    contrast: Option<yu_scene::ContrastPalette>,
     viewport: ViewportSpan,
     font_size: f32,
     /// 编辑区背景色。
@@ -2012,6 +2013,19 @@ pub struct ViewportRenderConfig {
 
 impl ViewportRenderConfig {
     #[must_use]
+    pub const fn with_contrast_palette(
+        mut self,
+        contrast: Option<yu_scene::ContrastPalette>,
+    ) -> Self {
+        self.contrast = contrast;
+        self
+    }
+
+    #[must_use]
+    pub const fn contrast_palette(self) -> Option<yu_scene::ContrastPalette> {
+        self.contrast
+    }
+    #[must_use]
     pub const fn new(
         viewport: ViewportSpan,
         font_size: f32,
@@ -2021,6 +2035,7 @@ impl ViewportRenderConfig {
         Self {
             viewport,
             font_size,
+            contrast: None,
             background: Rgba8::white(),
             raster_scale: 1.0,
             scene_viewport,
@@ -3406,22 +3421,29 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
     image_intrinsics: &[ImageIntrinsicPublication],
     embedded_publications: &[EmbeddedRenderPublication],
 ) -> Result<ViewportRenderFrame, ViewportSceneError> {
-    let scene = assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize(
-        document,
-        viewport,
-        shaper,
-        config.font_size(),
-        config.scene_viewport(),
-        atlas,
-        config.color(),
-        config.background(),
-        image_publications,
-        image_intrinsics,
-        embedded_publications,
-        config.table_resize(),
-        config.editor_decorations(),
-        config.appearance(),
-    )?;
+    let mut scene =
+        assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize(
+            document,
+            viewport,
+            shaper,
+            config.font_size(),
+            config.scene_viewport(),
+            atlas,
+            config.color(),
+            config.background(),
+            image_publications,
+            image_intrinsics,
+            embedded_publications,
+            config.table_resize(),
+            config.editor_decorations(),
+            config.appearance(),
+        )?;
+    if let Some(contrast) = config.contrast_palette() {
+        scene.scene = scene
+            .scene
+            .with_contrast_palette(contrast, config.raster_scale());
+        scene.background = contrast.background;
+    }
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
             expected: document.revision(),

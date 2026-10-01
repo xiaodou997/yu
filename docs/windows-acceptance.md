@@ -301,3 +301,22 @@ GPU 恢复验证读取实际渲染目标，并要求重建前后像素完全一�
 完整证据、复现命令、资源限制和剩余兼容性范围见
 [第五组原生验收记录](windows-group5-native-acceptance-20261001.md)。
 下一阶段为第六组 UI Automation / Narrator / Contrast Theme；签名与发布包装仍为第七组。
+
+## 第六组：UI Automation / Narrator 接线 / Contrast Theme
+
+状态：**2026-10-01 软件实现与本机自动验收完成。Narrator 实际语音和系统对比主题
+实际切换尚未验收，不计入本轮通过声明。**
+
+真实编辑 HWND 已暴露 TextPattern / TextPattern2、选区 / caret / 可见范围、共享
+Markdown 语义节点、任务 Toggle、屏幕几何及事件；原生动作经过现有 editor model。
+F6 / Shift+F6 可在正文与可见侧栏间切换；搜索框有系统 UIA 名称。
+对比模式使用系统颜色，不透明选区下的文字通过实际 GPU 读回验证，普通模式恢复通过。
+
+独立进程 UIA 客户端 37 项通过；字体 / D3D / shell 常规测试 20 / 4 / 22 项通过，
+第五组真实资源集成显式重跑通过。全 workspace 1,532 项通过、0 失败，4 项默认
+ignored（其中资源集成已另行执行）；全仓 all-targets clippy、fmt、diff 与依赖方向通过。
+扩大验证时发现的 Windows 编译 cfg、PNG 导出目录身份和图片同长度改写漏检已修复。
+
+完整证据、复现入口和未验范围见
+[第六组原生验收记录](windows-group6-native-acceptance-20261001.md)。
+下一阶段为第七组发布包装；Narrator / 系统主题人工体验仍保留独立验收项。

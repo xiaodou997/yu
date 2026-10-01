@@ -9,6 +9,16 @@ use yu_markdown::{
 use yu_text::{TextPositionError, TextSnapshot};
 
 use crate::{EditorDocument, EditorSelection};
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Source text units shared by native accessibility range adapters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessibilityTextUnit {
+    Character,
+    Word,
+    Paragraph,
+    Document,
+}
 
 /// A native UTF-16 position bound to one immutable document revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +187,46 @@ pub struct AccessibilitySemanticSnapshot {
 }
 
 impl AccessibilitySemanticSnapshot {
+    /// Resolve a native label from the same canonical revision, including HTML
+    /// entities and inline tags handled by the existing Markdown HTML model.
+    pub fn label_text(
+        &self,
+        document: &EditorDocument,
+        index: u32,
+    ) -> Result<String, AccessibilityTextError> {
+        let snapshot = document.snapshot();
+        if self.revision != snapshot.revision() {
+            return Err(AccessibilityTextError::StaleRevision {
+                expected: snapshot.revision(),
+                actual: self.revision,
+            });
+        }
+        let node = self
+            .node(index)
+            .ok_or(AccessibilityTextError::SemanticNodeOverflow)?;
+        let range =
+            AccessibilityTextSnapshot::from_document(document)?.source_range(node.label_range())?;
+        if let Some(text) = document
+            .markdown()
+            .html_regions()
+            .region_for(range)
+            .and_then(|region| region.model.as_ref().ok())
+            .and_then(|model| model.accessible_text(snapshot.as_str(), range))
+        {
+            return Ok(text);
+        }
+        let text = collect_text(&snapshot, range)?;
+        Ok(
+            if matches!(
+                node.kind(),
+                AccessibilitySemanticKind::ListItem | AccessibilitySemanticKind::TaskListItem
+            ) {
+                text.trim().to_owned()
+            } else {
+                text
+            },
+        )
+    }
     /// Builds a fresh tree from the canonical Markdown blocks and inline spans.
     /// The tree owns only compact node metadata and source ranges.
     pub fn from_document(document: &EditorDocument) -> Result<Self, AccessibilityTextError> {
@@ -374,6 +424,102 @@ pub struct AccessibilityTextSnapshot {
 }
 
 impl AccessibilityTextSnapshot {
+    /// Literal search with offsets mapped back to the original source even
+    /// when Unicode lowercase mapping expands a scalar.
+    pub fn find_text(
+        &self,
+        range: AccessibilityTextRange,
+        query: &str,
+        backwards: bool,
+        ignore_case: bool,
+    ) -> Result<Option<AccessibilityTextRange>, AccessibilityTextError> {
+        let source = self.source_range(range)?;
+        let text = self.text_for_range(range)?;
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let hit = if ignore_case {
+            let mut folded = String::new();
+            let mut boundaries = vec![(0, 0)];
+            for (index, scalar) in text.char_indices() {
+                folded.extend(scalar.to_lowercase());
+                boundaries.push((folded.len(), index + scalar.len_utf8()));
+            }
+            let wanted = query.to_lowercase();
+            let mut found = None;
+            let matches: Box<dyn Iterator<Item = (usize, &str)> + '_> = if backwards {
+                Box::new(folded.rmatch_indices(wanted.as_str()))
+            } else {
+                Box::new(folded.match_indices(wanted.as_str()))
+            };
+            for (index, hit) in matches {
+                let Ok(start) = boundaries.binary_search_by_key(&index, |entry| entry.0) else {
+                    continue;
+                };
+                let Ok(end) =
+                    boundaries.binary_search_by_key(&(index + hit.len()), |entry| entry.0)
+                else {
+                    continue;
+                };
+                found = Some((boundaries[start].1, boundaries[end].1));
+                break;
+            }
+            found
+        } else if backwards {
+            text.rfind(query).map(|start| (start, start + query.len()))
+        } else {
+            text.find(query).map(|start| (start, start + query.len()))
+        };
+        hit.map(|(start, end)| {
+            self.range_for_source(
+                TextRange::new(
+                    ByteOffset::new(source.start().get() + start as u64),
+                    ByteOffset::new(source.start().get() + end as u64),
+                )
+                .expect("ordered literal match"),
+            )
+        })
+        .transpose()
+    }
+    /// Ordered UTF-16 unit starts and document end. Characters are extended
+    /// graphemes; paragraphs use the canonical LF line model.
+    pub fn unit_boundaries(
+        &self,
+        unit: AccessibilityTextUnit,
+    ) -> Result<Vec<Utf16Offset>, AccessibilityTextError> {
+        let mut positions = vec![Utf16Offset::ZERO];
+        match unit {
+            AccessibilityTextUnit::Character => {
+                let mut byte = ByteOffset::ZERO;
+                while byte < self.source.len_bytes() {
+                    byte = crate::command::next_grapheme_boundary(&self.source, byte).map_err(
+                        |_| AccessibilityTextError::InvalidSourceRange(TextRange::empty(byte)),
+                    )?;
+                    positions.push(self.source.utf16_offset(byte)?);
+                }
+            }
+            AccessibilityTextUnit::Word => {
+                let text = self.text_for_range(self.full_range())?;
+                let mut units = 0;
+                for part in text.split_word_bounds() {
+                    units += part.encode_utf16().count() as u64;
+                    positions.push(Utf16Offset::new(units));
+                }
+            }
+            AccessibilityTextUnit::Paragraph => {
+                for index in 1..self.source.summary().line_count() {
+                    positions.push(
+                        self.source
+                            .utf16_offset(self.source.line_start(LineIndex::new(index))?)?,
+                    );
+                }
+            }
+            AccessibilityTextUnit::Document => {}
+        }
+        positions.push(self.number_of_characters());
+        positions.dedup();
+        Ok(positions)
+    }
     /// Creates an accessibility snapshot from the document's canonical source
     /// and revision-bound selection.
     pub fn from_document(document: &EditorDocument) -> Result<Self, AccessibilityTextError> {
@@ -632,6 +778,17 @@ fn push_semantic_node(
 /// 认识 Markdown 语法）；此前这里自己扫了一遍 `#`，于是 Setext 标题会带着
 /// 一行 `===` 被读出来。
 fn semantic_block_label_range(markdown: &MarkdownDocument, block: Block) -> TextRange {
+    let start = match block.kind() {
+        BlockKind::TaskListItem { .. } => {
+            yu_markdown::task_marker(markdown.source(), block).map(|marker| marker.range().end())
+        }
+        BlockKind::ListItem { .. } => yu_markdown::list_marker(markdown.source(), block)
+            .map(|marker| marker.prefix_range().end()),
+        _ => None,
+    };
+    if let Some(start) = start {
+        return TextRange::new(start, block.range().end()).unwrap_or(block.range());
+    }
     yu_markdown::heading_content_range(markdown, block)
 }
 
@@ -743,6 +900,121 @@ impl From<InlineParseError> for AccessibilityTextError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_search_maps_expanding_case_and_backwards_matches_to_source() {
+        let document = EditorDocument::new("😀 İ hello İ HELLO");
+        let snapshot = AccessibilityTextSnapshot::from_document(&document).expect("snapshot");
+        let query = "i\u{307}";
+        let first = snapshot
+            .find_text(snapshot.full_range(), query, false, true)
+            .expect("search")
+            .expect("first");
+        let last = snapshot
+            .find_text(snapshot.full_range(), query, true, true)
+            .expect("search")
+            .expect("last");
+        assert_eq!(first.range(), utf16_range(3, 4));
+        assert_eq!(last.range(), utf16_range(11, 12));
+        assert_eq!(snapshot.text_for_range(first).expect("source"), "İ");
+        assert!(
+            snapshot
+                .find_text(snapshot.full_range(), "i", false, true)
+                .expect("partial expansion")
+                .is_none()
+        );
+        let clipped = snapshot.bind_range(utf16_range(4, 11)).expect("clip");
+        assert!(
+            snapshot
+                .find_text(clipped, query, false, true)
+                .expect("clipped search")
+                .is_none()
+        );
+        let last_word = snapshot
+            .find_text(snapshot.full_range(), "hello", true, true)
+            .expect("word")
+            .expect("last word");
+        assert_eq!(
+            snapshot.text_for_range(last_word).expect("original"),
+            "HELLO"
+        );
+        let overlap = AccessibilityTextSnapshot::from_document(&EditorDocument::new("aaaaa"))
+            .expect("overlap snapshot");
+        assert_eq!(
+            overlap
+                .find_text(overlap.full_range(), "AA", true, true)
+                .expect("backwards overlap")
+                .expect("match")
+                .range(),
+            utf16_range(3, 5)
+        );
+    }
+
+    #[test]
+    fn native_task_labels_keep_content_and_exclude_parser_owned_markers() {
+        let document =
+            EditorDocument::new("- [ ] Accessible task\n- [x] 完成\n\n1. Ordinary item\n");
+        let semantic = AccessibilitySemanticSnapshot::from_document(&document).expect("tree");
+        let labels: Vec<_> = semantic
+            .nodes()
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.kind(),
+                    AccessibilitySemanticKind::TaskListItem | AccessibilitySemanticKind::ListItem
+                )
+            })
+            .map(|n| semantic.label_text(&document, n.index()).expect("label"))
+            .collect();
+        assert_eq!(labels, ["Accessible task", "完成", "Ordinary item"]);
+    }
+    #[test]
+    fn native_units_keep_zwj_combining_surrogates_and_crlf_whole() {
+        use super::*;
+        let document = EditorDocument::new("A👩‍💻e\u{301}\r\n中文\n");
+        let snapshot = AccessibilityTextSnapshot::from_document(&document).expect("snapshot");
+        let chars = snapshot
+            .unit_boundaries(AccessibilityTextUnit::Character)
+            .expect("characters");
+        let offsets: Vec<_> = chars.iter().map(|p| p.get()).collect();
+        assert_eq!(offsets, vec![0, 1, 6, 8, 10, 11, 12, 13]);
+        for pair in chars.windows(2) {
+            snapshot
+                .bind_range(Utf16Range::new(pair[0], pair[1]).expect("range"))
+                .expect("scalar-safe range");
+        }
+        assert_eq!(
+            snapshot
+                .unit_boundaries(AccessibilityTextUnit::Paragraph)
+                .expect("paragraphs")
+                .iter()
+                .map(|p| p.get())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 13]
+        );
+        assert!(
+            snapshot.bind_position(Utf16Offset::new(2)).is_err(),
+            "surrogate midpoint must be rejected"
+        );
+    }
+
+    #[test]
+    fn native_semantic_labels_use_the_existing_html_model() {
+        use super::*;
+        let document = EditorDocument::new(
+            "<details><summary><strong>中文</strong> &amp; test</summary>\nbody\n</details>\n",
+        );
+        let semantic =
+            AccessibilitySemanticSnapshot::from_document(&document).expect("semantic tree");
+        let node = semantic
+            .nodes()
+            .iter()
+            .find(|n| n.kind() == AccessibilitySemanticKind::Disclosure)
+            .expect("disclosure");
+        assert_eq!(
+            semantic.label_text(&document, node.index()).expect("label"),
+            "中文 & test"
+        );
+    }
     use super::*;
     use crate::{CaretAffinity, EditorCommand};
     use yu_core::ByteOffset;

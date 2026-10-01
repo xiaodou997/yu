@@ -21,6 +21,10 @@ try {
     Write-Host "==> Windows HWND + DirectWrite + D3D render smoke"
     cargo run -p yu-shell-windows -- --window-self-check
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    Write-Host "==> Windows external UI Automation client / actions / notifications"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Mta -File (Join-Path $PSScriptRoot 'verify-accessibility.ps1')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
     Pop-Location
