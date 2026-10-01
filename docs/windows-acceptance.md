@@ -2,7 +2,9 @@
 
 ## 第二组：原生 Windows 产品壳
 
-状态：**实现与 Windows x64 目标构建已完成；真实 Windows 会话窗口 smoke 待执行。**
+状态：**实现与 Windows x64 目标构建已完成；2026-10-01 真实 Windows 11 x64 HWND
+启动与 clean close smoke 已通过；同日已补齐侧栏与状态栏的基础界面，
+当前 200% DPI 下可见窗口检查通过，完整人工交互及其他缩放比例待验收。**
 
 本组只建立平台产品壳与文档生命周期，不提前实现后续组的 D3D 渲染、
 完整 DirectWrite、TSF 或 UI Automation。编辑器区域是独立的原生 surface host，
@@ -30,6 +32,32 @@
 - 新增独立 `windows-shell` CI job、PowerShell self-check 和
   `tools/check-platform-parity.py`，第二个平台不会再掉出验证面。
 
+### 2026-10-01 可见界面缺口及修复
+
+用户提供的当前窗口截图显示：侧栏与状态栏文字过小，侧栏缺少正常导航样式和内容。
+源码核对确认侧栏只是单个 `STATIC` 控件中的“文件 / 大纲 / 搜索”占位字符串，
+不是三个可切换的导航控件，也没有文件列表、大纲列表或搜索输入与结果面板。
+侧栏和状态栏未设置 UI 字体，尺寸布局虽按 DPI 缩放，字体未随之配置；
+同时缺少内边距、选中/悬停状态及侧栏/状态栏的完整主题绘制。
+现有 HWND / Present / TSF smoke 不能作为这些视觉和功能项的通过证据。
+该缺口属于产品壳补齐项，不能用第四组输入测试通过或第五组资源功能替代。
+
+同日已在工作区修复：侧栏、状态栏使用按 DPI 获取的系统 UI 字体，增加内边距、
+导航选中/悬停/焦点状态及浅色/深色绘制。三个导航接入当前目录 Markdown 文件列表、
+共享 `OutlineTree` 大纲和共享 `SearchResults` 文内搜索；跳转复用共享选区与 caret 滚动。
+同时修复渲染实测布局未同步回编辑器、scene viewport 未携带滚动原点的问题。
+原生字体 19/19、render 2/2、shell 19/19 和真实窗口 smoke 通过。
+当前 192 DPI（200%）已检查三个页面、Unicode 搜索、目标可见及文件打开的实际截图。
+该检查使用定向 Win32 消息，不构成物理键鼠或真实 IME 通过记录。
+文件面板目前是同目录 Markdown 列表，大纲目前按层级缩进展示；
+文件夹树、大纲折叠等完整 macOS 面板功能对齐未包含在本轮验收。
+详见 [侧栏与滚动修复记录](windows-chrome-native-fix-20261001.md)。
+
+随后按用户反馈继续优化样式：采用共享 Yu 浅色/深色主题、圆角分段导航、
+按界面语言选择的 UI 字体、辅助文字层级、左右分布的轻量状态栏和带留白的正文阅读列。
+原生 DPI 字体、正文 HWND 层级、caret 屏幕坐标与 ACP 命中回归通过。
+详见 [Windows 样式优化记录](windows-style-polish-20261001.md)。
+
 ### 已执行验证
 
 - `cargo test -p yu-shell-windows`：8 项通过。
@@ -56,9 +84,9 @@
 `--window-self-check`：创建真实 HWND、菜单/子窗口/DPI/主题状态，然后对一个 clean
 临时文档自动走正常关闭路径。
 
-当前开发 Runner 是 macOS，且本次分支推送没有生成 GitHub workflow run，因此
-**真实 HWND 启动 smoke 尚未被执行**。这项必须在可用 Windows runner/真机上补绿，
-不能用交叉编译冒充。
+此前 macOS 开发与交叉编译未覆盖真实 HWND 运行。2026-10-01 已在本机 Windows 11 x64
+补绿，证据见 [原生修复记录](windows-group4-native-fix-20261001.md)。
+文件对话框和完整交互人工清单仍按真机验收计划逐项记录。
 
 ### 明确不属于第二组
 
@@ -70,8 +98,8 @@
 
 ## 第三组：DirectWrite + D3D11 / DXGI
 
-状态：**实现与 Windows x64 目标构建已完成；真实 Windows GPU/窗口 render smoke
-仍必须在 Windows runner/真机执行。**
+状态：**实现与 Windows x64 目标构建已完成；2026-10-01 原生 DirectWrite 测试及真实
+D3D first Present / resize render smoke 已通过，人工交互与 DPI 清单继续执行。**
 
 本组把第二组留下的 editor surface HWND 接成真正的 Yu 渲染链：
 
@@ -87,7 +115,7 @@
   - first-strong paragraph base direction；
   - `IDWriteFontFallback::MapCharacters`；
   - `GetGlyphs` / `GetGlyphPlacements`；
-  - many-to-many cluster、RTL 原生 glyph 顺序、UTF-16 → UTF-8 source 映射；
+  - many-to-many cluster、RTL glyph 绘制顺序/offset 转换、UTF-16 → UTF-8 source 映射；
   - fallback `mapped_scale` 进入 face identity、metrics 与 rasterization，避免
     fallback 字体“排版尺寸对、位图尺寸错”。
 - `DirectWriteGlyphRasterizer` 与 shaper 共用同一张 `SharedFaceTable`；
@@ -135,8 +163,23 @@
 
 ## 第四组：TSF / IME / 完整编辑输入链
 
-状态：**主体实现与 Windows x64 目标构建已完成；真实 Windows TSF/IME 交互 smoke
-仍必须在 Windows runner/真机执行。**
+状态：**主体实现、Windows x64 原生构建与 TSF 初始化 smoke 已完成；2026-10-01
+用户确认微软拼音基础提交、取消、Undo/Redo 第一轮通过；完整 IME 与 DPI 人工验收
+仍未完成，暂不正式结项。**
+
+2026-10-01 真机验收计划见 [Windows 第四组真机验收计划](windows-group4-manual-acceptance.md)。
+本轮已确认使用 Windows 11 x64 本机键鼠、单显示器；先覆盖真实 IME 与单屏
+100% / 125% / 150% DPI，跨显示器不同 DPI 迁移仍需补测。计划不构成通过记录。
+
+同日原生预检发现 DirectWrite RTL shaping 测试失败、窗口 self-check 退出 1；
+详细结果见 [Windows 原生预检记录](windows-group4-preflight-20261001.md)。
+随后已修复 TSF 可空焦点关联、RTL glyph 翻译、editor viewport 配置与选区/caret 接线，
+原生字体 19/19、render 2/2、shell 16/16 和真实窗口 self-check 均通过。
+详情见 [Windows 原生修复记录](windows-group4-native-fix-20261001.md)。
+用户随后在侧栏修复版上确认 `zhongwen` 候选提交“中文”位置正确且只提交一次，
+`ceshi` 按 Escape 完全取消无残留，Ctrl+Z / Ctrl+Y 正常。
+这是微软拼音基础第一轮人工结果，不等于四种 IME 全套通过。新版增加正文页边距后
+需要复查候选框位置；其余真实 IME 与 DPI 人工清单待执行，第四组保持未正式结项。
 
 本组让第三组的 D3D editor surface 从“可显示”进入“可编辑”：Windows 只负责
 把 TSF、键鼠、剪贴板与屏幕几何翻译到共享 Rust 编辑模型，不建立 RichEdit、

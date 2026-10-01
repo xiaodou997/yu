@@ -34,6 +34,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
@@ -52,14 +53,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyWindow, DispatchMessageW, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA, GetClientRect,
-    GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, IDC_ARROW, KillTimer, LoadCursorW,
-    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    DestroyWindow, DispatchMessageW, EN_CHANGE, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
+    GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, HWND_TOP, IDC_ARROW,
+    IsDialogMessageW, KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, MB_ICONERROR,
+    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
     WS_VISIBLE,
@@ -68,7 +71,7 @@ use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     Bias, EditorCommand, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
-    LayoutPoint, LayoutSnapshot, ViewportSpan,
+    LayoutConfig, LayoutPoint, LayoutSnapshot, ViewportConfig, ViewportSpan,
 };
 use yu_font::{FontRequest, GlyphAtlasConfig};
 use yu_font_windows::DirectWriteShaper;
@@ -78,6 +81,9 @@ use yu_scene::Rect;
 use yu_storage::{ClosePrompt, CloseRequest, CloseTransition};
 use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
 
+use crate::chrome::{
+    Chrome, ID_FILES, ID_OUTLINE, ID_QUERY, ID_ROWS, ID_SEARCH, PanelAction, sidebar_width,
+};
 use crate::text_input::{
     AcpProjection, AcpRange, AcpSelection, canonical_acp_range_to_source, local_selection_utf16,
     replace_local_utf16, selection_from_acp,
@@ -281,6 +287,14 @@ impl RenderHost {
     }
 
     fn render(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
+        let session = state.document_mut().session_mut();
+        let viewport_config = editor_viewport_config(
+            self.builder.config().scene_viewport().width(),
+            self.builder.config().appearance(),
+        );
+        if session.viewport_config() != viewport_config {
+            session.set_viewport_config(viewport_config)?;
+        }
         let revision = state.document().session().revision();
         let snapshot = state
             .document()
@@ -294,6 +308,17 @@ impl RenderHost {
             .publish(&mut layout)
             .map_err(|error| ShellError::Platform(error.to_string()))?;
         self.layout = Some(publication.layout_snapshot());
+        if !state
+            .document_mut()
+            .session_mut()
+            .document_mut()
+            .editor_mut()
+            .adopt_layout_snapshot(publication.layout_snapshot())
+        {
+            return Err(ShellError::Platform(
+                "rendered layout does not match the current editor state".into(),
+            ));
+        }
 
         match self.renderer.render_viewport_frame(
             revision,
@@ -319,6 +344,7 @@ pub(crate) struct AppWindow {
     sidebar: HWND,
     surface: HWND,
     status: HWND,
+    chrome: Option<Chrome>,
     state: ShellState,
     render: Option<RenderHost>,
     tsf: Option<TsfHost>,
@@ -336,6 +362,7 @@ impl AppWindow {
             sidebar: HWND::default(),
             surface: HWND::default(),
             status: HWND::default(),
+            chrome: None,
             state,
             render: None,
             tsf: None,
@@ -350,16 +377,22 @@ impl AppWindow {
     fn initialize(&mut self, hwnd: HWND) -> Result<(), ShellError> {
         self.hwnd = hwnd;
         self.apply_system_theme();
-        self.install_menu()?;
-        self.create_children()?;
+        self.install_menu()
+            .map_err(|error| startup_error("install menu", error))?;
+        self.create_children()
+            .map_err(|error| startup_error("create child windows", error))?;
         self.refresh_chrome();
         self.update_layout();
-        self.render = Some(RenderHost::new(self.surface, self.state.appearance())?);
-        self.render_current()?;
+        self.render = Some(
+            RenderHost::new(self.surface, self.state.appearance())
+                .map_err(|error| startup_error("create renderer", error))?,
+        );
+        self.render_current()
+            .map_err(|error| startup_error("render first frame", error))?;
         let app = self as *mut Self;
         self.tsf = Some(
             TsfHost::new(app, self.surface)
-                .map_err(|error| ShellError::Platform(error.to_string()))?,
+                .map_err(|error| startup_error("initialize TSF", error))?,
         );
         unsafe {
             let _ = SetFocus(self.surface);
@@ -368,6 +401,9 @@ impl AppWindow {
     }
 
     fn render_current(&mut self) -> Result<(), ShellError> {
+        if let Some(chrome) = self.chrome.as_mut() {
+            chrome.refresh(&mut self.state)?;
+        }
         let Some(mut render) = self.render.take() else {
             return Ok(());
         };
@@ -1231,17 +1267,11 @@ impl AppWindow {
     }
 
     fn create_children(&mut self) -> Result<(), ShellError> {
-        let strings = self.state.strings();
-        let sidebar_text = format!(
-            "{}\r\n\r\n{}\r\n\r\n{}",
-            strings.files(),
-            strings.outline(),
-            strings.search()
-        );
-        let status_text = strings.ready().to_owned();
-
+        let chrome = Chrome::new(self.hwnd, &self.state)?;
+        self.sidebar = chrome.background;
+        self.status = chrome.status;
+        self.chrome = Some(chrome);
         unsafe {
-            self.sidebar = create_child_static(self.hwnd, &sidebar_text)?;
             self.surface = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 SURFACE_CLASS,
@@ -1257,7 +1287,18 @@ impl AppWindow {
                 None,
             )
             .map_err(platform_error)?;
-            self.status = create_child_static(self.hwnd, &status_text)?;
+            // Child creation can place the surface below existing siblings.
+            // Keep the GPU view above the full-client background canvas.
+            SetWindowPos(
+                self.surface,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+            .map_err(platform_error)?;
         }
         Ok(())
     }
@@ -1283,19 +1324,39 @@ impl AppWindow {
         self.state
             .set_metrics(WindowMetrics::new(width as u32, height as u32, dpi));
 
-        let status_h = self.state.metrics().px(24.0).clamp(20, height);
+        let metrics = self.state.metrics();
+        let spec = self.state.appearance().theme_id().spec();
+        let status_h = metrics.px(24.0).min(height);
         let content_h = (height - status_h).max(1);
-        let sidebar_w = if self.state.sidebar() == SidebarMode::Hidden {
-            0
-        } else {
-            self.state.metrics().px(240.0).clamp(0, (width / 2).max(0))
-        };
-        let surface_w = (width - sidebar_w).max(1);
+        let sidebar_w = sidebar_width(metrics, self.state.sidebar());
+        let available_w = (width - sidebar_w).max(1);
+        let gutter = metrics.px(spec.gutter).min((available_w - 1) / 4);
+        let surface_w = (available_w - gutter * 2)
+            .min(metrics.px(spec.column_width))
+            .max(1);
+        let surface_x = sidebar_w + (available_w - surface_w) / 2;
+        let surface_y = metrics.px(spec.top).min((content_h - 1) / 4);
+        let bottom = metrics.px(16.0).min((content_h - 1) / 4);
+        let surface_h = (content_h - surface_y - bottom).max(1);
 
         unsafe {
-            let _ = MoveWindow(self.sidebar, 0, 0, sidebar_w, content_h, true);
-            let _ = MoveWindow(self.surface, sidebar_w, 0, surface_w, content_h, true);
-            let _ = MoveWindow(self.status, 0, content_h, width, status_h, true);
+            let _ = MoveWindow(
+                self.surface,
+                surface_x,
+                surface_y,
+                surface_w,
+                surface_h,
+                true,
+            );
+        }
+        if let Some(chrome) = self.chrome.as_mut()
+            && let Err(error) = chrome.layout(
+                self.state.metrics(),
+                self.state.sidebar(),
+                self.state.appearance(),
+            )
+        {
+            show_error(self.hwnd, &self.state, &error);
         }
         self.refresh_chrome();
     }
@@ -1303,9 +1364,9 @@ impl AppWindow {
     fn apply_system_theme(&mut self) {
         let dark = system_prefers_dark();
         self.state.set_appearance(if dark {
-            Appearance::Dark
+            Appearance::YuDark
         } else {
-            Appearance::Light
+            Appearance::YuLight
         });
         unsafe {
             let dark_value = BOOL::from(dark);
@@ -1330,6 +1391,9 @@ impl AppWindow {
             ID_FILE_NEW => {
                 if self.confirm_replace_current()? {
                     self.state.new_document();
+                    if let Some(chrome) = self.chrome.as_mut() {
+                        chrome.invalidate_content();
+                    }
                     self.refresh_chrome();
                 }
             }
@@ -1338,6 +1402,9 @@ impl AppWindow {
                     let candidate = DocumentSlot::open(path)?;
                     if self.confirm_replace_current()? {
                         self.state.replace_document(candidate);
+                        if let Some(chrome) = self.chrome.as_mut() {
+                            chrome.invalidate_content();
+                        }
                         self.refresh_chrome();
                     }
                 }
@@ -1387,6 +1454,12 @@ impl AppWindow {
             ID_VIEW_SIDEBAR => {
                 self.state.toggle_sidebar();
                 self.update_layout();
+                unsafe {
+                    let _ = SetFocus(self.surface);
+                }
+            }
+            ID_SEARCH => {
+                self.handle_chrome_command(ID_SEARCH, 0)?;
             }
             _ => {}
         }
@@ -1394,6 +1467,152 @@ impl AppWindow {
             self.render_current()?;
         }
         Ok(())
+    }
+
+    fn handle_chrome_command(&mut self, command: u16, notification: u16) -> Result<(), ShellError> {
+        match command {
+            ID_FILES | ID_OUTLINE | ID_SEARCH => {
+                self.state.set_sidebar(match command {
+                    ID_FILES => SidebarMode::Files,
+                    ID_OUTLINE => SidebarMode::Outline,
+                    _ => SidebarMode::Search,
+                });
+                self.update_layout();
+                self.render_current()?;
+                if let Some(tsf) = self.tsf.as_ref() {
+                    tsf.notify_layout_change();
+                }
+                if command == ID_SEARCH
+                    && let Some(chrome) = self.chrome.as_ref()
+                {
+                    unsafe {
+                        let _ = SetFocus(chrome.query);
+                    }
+                }
+            }
+            ID_QUERY if notification == EN_CHANGE as u16 => {
+                self.render_current()?;
+            }
+            ID_ROWS
+                if (notification == LBN_SELCHANGE as u16 || notification == LBN_DBLCLK as u16)
+                    && (self.state.sidebar() != SidebarMode::Files
+                        || notification == LBN_DBLCLK as u16) =>
+            {
+                self.activate_panel_row(notification == LBN_DBLCLK as u16)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn activate_panel_row(&mut self, focus_editor: bool) -> Result<(), ShellError> {
+        // TSF owns active preedit. Navigation must not replace its canonical range.
+        if self.state.document().session().composition().is_some() {
+            return Ok(());
+        }
+        let action = self.chrome.as_ref().and_then(Chrome::selected_action);
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let mut document_changed = false;
+        match action {
+            Some(PanelAction::File(path)) => {
+                if path != self.state.document().session().path() {
+                    let candidate = DocumentSlot::open(path)?;
+                    if !self.confirm_replace_current()? {
+                        return Ok(());
+                    }
+                    self.state.replace_document(candidate);
+                    document_changed = true;
+                    if let Some(chrome) = self.chrome.as_mut() {
+                        chrome.invalidate_content();
+                    }
+                    if let Some(render) = self.render.as_mut() {
+                        let config = render.builder.config();
+                        render
+                            .builder
+                            .update_config(viewport_render_config(
+                                render.renderer.surface(),
+                                config.appearance(),
+                                0.0,
+                            )?)
+                            .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    }
+                }
+            }
+            Some(PanelAction::Select(range)) => {
+                let snapshot = self.state.document().session().snapshot();
+                let selection = EditorSelection::range(
+                    &snapshot,
+                    range.start(),
+                    range.end(),
+                    CaretAffinity::Downstream,
+                )
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+                self.state
+                    .document_mut()
+                    .session_mut()
+                    .set_selection(selection)?;
+                self.reveal_panel_selection()?;
+            }
+            None => return Ok(()),
+        }
+        self.refresh_chrome();
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, document_changed)?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_layout_change();
+        }
+        if focus_editor {
+            unsafe {
+                let _ = SetFocus(self.surface);
+            }
+        }
+        Ok(())
+    }
+
+    fn reveal_panel_selection(&mut self) -> Result<(), ShellError> {
+        // Measuring newly visible blocks can change the target's document y.
+        // Adopt each frame before resolving the next request against that geometry.
+        for _ in 0..4 {
+            let Some(render) = self.render.as_mut() else {
+                return Ok(());
+            };
+            let config = render.builder.config();
+            let request = self
+                .state
+                .document_mut()
+                .session_mut()
+                .caret_scroll_request_with_shaper(
+                    config.viewport(),
+                    24.0,
+                    render.builder.shaper(),
+                )?;
+            render
+                .builder
+                .update_config(viewport_render_config(
+                    render.renderer.surface(),
+                    config.appearance(),
+                    request.target_scroll_y(),
+                )?)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+            self.render_current()?;
+            let render = self
+                .render
+                .as_ref()
+                .expect("render host survived publication");
+            let range = TextRange::empty(self.state.document().session().selection().focus());
+            if let Some(layout) = render.layout.as_ref()
+                && let Ok((_, top, _, bottom)) = source_range_bounds(layout, range)
+            {
+                let viewport = render.builder.config().viewport();
+                if top >= viewport.scroll_y() && bottom <= viewport.scroll_y() + viewport.height() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(ShellError::Platform(
+            "navigation target could not be revealed in the current viewport".into(),
+        ))
     }
 
     fn save_current(&mut self, force_save_as: bool) -> Result<(), ShellError> {
@@ -1479,11 +1698,12 @@ impl AppWindow {
 }
 
 pub fn run() -> Result<(), ShellError> {
-    let _com = ComApartment::initialize().map_err(platform_error)?;
+    let _com =
+        ComApartment::initialize().map_err(|error| startup_error("initialize COM", error))?;
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    register_classes()?;
+    register_classes().map_err(|error| startup_error("register window classes", error))?;
 
     let locale = current_locale();
     let argument = std::env::args_os().nth(1);
@@ -1537,7 +1757,7 @@ fn run_window(state: ShellState, auto_close: bool) -> Result<(), ShellError> {
             unsafe {
                 drop(Box::from_raw(app_ptr));
             }
-            return Err(platform_error(error));
+            return Err(startup_error("create main window", error));
         }
     };
 
@@ -1644,6 +1864,11 @@ fn create_accelerators() -> Result<HACCEL, ShellError> {
             key: b'L' as u16,
             cmd: ID_VIEW_SIDEBAR,
         },
+        ACCEL {
+            fVirt: FCONTROL | FVIRTKEY,
+            key: b'F' as u16,
+            cmd: ID_SEARCH,
+        },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }.map_err(platform_error)
 }
@@ -1661,6 +1886,43 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
         } else {
             let app = unsafe { &mut *app_ptr };
             match message.message {
+                WM_KEYDOWN
+                    if app.chrome.as_ref().is_some_and(|chrome| {
+                        message.hwnd == chrome.query || message.hwnd == chrome.list
+                    }) && message.wParam.0 == VK_RETURN.0 as usize
+                        && !app.chrome.as_ref().is_some_and(|chrome| {
+                            message.hwnd == chrome.query && chrome.query_is_composing()
+                        }) =>
+                {
+                    if let Some(chrome) = app.chrome.as_ref()
+                        && message.hwnd == chrome.query
+                    {
+                        chrome.select_first();
+                    }
+                    if let Err(error) = app.activate_panel_row(true) {
+                        show_error(hwnd, &app.state, &error);
+                    }
+                    true
+                }
+                WM_KEYDOWN
+                    if message.hwnd != app.surface
+                        && message.wParam.0
+                            == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0
+                                as usize
+                        && !app.chrome.as_ref().is_some_and(|chrome| {
+                            message.hwnd == chrome.query && chrome.query_is_composing()
+                        }) =>
+                {
+                    unsafe {
+                        let _ = SetFocus(app.surface);
+                    }
+                    true
+                }
+                WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+                    if message.hwnd != app.surface =>
+                {
+                    false
+                }
                 WM_KEYDOWN | WM_SYSKEYDOWN => app
                     .tsf
                     .as_ref()
@@ -1675,7 +1937,14 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
         if tsf_ate {
             continue;
         }
-        if unsafe { TranslateAcceleratorW(hwnd, accelerator, &message) } != 0 {
+        let local_undo = !app_ptr.is_null()
+            && message.hwnd != unsafe { (*app_ptr).surface }
+            && matches!(message.wParam.0, 0x5a | 0x59)
+            && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        if !local_undo && unsafe { TranslateAcceleratorW(hwnd, accelerator, &message) } != 0 {
+            continue;
+        }
+        if unsafe { IsDialogMessageW(hwnd, &message) }.as_bool() {
             continue;
         }
         unsafe {
@@ -1707,7 +1976,12 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_COMMAND => {
                 let command = (wparam.0 & 0xffff) as u16;
-                if let Err(error) = app.handle_command(command) {
+                let result = if lparam.0 != 0 && (ID_FILES..=ID_ROWS).contains(&command) {
+                    app.handle_chrome_command(command, (wparam.0 >> 16) as u16)
+                } else {
+                    app.handle_command(command)
+                };
+                if let Err(error) = result {
                     show_error(hwnd, &app.state, &error);
                 }
                 return LRESULT(0);
@@ -1744,6 +2018,10 @@ unsafe extern "system" fn window_proc(
             }
             WM_SETTINGCHANGE => {
                 app.apply_system_theme();
+                if let Some(chrome) = app.chrome.as_mut() {
+                    chrome.invalidate_font();
+                }
+                app.update_layout();
                 app.refresh_chrome();
                 if let Err(error) = app.render_current() {
                     show_error(hwnd, &app.state, &error);
@@ -1773,6 +2051,29 @@ unsafe extern "system" fn window_proc(
                     PostQuitMessage(0);
                 }
                 return LRESULT(0);
+            }
+            WM_MEASUREITEM => {
+                let item = unsafe { &mut *(lparam.0 as *mut MEASUREITEMSTRUCT) };
+                if item.CtlID == u32::from(ID_ROWS) {
+                    item.itemHeight = app.state.metrics().px(32.0) as u32;
+                    return LRESULT(1);
+                }
+            }
+            WM_DRAWITEM => {
+                let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                if app.chrome.as_ref().is_some_and(|chrome| chrome.draw(item)) {
+                    return LRESULT(1);
+                }
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                if let Some(result) = app.chrome.as_ref().and_then(|chrome| {
+                    chrome.control_color(
+                        windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _),
+                        HWND(lparam.0 as *mut _),
+                    )
+                }) {
+                    return result;
+                }
             }
             _ => {}
         }
@@ -2047,7 +2348,9 @@ fn viewport_render_config(
 ) -> Result<ViewportRenderConfig, ShellError> {
     let width = surface.logical_width() as f32;
     let height = surface.logical_height() as f32;
-    let scene = Rect::new(0.0, 0.0, width, height)
+    // Scene primitives use document coordinates. The shared draw-command
+    // builder subtracts this viewport origin when producing surface pixels.
+    let scene = Rect::new(0.0, scroll_y.max(0.0), width, height)
         .map_err(|error| ShellError::Platform(error.to_string()))?;
     Ok(ViewportRenderConfig::new(
         ViewportSpan::new(scroll_y.max(0.0), height),
@@ -2057,28 +2360,19 @@ fn viewport_render_config(
     )
     .with_background(appearance.background())
     .with_raster_scale(surface.scale() as f32)
+    .with_editor_decorations(appearance.editor_decorations())
     .with_appearance(appearance))
 }
 
-unsafe fn create_child_static(parent: HWND, text: &str) -> Result<HWND, ShellError> {
-    let text = wide(text);
-    unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
-            PCWSTR(text.as_ptr()),
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            1,
-            1,
-            parent,
-            None,
-            None,
-            None,
-        )
-    }
-    .map_err(platform_error)
+fn editor_viewport_config(logical_width: f32, appearance: Appearance) -> ViewportConfig {
+    let line_height = BODY_FONT_SIZE * appearance.theme_id().spec().body_line_ratio;
+    ViewportConfig::new(
+        LayoutConfig::new(logical_width, line_height)
+            .with_default_advance(BODY_FONT_SIZE * 0.5)
+            .with_theme(appearance.theme_id()),
+        line_height,
+        line_height * 2.0,
+    )
 }
 
 unsafe fn append_string(menu: HMENU, id: u16, text: &str) -> Result<(), ShellError> {
@@ -2250,4 +2544,288 @@ fn wide(value: &str) -> Vec<u16> {
 
 fn platform_error(error: WindowsError) -> ShellError {
     ShellError::Platform(error.to_string())
+}
+
+fn startup_error(stage: &str, error: impl std::fmt::Display) -> ShellError {
+    ShellError::Platform(format!("Windows startup ({stage}): {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::WS_POPUP;
+    use yu_scene::{EditorDecorationPrimitiveRole, Primitive};
+
+    struct Window(HWND);
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    fn has_decoration(
+        render: &mut RenderHost,
+        state: &ShellState,
+        role: EditorDecorationPrimitiveRole,
+    ) -> bool {
+        let mut context = state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .capture_render_snapshot()
+            .into_layout_context();
+        let publication = render.builder.publish(&mut context).expect("editor frame");
+        publication.frame().scene().scene().primitives().iter().any(|primitive| {
+            matches!(primitive, Primitive::EditorDecoration(decoration) if decoration.role() == role)
+        })
+    }
+
+    #[test]
+    fn native_render_uses_surface_width_and_readable_lines_after_resize() {
+        let _com = ComApartment::initialize().expect("COM");
+        let window = Window(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Yu layout regression"),
+                WS_POPUP,
+                0,
+                0,
+                640,
+                480,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("hidden surface")
+        });
+        let mut state = ShellState::new(Locale::English);
+        state
+            .document_mut()
+            .session_mut()
+            .execute(EditorCommand::insert_text("a".repeat(200)))
+            .expect("source");
+        let revision = state.document().session().revision();
+        let mut render = RenderHost::new(window.0, Appearance::Light).expect("renderer");
+        render.render(&mut state).expect("first Present");
+        assert!(has_decoration(
+            &mut render,
+            &state,
+            EditorDecorationPrimitiveRole::Caret
+        ));
+        let layout = render.layout.as_ref().expect("geometry");
+        assert_eq!(
+            layout.config().max_width(),
+            render.renderer.surface().logical_width() as f32
+        );
+        let narrow_lines: usize = layout
+            .blocks()
+            .iter()
+            .map(|block| {
+                assert!(
+                    block
+                        .layout()
+                        .lines()
+                        .iter()
+                        .all(|line| line.bounds().height() >= BODY_FONT_SIZE)
+                );
+                block.layout().lines().len()
+            })
+            .sum();
+        assert!(narrow_lines > 1);
+        unsafe {
+            MoveWindow(window.0, 0, 0, 1280, 480, false).expect("resize");
+        }
+        render
+            .sync_surface(window.0, Appearance::Light)
+            .expect("sync surface");
+        render.render(&mut state).expect("resized Present");
+        let layout = render.layout.as_ref().expect("resized geometry");
+        let wide_lines: usize = layout
+            .blocks()
+            .iter()
+            .map(|block| block.layout().lines().len())
+            .sum();
+        assert!(
+            wide_lines < narrow_lines,
+            "wrap width must track the resized surface"
+        );
+        assert_eq!(
+            layout.config().max_width(),
+            render.renderer.surface().logical_width() as f32
+        );
+        assert_eq!(state.document().session().revision(), revision);
+        let snapshot = state.document().session().snapshot();
+        let selection = EditorSelection::range(
+            &snapshot,
+            ByteOffset::ZERO,
+            snapshot.len_bytes(),
+            CaretAffinity::Downstream,
+        )
+        .expect("selection");
+        state
+            .document_mut()
+            .session_mut()
+            .set_selection(selection)
+            .expect("select source");
+        render.render(&mut state).expect("selected Present");
+        assert!(has_decoration(
+            &mut render,
+            &state,
+            EditorDecorationPrimitiveRole::Selection
+        ));
+        state.set_appearance(Appearance::Dark);
+        render
+            .sync_surface(window.0, Appearance::Dark)
+            .expect("dark theme");
+        render
+            .render(&mut state)
+            .expect("dark Present and layout adoption");
+        assert_eq!(
+            state
+                .document()
+                .session()
+                .viewport_config()
+                .layout()
+                .theme(),
+            Appearance::Dark.theme_id()
+        );
+        assert_eq!(state.document().session().revision(), revision);
+    }
+
+    #[test]
+    fn native_sidebar_navigation_reveals_unicode_search_without_editing_source() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GW_CHILD, GetWindow, LB_GETCOUNT, SendMessageW,
+        };
+        let _com = ComApartment::initialize().expect("COM");
+        register_classes().expect("classes");
+        let mut state = ShellState::new(Locale::English);
+        let source = format!(
+            "# First\n\n{}\n\n## **目标**\n\n中文😀 result\n",
+            "filler paragraph\n\n".repeat(60)
+        );
+        state
+            .document_mut()
+            .session_mut()
+            .execute(EditorCommand::insert_text(source.as_str()))
+            .expect("source");
+        let mut app = Box::new(AppWindow::new(state));
+        let app_ptr = std::ptr::from_mut(app.as_mut());
+        let window = Window(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                MAIN_CLASS,
+                w!("Native sidebar regression"),
+                WS_POPUP | WS_CLIPCHILDREN,
+                0,
+                0,
+                1200,
+                800,
+                None,
+                None,
+                None,
+                Some(app_ptr.cast()),
+            )
+            .expect("hidden main window")
+        });
+        app.initialize(window.0)
+            .expect("native chrome / render / TSF");
+        assert_eq!(
+            unsafe { GetWindow(app.hwnd, GW_CHILD) }.expect("top child"),
+            app.surface,
+            "background canvas must not obscure the GPU surface"
+        );
+        let revision = app.state.document().session().revision();
+        app.handle_chrome_command(ID_OUTLINE, 0)
+            .expect("outline tab");
+        let list = app.chrome.as_ref().expect("chrome").list;
+        assert_eq!(
+            unsafe { SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0,
+            2
+        );
+        app.handle_chrome_command(ID_SEARCH, 0).expect("search tab");
+        let query = app.chrome.as_ref().expect("chrome").query;
+        set_window_text(query, "中文😀");
+        assert_eq!(
+            unsafe { SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0,
+            1
+        );
+        app.chrome.as_ref().expect("chrome").select_first();
+        app.activate_panel_row(false)
+            .expect("jump to search result");
+        let range = app.state.document().session().selection().ordered_range();
+        assert_eq!(
+            range.start().get(),
+            source.find("中文😀").expect("hit") as u64
+        );
+        assert_eq!(
+            range.end().get() - range.start().get(),
+            "中文😀".len() as u64
+        );
+        assert!(
+            app.render
+                .as_ref()
+                .expect("render")
+                .builder
+                .config()
+                .viewport()
+                .scroll_y()
+                > 0.0,
+            "offscreen result must be revealed"
+        );
+        let render = app.render.as_ref().expect("render");
+        let frame = render
+            .builder
+            .last_publication()
+            .expect("published frame")
+            .frame();
+        let viewport = frame.plan().viewport();
+        assert!(
+            viewport.y() > 0.0,
+            "scene viewport must translate document coordinates"
+        );
+        assert!(
+            frame.scene().scene().primitives().iter().any(|primitive| {
+                matches!(primitive, Primitive::EditorDecoration(decoration)
+                if decoration.role() == EditorDecorationPrimitiveRole::Selection
+                    && decoration.bounds().y() < viewport.y() + viewport.height()
+                    && decoration.bounds().y() + decoration.bounds().height() > viewport.y())
+            }),
+            "selected search result must paint inside the visible scene viewport"
+        );
+        let mut client_origin = POINT::default();
+        assert!(unsafe { ClientToScreen(app.hwnd, &mut client_origin) }.as_bool());
+        let view = app.input_screen_ext().expect("inset view");
+        assert!(
+            view.left > client_origin.x + sidebar_width(app.state.metrics(), app.state.sidebar()),
+            "editor must have a real HWND gutter, including TSF coordinates"
+        );
+        assert!(view.top > client_origin.y);
+        let selection = app.input_projection().expect("projection").selection();
+        let caret_acp = selection.range.end();
+        let caret = app
+            .input_text_ext(AcpRange::new(caret_acp, caret_acp).expect("caret range"))
+            .expect("caret screen geometry");
+        assert!(caret.left >= view.left && caret.left < view.right);
+        assert!(caret.top >= view.top && caret.top < view.bottom);
+        let hit = app
+            .input_acp_from_screen(
+                POINT {
+                    x: caret.left,
+                    y: (caret.top + caret.bottom) / 2,
+                },
+                false,
+            )
+            .expect("caret point hit after inset");
+        assert!(selection.range.contains(hit));
+        assert_eq!(app.state.document().session().revision(), revision);
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
+        drop(window);
+    }
 }

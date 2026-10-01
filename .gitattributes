@@ -11,6 +11,9 @@
 # 按平台转；前者要求工作树里也是 LF。rustfmt 检查的是工作树。
 * text=auto eol=lf
 
+# Windows input acceptance needs a real CRLF sample in every checkout.
+platform/windows/yu-shell-windows/Fixtures/group4-scroll-crlf.md text eol=crlf
+
 # 二进制：一个字节都不许动。截图比对的判据是逐字节相等（见交接稿「工具」），
 # 任何行尾转换都会让它变成一堆假差异。
 *.png binary
