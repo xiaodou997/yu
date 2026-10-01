@@ -184,7 +184,7 @@ struct NativeTexture {
 pub struct D3DRenderer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    swap_chain: IDXGISwapChain1,
+    swap_chain: Option<IDXGISwapChain1>,
     target: Option<ID3D11RenderTargetView>,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
@@ -196,6 +196,8 @@ pub struct D3DRenderer {
     atlas: BTreeMap<u32, NativeTexture>,
     images: BTreeMap<(u64, u32), NativeTexture>,
     frame_consumer: FrameConsumer,
+    capture_requested: bool,
+    captured_frame: Option<DecodedImage>,
 }
 
 impl std::fmt::Debug for D3DRenderer {
@@ -446,7 +448,7 @@ impl D3DRenderer {
         let mut renderer = Self {
             device,
             context,
-            swap_chain,
+            swap_chain: Some(swap_chain),
             target: None,
             vertex_shader,
             pixel_shader,
@@ -458,6 +460,8 @@ impl D3DRenderer {
             atlas: BTreeMap::new(),
             images: BTreeMap::new(),
             frame_consumer: FrameConsumer::new(),
+            capture_requested: false,
+            captured_frame: None,
         };
         renderer.recreate_target()?;
         Ok(renderer)
@@ -473,8 +477,18 @@ impl D3DRenderer {
         self.generation
     }
 
+    /// Revisions are monotonic within one document, not across newly opened
+    /// sessions. A replacement document starts a new revision ownership scope.
+    pub fn reset_document(&mut self) {
+        self.frame_consumer = FrameConsumer::new();
+    }
+
     fn recreate_target(&mut self) -> Result<(), D3DRenderError> {
-        let back_buffer: ID3D11Texture2D = unsafe { self.swap_chain.GetBuffer(0)? };
+        let swap_chain = self
+            .swap_chain
+            .as_ref()
+            .ok_or(D3DRenderError::InvalidResource("no swapchain"))?;
+        let back_buffer: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0)? };
         let mut target = None;
         unsafe {
             self.device
@@ -500,18 +514,41 @@ impl D3DRenderer {
         }
         self.target = None;
         unsafe {
-            self.swap_chain.ResizeBuffers(
-                2,
-                surface.pixel_width(),
-                surface.pixel_height(),
-                DXGI_FORMAT_R8G8B8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )?;
+            self.swap_chain
+                .as_ref()
+                .ok_or(D3DRenderError::InvalidResource("no swapchain"))?
+                .ResizeBuffers(
+                    2,
+                    surface.pixel_width(),
+                    surface.pixel_height(),
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )?;
         }
         self.surface = surface;
         self.generation = self.generation.wrapping_add(1).max(1);
         self.recreate_target()?;
         Ok(true)
+    }
+
+    /// A HWND can own only one live flip swapchain. Release its views and
+    /// deferred context references before constructing the replacement.
+    pub fn recreate(&mut self, hwnd: HWND) -> Result<(), D3DRenderError> {
+        unsafe {
+            self.context.ClearState();
+        }
+        self.target = None;
+        self.swap_chain = None;
+        self.atlas.clear();
+        self.images.clear();
+        unsafe {
+            self.context.Flush();
+        }
+        let generation = self.generation.wrapping_add(1).max(1);
+        let mut replacement = Self::new(hwnd, self.surface)?;
+        replacement.generation = generation;
+        *self = replacement;
+        Ok(())
     }
 
     pub fn sync_glyph_atlas(&mut self, atlas: &GlyphAtlas) -> Result<usize, D3DRenderError> {
@@ -589,6 +626,69 @@ impl D3DRenderer {
         before.saturating_sub(self.images.len())
     }
 
+    /// Opt into readback before the next Present. Flip-discard contents are
+    /// undefined after Present, so reading the buffer afterwards is invalid.
+    pub fn request_frame_capture(&mut self) {
+        self.capture_requested = true;
+    }
+
+    pub fn take_captured_frame(&mut self) -> Option<DecodedImage> {
+        self.captured_frame.take()
+    }
+
+    fn capture_frame(&self) -> Result<DecodedImage, D3DRenderError> {
+        let target = self
+            .target
+            .as_ref()
+            .ok_or(D3DRenderError::InvalidResource("no render target"))?;
+        let texture: ID3D11Texture2D = unsafe { target.GetResource()? }.cast()?;
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut description);
+        }
+        let byte_count = (description.Width as usize)
+            .checked_mul(description.Height as usize)
+            .and_then(|count| count.checked_mul(4))
+            .filter(|count| *count <= 128 * 1024 * 1024)
+            .ok_or(D3DRenderError::InvalidResource(
+                "readback dimensions exceed budget",
+            ))?;
+        description.Usage = D3D11_USAGE_STAGING;
+        description.BindFlags = 0;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        description.MiscFlags = 0;
+        let mut staging = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&description, None, Some(&mut staging))?;
+        }
+        let staging = staging.ok_or(D3DRenderError::InvalidResource("no readback texture"))?;
+        unsafe {
+            self.context.CopyResource(&staging, &texture);
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        }
+        let mut pixels = vec![0; byte_count];
+        let stride = description.Width as usize * 4;
+        for y in 0..description.Height as usize {
+            let row = unsafe {
+                slice::from_raw_parts(
+                    mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize),
+                    stride,
+                )
+            };
+            pixels[y * stride..(y + 1) * stride].copy_from_slice(row);
+        }
+        unsafe {
+            self.context.Unmap(&staging, 0);
+        }
+        DecodedImage::new(description.Width, description.Height, pixels)
+            .map_err(|_| D3DRenderError::InvalidResource("invalid readback pixels"))
+    }
+
     fn page_sizes(&self) -> BTreeMap<u32, (u32, u32)> {
         self.atlas
             .iter()
@@ -608,9 +708,9 @@ impl D3DRenderer {
     fn embedded_sizes(&self) -> BTreeMap<(u64, u32), (u32, u32)> {
         self.images
             .iter()
-            .filter_map(|(&(resource, kind), texture)| {
-                (kind != IMAGE_KIND_REGULAR)
-                    .then_some(((resource, kind - 1), (texture.width, texture.height)))
+            .filter(|(key, _)| key.1 != IMAGE_KIND_REGULAR)
+            .map(|(&(resource, kind), texture)| {
+                ((resource, kind - 1), (texture.width, texture.height))
             })
             .collect()
     }
@@ -701,7 +801,15 @@ impl D3DRenderer {
         unsafe {
             self.context.PSSetShaderResources(0, Some(&[None]));
         }
-        let present = unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) };
+        if self.capture_requested {
+            self.captured_frame = Some(self.capture_frame()?);
+            self.capture_requested = false;
+        }
+        let swap_chain = self
+            .swap_chain
+            .as_ref()
+            .ok_or(D3DRenderError::InvalidResource("no swapchain"))?;
+        let present = unsafe { swap_chain.Present(1, DXGI_PRESENT(0)) };
         if present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET {
             return Err(D3DRenderError::DeviceLost);
         }

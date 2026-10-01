@@ -15,6 +15,10 @@ mod command;
 
 #[cfg(target_os = "windows")]
 mod native;
+#[cfg(target_os = "windows")]
+mod resources;
+#[cfg(target_os = "windows")]
+pub use resources::ResourceRasterizer;
 
 #[cfg(target_os = "windows")]
 pub use native::{D3DRenderer, D3DTextureIdentity};

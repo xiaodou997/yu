@@ -9,9 +9,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+yu-assets = { path = "../../../crates/yu-assets" }
+yu-embedded-client = { path = "../../../crates/yu-embedded-client" }
 yu-core = { path = "../../../crates/yu-core" }
 yu-editor = { path = "../../../crates/yu-editor" }
 yu-font = { path = "../../../crates/yu-font" }
+yu-markdown = { path = "../../../crates/yu-markdown" }
 yu-render = { path = "../../../crates/yu-render" }
 yu-scene = { path = "../../../crates/yu-scene" }
 yu-storage = { path = "../../../crates/yu-storage" }

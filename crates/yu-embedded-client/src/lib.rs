@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! The app-side client intentionally has no Typst/Mermaid dependency.
 use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
@@ -121,10 +123,15 @@ impl NativeRendererClient {
                 Err(error) => return Err(RenderFailure::Worker(error.to_string())),
             }
         }
-        let mut child = Command::new(&self.path)
+        let mut command = Command::new(&self.path);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // The helper uses pipes and must not flash a console in the GUI app.
+        #[cfg(target_os = "windows")]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let mut child = command
             .spawn()
             .map_err(|e| RenderFailure::Worker(e.to_string()))?;
         let input = child.stdin.take().expect("piped stdin");
