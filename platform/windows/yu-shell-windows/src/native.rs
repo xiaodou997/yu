@@ -47,7 +47,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FileOpenDialog,
-    FileSaveDialog, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
+    FileSaveDialog, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::TextServices::TS_TEXTCHANGE;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -59,9 +59,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HACCEL, HMENU, HWND_TOP, IDC_ARROW, IsDialogMessageW, KillTimer, LBN_DBLCLK,
     LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
     MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
+    PostQuitMessage, RegisterClassExW, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
     WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
     WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
@@ -89,9 +89,9 @@ use crate::accessibility::{
     WM_APP_UIA_ACTION,
 };
 use crate::chrome::{
-    Chrome, ID_FILES, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY, ID_ROWS,
-    ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height,
-    search_height, sidebar_width,
+    Chrome, ID_FILES, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY,
+    ID_ROWS, ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction,
+    menu_height, search_height, sidebar_width,
 };
 use crate::resources::ResourceHost;
 use crate::text_input::{
@@ -112,6 +112,9 @@ const ID_FILE_EXIT: u16 = 1005;
 const ID_EDIT_UNDO: u16 = 1101;
 const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
+const ID_HELP_REPOSITORY: u16 = 1301;
+const ID_HELP_REPORT_ISSUE: u16 = 1302;
+const ID_HELP_ABOUT: u16 = 1303;
 const ID_FOCUS_NEXT: u16 = 1202;
 const ID_FOCUS_PREVIOUS: u16 = 1203;
 const ID_MENU_FOCUS: u16 = 2100;
@@ -1612,6 +1615,14 @@ impl AppWindow {
             append_popup(root.0, view.0, strings.view())?;
             std::mem::forget(view);
 
+            let help = Menu(CreatePopupMenu().map_err(platform_error)?);
+            append_string(help.0, ID_HELP_REPOSITORY, strings.github_repository())?;
+            append_string(help.0, ID_HELP_REPORT_ISSUE, strings.report_issue())?;
+            AppendMenuW(help.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
+            append_string(help.0, ID_HELP_ABOUT, strings.about_yu())?;
+            append_popup(root.0, help.0, strings.help())?;
+            std::mem::forget(help);
+
             self.menu = Some(root);
         }
         Ok(())
@@ -1797,8 +1808,27 @@ impl AppWindow {
                     }
                 }
             }
-            ID_MENU_FILE | ID_MENU_EDIT | ID_MENU_VIEW => {
+            ID_MENU_FILE | ID_MENU_EDIT | ID_MENU_VIEW | ID_MENU_HELP => {
                 self.show_menu(usize::from(command - ID_MENU_FILE))?;
+            }
+            ID_HELP_REPOSITORY => {
+                open_external_url(self.hwnd, "https://github.com/xiaodou997/yu");
+            }
+            ID_HELP_REPORT_ISSUE => {
+                open_external_url(
+                    self.hwnd,
+                    "https://github.com/xiaodou997/yu/issues/new/choose",
+                );
+            }
+            ID_HELP_ABOUT => {
+                let strings = self.state.strings();
+                let body = format!(
+                    "Yu\n{} {}\n\n{}",
+                    strings.version(),
+                    env!("CARGO_PKG_VERSION"),
+                    strings.about_body()
+                );
+                let _ = message_box(self.hwnd, &body, strings.about_yu(), MB_OK);
             }
             ID_FOCUS_NEXT | ID_FOCUS_PREVIOUS => {
                 let mut targets = vec![self.surface];
@@ -2347,6 +2377,11 @@ fn create_accelerators() -> Result<HACCEL, ShellError> {
             fVirt: FALT | FVIRTKEY,
             key: b'V' as u16,
             cmd: ID_MENU_VIEW,
+        },
+        ACCEL {
+            fVirt: FALT | FVIRTKEY,
+            key: b'H' as u16,
+            cmd: ID_MENU_HELP,
         },
         ACCEL {
             fVirt: FVIRTKEY,
@@ -3138,6 +3173,20 @@ fn show_error(hwnd: HWND, state: &ShellState, error: &ShellError) {
     let strings = state.strings();
     let message = error.to_string();
     let _ = message_box(hwnd, &message, strings.error_title(), MB_ICONERROR | MB_OK);
+}
+
+fn open_external_url(hwnd: HWND, url: &str) {
+    let url = wide(url);
+    unsafe {
+        let _ = ShellExecuteW(
+            hwnd,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
 }
 
 fn message_box(

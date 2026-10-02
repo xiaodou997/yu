@@ -45,6 +45,7 @@ pub(crate) const ID_SEARCH_NEXT: u16 = 2008;
 pub(crate) const ID_MENU_FILE: u16 = 2101;
 pub(crate) const ID_MENU_EDIT: u16 = 2102;
 pub(crate) const ID_MENU_VIEW: u16 = 2103;
+pub(crate) const ID_MENU_HELP: u16 = 2104;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -244,7 +245,7 @@ pub(crate) struct Chrome {
     pub(crate) status: HWND,
     pub(crate) query: HWND,
     pub(crate) list: HWND,
-    pub(crate) menu_buttons: [HWND; 3],
+    pub(crate) menu_buttons: [HWND; 4],
     menu_background: HWND,
     search_previous: HWND,
     search_next: HWND,
@@ -271,7 +272,7 @@ pub(crate) struct Chrome {
     empty_text: String,
     caption_text: String,
     tab_text: [String; 2],
-    menu_text: [String; 3],
+    menu_text: [String; 4],
 }
 
 impl Chrome {
@@ -312,7 +313,13 @@ impl Chrome {
         let strings = state.strings();
         let canvas = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2014, false)?;
         let background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2010, false)?;
-        let menu_text = [strings.file(), strings.edit(), strings.view()].map(menu_label);
+        let menu_text = [
+            strings.file(),
+            strings.edit(),
+            strings.view(),
+            strings.help(),
+        ]
+        .map(menu_label);
         let menu_background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2019, false)?;
         let menu_buttons = [
             child(
@@ -337,6 +344,14 @@ impl Chrome {
                 &menu_text[2],
                 BS_OWNERDRAW as u32,
                 ID_MENU_VIEW,
+                true,
+            )?,
+            child(
+                parent,
+                w!("BUTTON"),
+                &menu_text[3],
+                BS_OWNERDRAW as u32,
+                ID_MENU_HELP,
                 true,
             )?,
         ];
@@ -965,7 +980,7 @@ impl Chrome {
         Ok(())
     }
 
-    fn controls(&self) -> [HWND; 19] {
+    fn controls(&self) -> [HWND; 20] {
         [
             self.canvas,
             self.background,
@@ -974,6 +989,7 @@ impl Chrome {
             self.menu_buttons[0],
             self.menu_buttons[1],
             self.menu_buttons[2],
+            self.menu_buttons[3],
             self.tabs[0],
             self.tabs[1],
             self.caption,

@@ -121,6 +121,13 @@
 "Could Not Read Recovery Copy" = "Could Not Read Recovery Copy";
 "Recovery file kept: %@\n%@" = "Recovery file kept: %@\n%@";
 "About Yu" = "About Yu";
+"Help" = "Help";
+"GitHub Repository" = "GitHub Repository";
+"Report an Issue…" = "Report an Issue…";
+"Visual Markdown Editor" = "Visual Markdown Editor";
+"Version %@" = "Version %@";
+"Yu is open source software. If you run into a problem or have a feature suggestion, please report it on GitHub so it can be tracked and discussed." = "Yu is open source software. If you run into a problem or have a feature suggestion, please report it on GitHub so it can be tracked and discussed.";
+"Open Source · Apache 2.0" = "Open Source · Apache 2.0";
 "Settings…" = "Settings…";
 "Quit Yu" = "Quit Yu";
 "File" = "File";
