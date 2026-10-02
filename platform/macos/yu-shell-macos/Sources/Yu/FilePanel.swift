@@ -15,6 +15,7 @@ final class FilePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate 
     private let outline = NSOutlineView()
     private var root: Item
     var onOpen: ((URL) -> Void)?
+    var directoryURL: URL { root.url }
 
     init(directory: URL) {
         root = Item(directory)
