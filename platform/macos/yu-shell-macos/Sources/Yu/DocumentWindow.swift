@@ -850,6 +850,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         guard abs(next - readingZoom) > 0.001 else { return }
         surfaceCoordinator.retainPositionForPresentationChange()
         readingZoom = next
+        updateStatus()
         let theme = NativeTheme.spec(dark: view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
         let size = CGFloat(NativeWritingPreferences.shared.fontSize) * next
         textView.font = NativeTheme.font(identity: theme.body_font, size: size)
@@ -3054,7 +3055,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         view.window?.isDocumentEdited = state.dirty
         statusLabel.setAccessibilityValue(status)
         let characterCount = (bridge.source as NSString).length
-        statusDetailLabel.stringValue = L10n.format(characterCount == 1 ? "%d character" : "%d characters", characterCount)
+        let count = L10n.format(characterCount == 1 ? "%d character" : "%d characters", characterCount)
+        if abs(readingZoom - 1) <= 0.001 {
+            statusDetailLabel.stringValue = count
+        } else {
+            let percent = readingZoom * 100
+            let rounded = percent.rounded()
+            let zoom = abs(percent - rounded) <= 0.01
+                ? "\(Int(rounded))%"
+                : String(format: "%.1f%%", locale: Locale.current, Double(percent))
+            statusDetailLabel.stringValue = "\(count) · \(zoom)"
+        }
         statusDetailLabel.setAccessibilityValue(statusDetailLabel.stringValue)
     }
 

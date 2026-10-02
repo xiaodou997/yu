@@ -1702,12 +1702,19 @@ impl AppWindow {
 
     fn refresh_chrome(&self) {
         set_window_text(self.hwnd, &self.state.window_title());
-        let scale = (self.state.metrics().scale() * 100.0).round() as u32;
-        let status = format!(
-            "{} · {scale}% · UTF-8 · Markdown",
-            self.state.strings().ready()
-        );
-        set_window_text(self.status, &status);
+        // Match macOS' lightweight bottom-right document details. Count UTF-16
+        // code units so both native shells use the same definition. Do not show
+        // monitor DPI as document zoom; Windows has no document zoom control yet.
+        let character_count = self
+            .state
+            .document()
+            .session()
+            .snapshot()
+            .as_str()
+            .encode_utf16()
+            .count();
+        let details = self.state.strings().character_count(character_count);
+        set_window_text(self.status, &details);
     }
 
     fn update_layout(&mut self) {
@@ -1723,8 +1730,7 @@ impl AppWindow {
 
         let metrics = self.state.metrics();
         let spec = self.state.appearance().theme_id().spec();
-        let status_h = metrics.px(24.0).min(height);
-        let content_h = (height - status_h).max(1);
+        let content_h = height;
         let sidebar_w = sidebar_width(metrics, self.state.sidebar());
         let available_w = (width - sidebar_w).max(1);
         let gutter = metrics.px(spec.gutter).min((available_w - 1) / 4);

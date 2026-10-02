@@ -316,13 +316,14 @@ impl Strings {
     }
 
     #[must_use]
-    pub const fn ready(self) -> &'static str {
+    pub fn character_count(self, count: usize) -> String {
         match self.locale {
-            Locale::English => "Ready",
-            Locale::SimplifiedChinese => "就绪",
-            Locale::TraditionalChinese => "就緒",
-            Locale::Japanese => "準備完了",
-            Locale::Korean => "준비됨",
+            Locale::English if count == 1 => "1 character".to_owned(),
+            Locale::English => format!("{count} characters"),
+            Locale::SimplifiedChinese => format!("{count} 字符"),
+            Locale::TraditionalChinese => format!("{count} 字元"),
+            Locale::Japanese => format!("{count}文字"),
+            Locale::Korean => format!("{count}자"),
         }
     }
 
@@ -383,6 +384,22 @@ mod tests {
     }
 
     #[test]
+    fn character_count_matches_release_locale_wording() {
+        assert_eq!(Locale::English.strings().character_count(1), "1 character");
+        assert_eq!(Locale::English.strings().character_count(2), "2 characters");
+        assert_eq!(
+            Locale::SimplifiedChinese.strings().character_count(26),
+            "26 字符"
+        );
+        assert_eq!(
+            Locale::TraditionalChinese.strings().character_count(26),
+            "26 字元"
+        );
+        assert_eq!(Locale::Japanese.strings().character_count(26), "26文字");
+        assert_eq!(Locale::Korean.strings().character_count(26), "26자");
+    }
+
+    #[test]
     fn every_release_locale_exposes_the_shell_commands() {
         for locale in Locale::all() {
             let strings = locale.strings();
@@ -392,6 +409,8 @@ mod tests {
             assert!(!strings.report_issue().is_empty());
             assert!(!strings.about_yu().is_empty());
             assert!(!strings.about_body().is_empty());
+            assert!(!strings.character_count(0).is_empty());
+            assert!(!strings.character_count(1).is_empty());
             assert!(strings.new_document().contains("Ctrl+N"));
             assert!(strings.open().contains("Ctrl+O"));
             assert!(strings.save().contains("Ctrl+S"));
