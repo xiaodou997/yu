@@ -24,8 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, HMENU, HWND_BOTTOM, HWND_TOP, LB_ADDSTRING, LB_GETCURSEL,
     LB_GETTOPINDEX, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, MoveWindow,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    NONCLIENTMETRICSW, SBS_VERT, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETFONT, WM_SETREDRAW, WS_CHILD, WS_CLIPSIBLINGS,
     WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
@@ -42,6 +42,7 @@ pub(crate) const ID_ROWS: u16 = 2005;
 pub(crate) const ID_SEARCH_PREVIOUS: u16 = 2006;
 pub(crate) const ID_SEARCH_CLOSE: u16 = 2007;
 pub(crate) const ID_SEARCH_NEXT: u16 = 2008;
+pub(crate) const ID_DOCUMENT_SCROLLBAR: u16 = 2009;
 pub(crate) const ID_MENU_FILE: u16 = 2101;
 pub(crate) const ID_MENU_EDIT: u16 = 2102;
 pub(crate) const ID_MENU_VIEW: u16 = 2103;
@@ -243,6 +244,7 @@ pub(crate) struct Chrome {
     canvas: HWND,
     pub(crate) background: HWND,
     pub(crate) status: HWND,
+    pub(crate) document_scrollbar: HWND,
     pub(crate) query: HWND,
     pub(crate) list: HWND,
     pub(crate) menu_buttons: [HWND; 4],
@@ -405,6 +407,17 @@ impl Chrome {
         if !unsafe { SetWindowSubclass(status, Some(overlay_subclass), 1, 0) }.as_bool() {
             return Err(error(windows::core::Error::from_win32()));
         }
+        let document_scrollbar = child(
+            parent,
+            w!("SCROLLBAR"),
+            "",
+            SBS_VERT as u32,
+            ID_DOCUMENT_SCROLLBAR,
+            false,
+        )?;
+        unsafe {
+            let _ = ShowWindow(document_scrollbar, SW_HIDE);
+        }
         let search_background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2016, false)?;
         let search_caption = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2017, false)?;
         let search_close = child(
@@ -527,6 +540,7 @@ impl Chrome {
             canvas,
             background,
             status,
+            document_scrollbar,
             query,
             list,
             menu_buttons,
@@ -840,6 +854,9 @@ impl Chrome {
         let status_h = metrics.px(24.0).min(height);
         let status_w = metrics.px(180.0).min(width);
         let header_h = menu_height(metrics);
+        let search_h = search_height(metrics, search_visible);
+        let scrollbar_w = metrics.px(12.0).min(width);
+        let scrollbar_gap = metrics.px(4.0);
         let sidebar_w = sidebar_width(metrics, mode);
         let padding = metrics.px(12.0);
         let inner = (sidebar_w - padding * 2).max(1);
@@ -866,7 +883,7 @@ impl Chrome {
             }
             let _ = MoveWindow(
                 self.status,
-                (width - status_w).max(0),
+                (width - scrollbar_w - scrollbar_gap - status_w).max(0),
                 (height - status_h).max(0),
                 status_w,
                 status_h,
@@ -874,6 +891,24 @@ impl Chrome {
             );
             let _ = SetWindowPos(
                 self.status,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let scrollbar_top = (header_h + search_h).min(height);
+            let _ = MoveWindow(
+                self.document_scrollbar,
+                (width - scrollbar_w).max(0),
+                scrollbar_top,
+                scrollbar_w,
+                (height - scrollbar_top).max(1),
+                true,
+            );
+            let _ = SetWindowPos(
+                self.document_scrollbar,
                 HWND_TOP,
                 0,
                 0,
@@ -939,7 +974,6 @@ impl Chrome {
                 },
             );
             let search_w = (width - sidebar_w).max(1);
-            let search_h = search_height(metrics, search_visible);
             let search_left = sidebar_w + padding;
             let gap = metrics.px(8.0);
             let button_w = metrics.px(28.0);
