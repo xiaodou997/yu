@@ -1028,12 +1028,9 @@ impl EditorDecorationStyle {
 /// 区间 → 逐行按 cluster 收左右边界 → 一条矩形。抽出来是因为第二个消费者
 /// 到了；在那之前它只是选区那一段循环体，抽了也没多出唯一性。
 ///
-/// 高度取**行盒自己的**高度，不是 `config().line_height()`。
-///
-/// 那个基准值只在 v1 里恰好对：标题把行高塞进了 config。v2 的行高住在行盒
-/// 里（光标读取同一条已排版的行），于是选区
-/// 与搜索底色在标题、在带 widget 的行上都会画得又矮又靠上——**不报错，只是
-/// 画在文字上方**。这是真实窗口截图抓出来的；在那之前没有任何断言压着它。
+/// 高度与纵向位置取已排版文字的 ascent / descent 范围，与光标使用相同几何。
+/// 段落行间距和较高的内联对象只影响排版，不拉高选区或搜索底色；标题的字体
+/// 缩放与回退字体度量则反映在实际 cluster 范围中。
 ///
 /// `origin_y` 是 `content_origin_y(kind)`：代码块的内容在盒里从上内边距起排，
 /// 块局部坐标折进文档坐标时所有消费方补同一个数（
@@ -1060,6 +1057,8 @@ fn append_visual_span_rects(
         }
         let mut left = f32::INFINITY;
         let mut right = f32::NEG_INFINITY;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
         for cluster_index in line.cluster_range() {
             let cluster = layout.clusters()[cluster_index];
             if cluster.is_line_break()
@@ -1070,16 +1069,13 @@ fn append_visual_span_rects(
             }
             left = left.min(cluster.x());
             right = right.max(cluster.x() + cluster.width());
+            top = top.min(cluster.y());
+            bottom = bottom.max(cluster.y() + cluster.line_height());
         }
         if left.is_finite() && right.is_finite() && right > left {
             builder.editor_decoration(EditorDecorationPrimitive::new(
                 layer_source,
-                Rect::new(
-                    left,
-                    block_y + origin_y + line.y(),
-                    right - left,
-                    line.height(),
-                )?,
+                Rect::new(left, block_y + origin_y + top, right - left, bottom - top)?,
                 color,
                 role,
             ))?;
@@ -6282,9 +6278,9 @@ mod tests {
         assert_eq!(bounds.x(), 0.0);
         assert_eq!(bounds.y(), 0.0);
         assert_eq!(bounds.width(), 240.0, "背景铺满内容列");
-        // 内容两个行盒（文字行 + 块尾换行符行盒）2 × 32pt（20 × 1.6）；
+        // 内容一个文字行盒 32pt（20 × 1.6），块尾换行符结束段落；
         // 引用块高里还折着到段落的缝（0.6 行），那一段不属于背景。
-        assert_eq!(bounds.height(), 2.0 * 32.0, "引用背景没有垂直内边距");
+        assert_eq!(bounds.height(), 32.0, "引用背景没有垂直内边距");
         let quote_block = frame.input().blocks()[0];
         assert!(
             quote_block.height() > bounds.height(),

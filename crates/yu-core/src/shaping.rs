@@ -307,6 +307,16 @@ pub trait ShapingProvider {
         None
     }
 
+    /// Font ascent and descent in logical units, at the same scale as shaping.
+    /// Reference providers can omit metrics and retain their deterministic strut.
+    fn font_metrics(
+        &self,
+        _face: FontFaceId,
+        _scale: f32,
+    ) -> Result<Option<(f32, f32)>, Self::Error> {
+        Ok(None)
+    }
+
     fn shape(
         &self,
         text: &str,

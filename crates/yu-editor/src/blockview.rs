@@ -748,12 +748,13 @@ impl BlockView {
                 CaretAffinity::Downstream
             };
             if let Ok(native) = layout.caret(local, affinity) {
-                return layout.lines()[native.line()].height();
+                return layout.lines()[native.line()].text_height();
             }
         }
-        self.lines()
+        self.layout
+            .lines()
             .get(caret.line())
-            .map_or(self.config.line_height(), |line| line.height())
+            .map_or(self.config.line_height(), |line| line.text_height())
     }
 
     #[must_use]
@@ -1461,9 +1462,9 @@ impl BlockView {
                     visual,
                     line: cell.row(),
                     x: origin.x() + cluster.x(),
-                    y: origin.y() + line.bounds().y(),
+                    y: origin.y() + line.text_y(),
                     baseline_y: origin.y() + line.bounds().y() + line.baseline(),
-                    line_height: line.bounds().height(),
+                    line_height: line.text_height(),
                     width: cluster.width(),
                     style,
                     line_break: cluster.is_line_break(),
@@ -1620,26 +1621,18 @@ fn source_backed_clusters(
             .attrs(cluster.style())
             .ok_or(LayoutError::UnknownStyle(cluster.style()))?
             .style();
-        let y = layout
+        let line = layout
             .lines()
             .get(cluster.line())
-            .map_or(0.0, |line| line.bounds().y());
+            .ok_or(LayoutError::OffsetOverflow)?;
         clusters.push(BlockCluster {
             source,
             visual: cluster.visual(),
             line: cluster.line(),
             x: cluster.x(),
-            y,
-            baseline_y: y + layout
-                .lines()
-                .get(cluster.line())
-                .map_or(0.0, |line| line.baseline()),
-            line_height: layout
-                .lines()
-                .get(cluster.line())
-                .ok_or(LayoutError::OffsetOverflow)?
-                .bounds()
-                .height(),
+            y: line.text_y(),
+            baseline_y: line.y() + line.baseline(),
+            line_height: line.text_height(),
             width: cluster.width(),
             style,
             line_break: cluster.is_line_break(),

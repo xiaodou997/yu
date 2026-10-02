@@ -98,8 +98,12 @@ try {
     $queryHwnd = [YuAccessibilityMessages]::GetDlgItem($process.MainWindowHandle, 2004)
     Check ([YuNativeProperties]::Read($queryHwnd, 30003) -eq 50004) 'native COM UIA resolves search as Edit control'
     Check (-not [string]::IsNullOrEmpty([YuNativeProperties]::Read($queryHwnd, 30005))) 'native search edit has an accessible name'
-    $searchTab = [YuAccessibilityMessages]::GetDlgItem($process.MainWindowHandle, 2003)
-    Check ([YuNativeProperties]::Read($searchTab, 30003) -eq 50000) 'native COM UIA resolves navigation button'
+    Check ([YuAccessibilityMessages]::GetDlgItem($process.MainWindowHandle, 2003) -eq [IntPtr]::Zero) 'search is independent of the two sidebar tabs'
+    foreach ($buttonId in @(2101, 2102, 2103, 2001, 2002, 2006, 2007, 2008)) {
+        $buttonHwnd = [YuAccessibilityMessages]::GetDlgItem($process.MainWindowHandle, $buttonId)
+        Check ([YuNativeProperties]::Read($buttonHwnd, 30003) -eq 50000) "native COM UIA resolves button $buttonId"
+        Check (-not [string]::IsNullOrEmpty([YuNativeProperties]::Read($buttonHwnd, 30005))) "button $buttonId has an accessible name"
+    }
     $document = [Windows.Automation.AutomationElement]::FromHandle($surface)
     Check ($document.Current.AutomationId -eq 'markdown-editor') 'external UIA resolves editor provider'
     Check ($document.Current.ControlType -eq [Windows.Automation.ControlType]::Document) 'editable document control type'

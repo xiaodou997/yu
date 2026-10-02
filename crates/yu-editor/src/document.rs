@@ -5538,8 +5538,7 @@ prefix **羽🙂** suffix
     /// 光标/滚动/AX 消费的数学不变。间距表以正文行高（line_height × 1.6）为
     /// 单位，这里 line_height = 1.0，于是一「行」间距 = 1.6。
     ///
-    /// 块的视觉文本带尾部换行符，排成「内容 + 一个空行」——内容按行数算时
-    /// 要带上那一行。
+    /// 块尾换行符结束段落，不额外占一行；源分隔空行也不重复贡献高度。
     #[test]
     fn block_spacing_folds_into_viewport_heights() {
         let mut document = EditorDocument::new("# title\n\nparagraph\n");
@@ -5558,11 +5557,10 @@ prefix **羽🙂** suffix
         let gap = 1.0;
         assert_eq!(
             blocks[0].height(),
-            3.0 + gap + 1.0 / 16.0,
-            "首标题段前距 + 内容 2 行 + 缩放后的边框 + 折进来的缝"
+            2.0 + gap + 1.0 / 16.0,
+            "首标题段前距 + 内容 1 行 + 缩放后的边框 + 折进来的缝"
         );
-        // 空行块自己 2 行（换行符自己占一行，与段落块的尾行同理）；它到下一段
-        // 没有缝（两边都是 0）。
+        // 分隔空行不重复撑开已经计入段间距的高度。
         assert_eq!(
             blocks[1].height(),
             0.0,
@@ -5574,8 +5572,8 @@ prefix **羽🙂** suffix
         // The final paragraph keeps its own margin inside the page padding.
         assert_eq!(
             blocks[2].height(),
-            2.8,
-            "two content lines plus trailing margin"
+            1.8,
+            "one content line plus trailing margin"
         );
     }
 
@@ -6162,12 +6160,12 @@ prefix **羽🙂** suffix
         let blocks = snapshot.blocks();
         assert_eq!(blocks.len(), 4, "两个 item、空行、段落");
 
-        // List paragraphs retain the theme half-rem margin. Content is two lines.
-        assert_eq!(blocks[0].height(), 2.5);
+        // List paragraphs retain the theme half-rem margin and one content line.
+        assert_eq!(blocks[0].height(), 1.5);
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
         // 列表边界：第二个 item 下面是空行，缝 = after(item) = 0.4 行。
         let boundary = 0.5 * LINE_HEIGHT_BODY;
-        assert_eq!(blocks[1].height(), 2.0 + boundary);
+        assert_eq!(blocks[1].height(), 1.0 + boundary);
         assert_eq!(blocks[2].y(), blocks[1].y() + blocks[1].height());
         assert_eq!(
             blocks[2].height(),
@@ -6199,7 +6197,7 @@ prefix **羽🙂** suffix
         let gap = 15.0 / 16.0;
         assert_eq!(
             blocks[0].height(),
-            origin + 2.0 + 7.0 / 16.0 + gap,
+            origin + 1.0 + 7.0 / 16.0 + gap,
             "缩放后的上内边距 + 内容 + 下内边距 + 段间距"
         );
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
@@ -6285,8 +6283,8 @@ prefix **羽🙂** suffix
         let placeholder = document
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 100.0), &WideShaper)
             .expect("placeholder viewport should measure");
-        // 16 = 占位那一行（行高 10 × 正文倍率 1.6），块尾换行符一行同高。
-        assert_eq!(placeholder.blocks()[0].height(), 40.0);
+        // 16 = 占位那一行，8 = 段间距；块尾换行符不再额外贡献一行。
+        assert_eq!(placeholder.blocks()[0].height(), 24.0);
 
         let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
         let ready = document
@@ -6296,12 +6294,9 @@ prefix **羽🙂** suffix
                 |_| Some(intrinsic),
             )
             .expect("ready image viewport should measure");
-        // 56 = 40 + 16：40 是图片那一行（200×100 缩到 80 宽就是 40 高），16
-        // 是块尾那个换行符自己的行（10 × 正文行高倍率 1.6）。图片 widget 化
-        // 之前这里是 50：图片是排完之后另贴上去的盒子，行不知道它有多高，块
-        // 高只能取 `max(行盒累加, 图片下沿)`——于是图片压在块尾那一行上面。
-        assert_eq!(ready.blocks()[0].height(), 64.0);
-        assert_eq!(ready.blocks()[1].y(), 64.0);
+        // 40 是图片那一行（200×100 缩到 80 宽），再计入 8 的段间距。
+        assert_eq!(ready.blocks()[0].height(), 48.0);
+        assert_eq!(ready.blocks()[1].y(), 48.0);
         assert!(ready.content_height() > placeholder.content_height());
         assert!(ready.content_height() >= ready.blocks()[1].y() + ready.blocks()[1].height());
     }

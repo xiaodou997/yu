@@ -374,6 +374,7 @@ impl BlockLayoutInput {
         LayoutInput::new(&self.text, &self.runs)
             .with_widgets(&self.widgets)
             .with_line_styles(&self.lines)
+            .with_paragraph_end()
     }
 
     /// 这一块生效的布局配置（断行宽度已按块类内边距收窄，见字段文档）。
