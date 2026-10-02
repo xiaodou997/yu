@@ -109,6 +109,81 @@ impl Strings {
     }
 
     #[must_use]
+    pub const fn help(self) -> &'static str {
+        match self.locale {
+            Locale::English => "&Help",
+            Locale::SimplifiedChinese => "帮助(&H)",
+            Locale::TraditionalChinese => "說明(&H)",
+            Locale::Japanese => "ヘルプ(&H)",
+            Locale::Korean => "도움말(&H)",
+        }
+    }
+
+    #[must_use]
+    pub const fn github_repository(self) -> &'static str {
+        match self.locale {
+            Locale::English => "GitHub Repository",
+            Locale::SimplifiedChinese => "GitHub 开源项目",
+            Locale::TraditionalChinese => "GitHub 開源專案",
+            Locale::Japanese => "GitHub リポジトリ",
+            Locale::Korean => "GitHub 저장소",
+        }
+    }
+
+    #[must_use]
+    pub const fn report_issue(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Report an Issue…",
+            Locale::SimplifiedChinese => "反馈问题…",
+            Locale::TraditionalChinese => "回報問題…",
+            Locale::Japanese => "問題を報告…",
+            Locale::Korean => "문제 신고…",
+        }
+    }
+
+    #[must_use]
+    pub const fn about_yu(self) -> &'static str {
+        match self.locale {
+            Locale::English => "About Yu",
+            Locale::SimplifiedChinese => "关于 Yu",
+            Locale::TraditionalChinese => "關於 Yu",
+            Locale::Japanese => "Yu について",
+            Locale::Korean => "Yu 정보",
+        }
+    }
+
+    #[must_use]
+    pub const fn version(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Version",
+            Locale::SimplifiedChinese | Locale::TraditionalChinese => "版本",
+            Locale::Japanese => "バージョン",
+            Locale::Korean => "버전",
+        }
+    }
+
+    #[must_use]
+    pub const fn about_body(self) -> &'static str {
+        match self.locale {
+            Locale::English => {
+                "Visual Markdown Editor\n\nYu is open source software. Use Help → GitHub Repository to view the source code. If you run into a problem or have a feature suggestion, use Help → Report an Issue… to open an issue on GitHub.\n\nLicense: Apache-2.0"
+            }
+            Locale::SimplifiedChinese => {
+                "所见即所得 Markdown 编辑器\n\nYu 是开源软件。可通过“帮助 → GitHub 开源项目”查看源码；如果遇到问题或有功能建议，请使用“帮助 → 反馈问题…”前往 GitHub 提交 Issue。\n\n许可证：Apache-2.0"
+            }
+            Locale::TraditionalChinese => {
+                "所見即所得 Markdown 編輯器\n\nYu 是開源軟體。可透過「說明 → GitHub 開源專案」查看原始碼；如果遇到問題或有功能建議，請使用「說明 → 回報問題…」前往 GitHub 提交 Issue。\n\n授權條款：Apache-2.0"
+            }
+            Locale::Japanese => {
+                "WYSIWYG Markdown エディター\n\nYu はオープンソースソフトウェアです。「ヘルプ → GitHub リポジトリ」からソースコードを確認できます。問題や機能提案がある場合は、「ヘルプ → 問題を報告…」から GitHub Issue を作成してください。\n\nライセンス: Apache-2.0"
+            }
+            Locale::Korean => {
+                "WYSIWYG Markdown 편집기\n\nYu는 오픈 소스 소프트웨어입니다. “도움말 → GitHub 저장소”에서 소스 코드를 볼 수 있습니다. 문제나 기능 제안이 있으면 “도움말 → 문제 신고…”를 사용해 GitHub Issue를 등록해 주세요.\n\n라이선스: Apache-2.0"
+            }
+        }
+    }
+
+    #[must_use]
     pub const fn new_document(self) -> &'static str {
         match self.locale {
             Locale::English => "&New\tCtrl+N",
@@ -312,6 +387,11 @@ mod tests {
         for locale in Locale::all() {
             let strings = locale.strings();
             assert!(!strings.file().is_empty());
+            assert!(!strings.help().is_empty());
+            assert!(!strings.github_repository().is_empty());
+            assert!(!strings.report_issue().is_empty());
+            assert!(!strings.about_yu().is_empty());
+            assert!(!strings.about_body().is_empty());
             assert!(strings.new_document().contains("Ctrl+N"));
             assert!(strings.open().contains("Ctrl+O"));
             assert!(strings.save().contains("Ctrl+S"));

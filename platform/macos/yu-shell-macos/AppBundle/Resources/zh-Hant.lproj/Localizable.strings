@@ -121,6 +121,13 @@
 "Could Not Read Recovery Copy" = "無法讀取復原副本";
 "Recovery file kept: %@\n%@" = "復原檔案已保留：%@\n%@";
 "About Yu" = "關於 Yu";
+"Help" = "說明";
+"GitHub Repository" = "GitHub 開源專案";
+"Report an Issue…" = "回報問題…";
+"Visual Markdown Editor" = "所見即所得 Markdown 編輯器";
+"Version %@" = "版本 %@";
+"Yu is open source software. If you run into a problem or have a feature suggestion, please report it on GitHub so it can be tracked and discussed." = "Yu 是開源軟體。如果使用過程中遇到問題或有功能建議，歡迎前往 GitHub 提交 Issue，以便集中追蹤與討論。";
+"Open Source · Apache 2.0" = "開源軟體 · Apache 2.0";
 "Settings…" = "設定…";
 "Quit Yu" = "結束 Yu";
 "File" = "檔案";

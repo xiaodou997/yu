@@ -3068,6 +3068,27 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var settingsController: NativeSettingsWindowController?
+    private var aboutController: NativeAboutWindowController?
+
+    @objc private func showAbout(_ sender: Any?) {
+        if aboutController == nil {
+            let about = NativeAboutWindowController()
+            if forceDarkMode || darkModeSelfCheck { about.window?.appearance = NSAppearance(named: .darkAqua) }
+            else if forceLightMode { about.window?.appearance = NSAppearance(named: .aqua) }
+            aboutController = about
+        }
+        aboutController?.showWindow(sender)
+        aboutController?.window?.makeKeyAndOrderFront(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openRepository(_ sender: Any?) {
+        NSWorkspace.shared.open(NativeAboutWindowController.repositoryURL)
+    }
+
+    @objc private func reportIssue(_ sender: Any?) {
+        NSWorkspace.shared.open(NativeAboutWindowController.issueURL)
+    }
 
     @objc private func showSettings(_ sender: Any?) {
         if settingsController == nil {
@@ -3207,7 +3228,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         fputs("Yu window self-check failed: clean document chrome or menu validation toolbar=\(window.toolbar != nil) dirty=\(state.dirty) revision=\(state.revision) saved=\(state.savedRevision) disk=\(state.disk) save=\(controller.validateMenuItem(saveItem)) reload=\(controller.validateMenuItem(reloadItem))\n", stderr)
                         exit(EXIT_FAILURE)
                     }
-                    print("Yu launch self-check: window appeared and remained stable")
+                    let helpMenu = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == L10n.tr("Help") })?.submenu
+                    guard helpMenu?.items.contains(where: { $0.title == L10n.tr("GitHub Repository") }) == true,
+                          helpMenu?.items.contains(where: { $0.title == L10n.tr("Report an Issue…") }) == true,
+                          helpMenu?.items.contains(where: { $0.title == L10n.tr("About Yu") }) == true else {
+                        fputs("Yu window self-check failed: Help menu open-source entries are missing\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                    self.showAbout(nil)
+                    guard self.aboutController?.window?.isVisible == true else {
+                        fputs("Yu window self-check failed: About window did not open\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                    self.aboutController?.close()
+                    window.makeKeyAndOrderFront(nil)
+                    controller.focusDocument()
+                    print("Yu launch self-check: window, Help menu and About panel appeared and remained stable")
                     Task { @MainActor in
                         do {
                             if let mode = self.lifecycleSelfCheck {
@@ -3588,11 +3624,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu(title: "Yu")
-        appMenu.addItem(
-            withTitle: L10n.tr("About Yu"),
-            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+        let about = NSMenuItem(
+            title: L10n.tr("About Yu"),
+            action: #selector(showAbout(_:)),
             keyEquivalent: ""
         )
+        about.target = self
+        appMenu.addItem(about)
         let settings = NSMenuItem(title: L10n.tr("Settings…"), action: #selector(showSettings(_:)), keyEquivalent: ",")
         settings.target = self
         appMenu.addItem(settings)
@@ -3774,6 +3812,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         viewMenuItem.submenu = viewMenu
         mainMenu.addItem(viewMenuItem)
+
+        let helpMenuItem = NSMenuItem()
+        let helpMenu = NSMenu(title: L10n.tr("Help"))
+        helpMenu.addItem(
+            withTitle: L10n.tr("GitHub Repository"),
+            action: #selector(openRepository(_:)),
+            keyEquivalent: ""
+        ).target = self
+        helpMenu.addItem(
+            withTitle: L10n.tr("Report an Issue…"),
+            action: #selector(reportIssue(_:)),
+            keyEquivalent: ""
+        ).target = self
+        helpMenu.addItem(.separator())
+        let helpAbout = NSMenuItem(
+            title: L10n.tr("About Yu"),
+            action: #selector(showAbout(_:)),
+            keyEquivalent: ""
+        )
+        helpAbout.target = self
+        helpMenu.addItem(helpAbout)
+        helpMenuItem.submenu = helpMenu
+        mainMenu.addItem(helpMenuItem)
 
         NSApp.mainMenu = mainMenu
     }
