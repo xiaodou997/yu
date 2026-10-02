@@ -34,6 +34,15 @@ final class NativeFileWatcher {
         source.cancel()
     }
 }
+private struct DocumentWindowPresentation {
+    let sidebarHidden: Bool
+    let sidebarPanel: Int
+    let sidebarWidth: CGFloat
+    let readingZoom: CGFloat
+    let sourceMode: Bool
+    let fileRoot: URL
+}
+
 final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate {
     private let bridge: StorageBridge
     private var htmlExport: NativeHTMLExportController?
@@ -136,6 +145,41 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         }
         memoryPressure?.cancel()
         surfaceCoordinator.detach()
+    }
+
+    fileprivate func documentSwitchPresentation() -> DocumentWindowPresentation {
+        _ = view
+        return DocumentWindowPresentation(
+            sidebarHidden: sidebarHidden,
+            sidebarPanel: sidebarTabs.selectedSegment,
+            sidebarWidth: preferredSidebarWidth,
+            readingZoom: readingZoom,
+            sourceMode: bridge.sourceMode,
+            fileRoot: filePanel.directoryURL
+        )
+    }
+
+    fileprivate func selectFilesForSelfCheck() {
+        _ = view
+        sidebarHidden = false
+        sidebarTabs.selectedSegment = 0
+        updateSidebarVisibility()
+    }
+
+    fileprivate func applyDocumentSwitchPresentation(_ state: DocumentWindowPresentation) {
+        _ = view
+        preferredSidebarWidth = min(400, max(180, state.sidebarWidth))
+        sidebarHidden = state.sidebarHidden
+        sidebarTabs.selectedSegment = min(1, max(0, state.sidebarPanel))
+        filePanel.setDirectory(state.fileRoot)
+        setReadingZoom(state.readingZoom)
+        if bridge.sourceMode != state.sourceMode {
+            do { try setSourceMode(state.sourceMode) }
+            catch { show(error) }
+        }
+        updateSidebarVisibility()
+        view.layoutSubtreeIfNeeded()
+        documentSplitView?.setPosition(preferredSidebarWidth, ofDividerAt: 0)
     }
 
     fileprivate func persistentDocumentScrollerForSelfCheck() -> Bool {
@@ -3165,7 +3209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let path: String
         renderRegression = CommandLine.arguments.contains("--render-regression-self-check")
         resourceRegression = CommandLine.arguments.contains("--resource-latency-self-check")
-        launchSelfCheck = CommandLine.arguments.contains("--empty-document-window-self-check") || CommandLine.arguments.contains("--launch-window-self-check") || CommandLine.arguments.contains("--layout-coordinator-self-check") || CommandLine.arguments.contains("--window-state-self-check") || CommandLine.arguments.contains("--idle-resource-self-check") || CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") || renderRegression || resourceRegression || lifecycleSelfCheck != nil
+        launchSelfCheck = CommandLine.arguments.contains("--empty-document-window-self-check") || CommandLine.arguments.contains("--launch-window-self-check") || CommandLine.arguments.contains("--layout-coordinator-self-check") || CommandLine.arguments.contains("--window-state-self-check") || CommandLine.arguments.contains("--file-sidebar-switch-self-check") || CommandLine.arguments.contains("--idle-resource-self-check") || CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") || renderRegression || resourceRegression || lifecycleSelfCheck != nil
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         // 冒烟/截图用的显式外观开关：默认跟随系统，不参与 self-check。
         forceDarkMode = CommandLine.arguments.contains("--dark-mode")
@@ -3296,6 +3340,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 try await fresh.runEmptyDocumentSelfCheck()
                             } else if CommandLine.arguments.contains("--window-state-self-check") {
                                 try await controller.runWindowStateSelfCheck()
+                            } else if CommandLine.arguments.contains("--file-sidebar-switch-self-check") {
+                                try self.runFileSidebarSwitchSelfCheck()
                             } else if CommandLine.arguments.contains("--idle-resource-self-check") {
                                 try await controller.runIdleResourceSelfCheck()
                             } else if CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") {
@@ -3355,14 +3401,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         documents.first { identity($0.value.documentURL) == identity(url) }?.key
     }
 
-    @discardableResult
-    private func presentDocument(bridge: StorageBridge, recovered: Bool = false) -> NSWindow {
+    private func makeDocumentController(
+        bridge: StorageBridge,
+        recovered: Bool = false
+    ) -> DocumentViewController {
         if SandboxDocumentAccess.shared.enabled {
             do { _ = try SandboxDocumentAccess.shared.ensureImageAccess(bridge.localImageAccess().paths) }
             catch { NSAlert(error: error).runModal() }
         }
         let controller = DocumentViewController(bridge: bridge, recovered: recovered)
         configureDocumentForCheck?(controller)
+        return controller
+    }
+
+    private func bindDocumentController(_ controller: DocumentViewController, to window: NSWindow) {
+        controller.onOpenDocument = { [weak self, weak window] next in
+            guard let self, let window else { return }
+            _ = self.replaceDocument(in: window, with: next)
+        }
+        controller.onValidateSaveDestination = { [weak self, weak window, weak controller] destination in
+            guard let self, let controller else { throw CocoaError(.userCancelled) }
+            if let existing = self.existingWindow(for: destination), existing !== window {
+                throw NSError(domain: "Yu.Document", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This file is already open in another Yu window. Choose a different location.")])
+            }
+            if self.identity(destination) != self.identity(controller.documentURL),
+               try self.pendingRecovery(for: destination) != nil {
+                throw NSError(domain: "Yu.Document", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This location has an unresolved recovery copy. Handle it from “Recover Unsaved Documents” first, or choose another location.")])
+            }
+        }
+        controller.onDocumentURLChange = { [weak self, weak window, weak controller] in
+            guard let self, let window, let controller else { return }
+            window.isRestorable = !self.launchSelfCheck && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
+            self.noteRecentDocument(controller.documentURL)
+        }
+    }
+
+    @discardableResult
+    private func presentDocument(bridge: StorageBridge, recovered: Bool = false) -> NSWindow {
+        let controller = makeDocumentController(bridge: bridge, recovered: recovered)
         let window = NSWindow(contentViewController: controller)
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window.setContentSize(NSSize(width: 900, height: 620))
@@ -3384,24 +3462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
         window.restorationClass = NativeWindowRestorer.self
         window.identifier = NSUserInterfaceItemIdentifier(bridge.path)
-        controller.onOpenDocument = { [weak self] next in _ = self?.openDocument(at: next) }
-        controller.onValidateSaveDestination = { [weak self, weak window, weak controller] destination in
-            guard let self, let controller else { throw CocoaError(.userCancelled) }
-            if let existing = self.existingWindow(for: destination), existing !== window {
-                throw NSError(domain: "Yu.Document", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This file is already open in another Yu window. Choose a different location.")])
-            }
-            if self.identity(destination) != self.identity(controller.documentURL),
-               try self.pendingRecovery(for: destination) != nil {
-                throw NSError(domain: "Yu.Document", code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: L10n.tr("This location has an unresolved recovery copy. Handle it from “Recover Unsaved Documents” first, or choose another location.")])
-            }
-        }
-        controller.onDocumentURLChange = { [weak self, weak window, weak controller] in
-            guard let self, let window, let controller else { return }
-            window.isRestorable = !self.launchSelfCheck && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
-            self.noteRecentDocument(controller.documentURL)
-        }
+        bindDocumentController(controller, to: window)
         documents[window] = controller
         self.window = window
         self.controller = controller
@@ -3481,6 +3542,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let documentErrorPresenter { documentErrorPresenter(error) }
             else { NSAlert(error: error).runModal() }
             return nil
+        }
+    }
+
+    @discardableResult
+    fileprivate func replaceDocument(in window: NSWindow, with requestedURL: URL) -> Bool {
+        guard let current = documents[window] else { return false }
+        if identity(current.documentURL) == identity(requestedURL) {
+            window.makeKeyAndOrderFront(nil)
+            current.focusDocument()
+            return true
+        }
+        if let existing = existingWindow(for: requestedURL), existing !== window {
+            existing.makeKeyAndOrderFront(nil)
+            documents[existing]?.focusDocument()
+            return true
+        }
+
+        do {
+            let url = try SandboxDocumentAccess.shared.accessibleURL(requestedURL)
+            var recovered = false
+            var recoveryRecord: URL?
+            let bridge: StorageBridge
+            if let record = try pendingRecovery(for: url) {
+                if let target = try? StorageBridge.recoveryTarget(at: record),
+                   identity(target) == identity(url) {
+                    switch recoveryResponse(for: target) {
+                    case .alertFirstButtonReturn:
+                        bridge = try StorageBridge(path: record.path, mode: .recovery)
+                        recovered = true
+                        recoveryRecord = record
+                    case .alertSecondButtonReturn:
+                        try FileManager.default.removeItem(at: record)
+                        bridge = try StorageBridge(path: identity(url).path)
+                    default:
+                        return false
+                    }
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = L10n.tr("This Document’s Recovery Copy Could Not Be Read")
+                    alert.informativeText = L10n.tr("You can keep the damaged copy for later inspection and open the disk file. The copy will not be deleted.")
+                    alert.addButton(withTitle: L10n.tr("Keep Copy and Open"))
+                    alert.addButton(withTitle: L10n.tr("Cancel"))
+                    guard (recoveryAlertDecision?(alert) ?? alert.runModal()) == .alertFirstButtonReturn else {
+                        return false
+                    }
+                    let archive = NativeDocumentLocations.current.recovery.appendingPathComponent("Invalid", isDirectory: true)
+                    try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                    try FileManager.default.moveItem(
+                        at: record,
+                        to: archive.appendingPathComponent(UUID().uuidString + "-" + record.lastPathComponent)
+                    )
+                    bridge = try StorageBridge(path: identity(url).path)
+                }
+            } else {
+                bridge = try StorageBridge(path: identity(url).path)
+            }
+
+            let preservedFrame = window.frame
+            let presentation = current.documentSwitchPresentation()
+            let next = makeDocumentController(bridge: bridge, recovered: recovered)
+            guard current.requestClose() else { return false }
+            do {
+                try current.finalizeCloseRequest()
+            } catch {
+                current.cancelCloseRequest()
+                throw error
+            }
+
+            current.detachSurfaceHost()
+            bindDocumentController(next, to: window)
+            documents[window] = next
+            window.contentViewController = next
+            window.title = next.persistence.isUntitled ? L10n.tr("Untitled") : next.documentURL.lastPathComponent
+            window.representedURL = next.persistence.isUntitled ? nil : next.documentURL
+            window.identifier = NSUserInterfaceItemIdentifier(bridge.path)
+            window.isRestorable = !launchSelfCheck && !next.persistence.isUntitled
+                && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
+            window.isDocumentEdited = next.persistence.bridge.state.dirty
+            window.invalidateRestorableState()
+            next.applyDocumentSwitchPresentation(presentation)
+            window.setFrame(preservedFrame, display: false)
+
+            if let record = recoveryRecord { consideredRecoveryFiles.insert(record) }
+            self.window = window
+            self.controller = next
+            if !next.persistence.isUntitled { noteRecentDocument(next.documentURL) }
+            installMainMenu(for: next)
+            window.makeKeyAndOrderFront(nil)
+            next.focusDocument()
+            return true
+        } catch {
+            if let documentErrorPresenter { documentErrorPresenter(error) }
+            else { NSAlert(error: error).runModal() }
+            return false
         }
     }
 
@@ -3916,6 +4071,78 @@ private enum NativeWindowCapture {
         configuration.capturesAudio = false
         configuration.ignoreShadowsSingleWindow = true
         return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+    }
+}
+
+extension AppDelegate {
+    @MainActor
+    private func runFileSidebarSwitchSelfCheck() throws {
+        func require(_ value: Bool, _ message: String) throws {
+            if !value {
+                throw NSError(
+                    domain: "Yu.FileSidebarSwitchCheck",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: message]
+                )
+            }
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("YuFileSidebarSwitch-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let firstURL = directory.appendingPathComponent("first.md")
+        let secondURL = directory.appendingPathComponent("second.md")
+        try Data("# First\n".utf8).write(to: firstURL, options: .atomic)
+        try Data("# Second\n".utf8).write(to: secondURL, options: .atomic)
+
+        let testWindow = presentDocument(bridge: try StorageBridge(path: firstURL.path))
+        guard let first = documents[testWindow] else { throw CocoaError(.coderInvalidValue) }
+        first.selectFilesForSelfCheck()
+        let frame = testWindow.frame
+        let presentation = first.documentSwitchPresentation()
+        let windowCount = documents.count
+
+        first.onOpenDocument?(secondURL)
+        guard let second = documents[testWindow] else { throw CocoaError(.coderInvalidValue) }
+        let switched = second.documentSwitchPresentation()
+        try require(second !== first, "File sidebar retained the old controller")
+        try require(identity(second.documentURL) == identity(secondURL), "File sidebar opened the wrong document")
+        try require(documents.count == windowCount, "File sidebar created an extra window")
+        try require(NSEqualRects(testWindow.frame, frame), "File sidebar changed the current window frame")
+        try require(
+            switched.sidebarHidden == presentation.sidebarHidden
+                && switched.sidebarPanel == 0
+                && abs(switched.sidebarWidth - presentation.sidebarWidth) < 0.5
+                && abs(switched.readingZoom - presentation.readingZoom) < 0.001
+                && switched.sourceMode == presentation.sourceMode
+                && identity(switched.fileRoot) == identity(presentation.fileRoot),
+            "File sidebar did not preserve window navigation presentation"
+        )
+
+        second.withFileInputForSelfCheck {
+            $0.insertText("未保存", replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        second.closeAlertDecision = { _ in .alertThirdButtonReturn }
+        second.onOpenDocument?(firstURL)
+        try require(documents[testWindow] === second, "Cancel did not block file-sidebar replacement")
+
+        second.closeAlertDecision = { _ in .alertSecondButtonReturn }
+        second.onOpenDocument?(firstURL)
+        guard let firstAgain = documents[testWindow] else { throw CocoaError(.coderInvalidValue) }
+        try require(identity(firstAgain.documentURL) == identity(firstURL), "Discard switch did not reach the requested file")
+
+        let alreadyOpenWindow = presentDocument(bridge: try StorageBridge(path: secondURL.path))
+        let currentBeforeExistingTarget = documents[testWindow]
+        let existingTargetCount = documents.count
+        firstAgain.onOpenDocument?(secondURL)
+        try require(documents[testWindow] === currentBeforeExistingTarget, "Existing target replaced the current window")
+        try require(documents.count == existingTargetCount, "Existing target created a duplicate window")
+
+        alreadyOpenWindow.performClose(nil)
+        testWindow.performClose(nil)
+        print("Yu file sidebar switch self-check: in-window replacement, chrome preservation, cancel/discard and open-target deduplication passed")
     }
 }
 
