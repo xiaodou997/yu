@@ -320,6 +320,11 @@ typedef struct YuStorageProjectionHit {
     uint64_t line;
     float x;
     float y;
+    /* Document-space image bounds for an image hit; all zero otherwise. */
+    float image_x;
+    float image_y;
+    float image_width;
+    float image_height;
     uint8_t affinity;
 } YuStorageProjectionHit;
 

@@ -380,6 +380,12 @@ pub struct YuStorageProjectionHit {
     pub line: u64,
     pub x: f32,
     pub y: f32,
+    /// Document-space image bounds when this hit landed on an image. All four
+    /// values are zero for ordinary text/content hits.
+    pub image_x: f32,
+    pub image_y: f32,
+    pub image_width: f32,
+    pub image_height: f32,
     pub affinity: u8,
 }
 
@@ -5802,6 +5808,31 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
                 Ok(range) => range,
                 Err(status) => return status,
             };
+        let (image_x, image_y, image_width, image_height) = if let Some(image_source) = hit.image()
+        {
+            let Some(image) = placed
+                .layout()
+                .images()
+                .iter()
+                .find(|image| image.source() == image_source)
+            else {
+                return YU_STORAGE_EDITOR_ERROR;
+            };
+            let bounds = image.bounds();
+            let origin = placed.document_point(LayoutPoint::new(bounds.x(), bounds.y()));
+            if !origin.x().is_finite()
+                || !origin.y().is_finite()
+                || !bounds.width().is_finite()
+                || !bounds.height().is_finite()
+                || bounds.width() <= 0.0
+                || bounds.height() <= 0.0
+            {
+                return YU_STORAGE_EDITOR_ERROR;
+            }
+            (origin.x(), origin.y(), bounds.width(), bounds.height())
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
         let (content_source_start_utf16, content_source_end_utf16) =
             match image_utf16_range(&source, hit.content_source()) {
                 Ok(range) => range,
@@ -5852,6 +5883,10 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
                 line: line_base.saturating_add(hit.line() as u64),
                 x: point.x(),
                 y: document_y,
+                image_x,
+                image_y,
+                image_width,
+                image_height,
                 affinity: affinity_to_ffi(match hit.bias() {
                     Bias::Before => CaretAffinity::Upstream,
                     Bias::After => CaretAffinity::Downstream,
@@ -11429,6 +11464,11 @@ mod tests {
         assert_eq!(hit.line, 0);
         assert!(hit.x.is_finite());
         assert!(hit.y.is_finite());
+        assert_eq!(
+            (hit.image_x, hit.image_y, hit.image_width, hit.image_height),
+            (0.0, 0.0, 0.0, 0.0),
+            "ordinary text hits must not expose stale image geometry"
+        );
 
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
@@ -11453,6 +11493,74 @@ mod tests {
     /// 不同高度（差一个行高减 5pt），映射必须落在同一 caret——source、line、
     /// 返回的 y 三者一致；漏掉原点的表现是偏下那个点越进行下沿落进块尾换行
     /// 的空行盒，不报错。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_projection_hit_test_returns_exact_image_bounds() {
+        let id = temp_id();
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-image-projection-hit-{id}.md"));
+        fs::write(&path, "before\n\n![logo](missing.png)\n\nafter\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let session = unsafe { &mut *raw };
+        let (shaper, metrics, _) =
+            core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
+        macos_publish_viewport_config(session, 500.0, metrics, yu_core::ThemeId::Github)
+            .expect("config");
+        let geometry = macos_query_layout_snapshot(session, ViewportSpan::new(0.0, 800.0), &shaper)
+            .expect("image geometry");
+        let (placed, image) = geometry
+            .blocks()
+            .iter()
+            .find_map(|placed| {
+                placed
+                    .layout()
+                    .images()
+                    .first()
+                    .copied()
+                    .map(|image| (placed, image))
+            })
+            .expect("image placement");
+        let bounds = image.bounds();
+        let origin = placed.document_point(LayoutPoint::new(bounds.x(), bounds.y()));
+        let probe = LayoutPoint::new(
+            origin.x() + bounds.width() * 0.5,
+            origin.y() + bounds.height() * 0.5,
+        );
+        let mut hit = YuStorageProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(
+                    raw,
+                    0,
+                    probe.x(),
+                    probe.y(),
+                    14.0,
+                    500.0,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_ne!(
+            hit.image_source_start_utf16,
+            YU_STORAGE_IMAGE_DESTINATION_NONE
+        );
+        assert!(hit.image_source_end_utf16 > hit.image_source_start_utf16);
+        assert!((hit.image_x - origin.x()).abs() < 0.01);
+        assert!((hit.image_y - origin.y()).abs() < 0.01);
+        assert!((hit.image_width - bounds.width()).abs() < 0.01);
+        assert!((hit.image_height - bounds.height()).abs() < 0.01);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_projection_hit_test_includes_the_code_content_origin() {

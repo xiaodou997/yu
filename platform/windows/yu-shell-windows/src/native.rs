@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetSysColorBrush, PAINTSTRUCT,
-    ScreenToClient,
+    BI_RGB, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetSysColorBrush,
+    PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -56,34 +56,35 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, FALT, FCONTROL, FSHIFT, FVIRTKEY,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetScrollInfo, GetSubMenu,
+    DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, EN_KILLFOCUS, FALT, FCONTROL, FSHIFT,
+    FVIRTKEY, GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetScrollInfo, GetSubMenu,
     GetWindowLongPtrW, GetWindowRect, HACCEL, HMENU, HWND_TOP, IDC_ARROW, IsDialogMessageW,
     KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONWARNING,
-    MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SB_BOTTOM, SB_CTL, SB_LINEDOWN,
-    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO,
-    SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
-    TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
-    WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SB_BOTTOM, SB_CTL,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
+    SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
+    TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
+    WM_DRAWITEM, WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
-    WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
+    WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_CHILD,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
+use yu_assets::{DecodedImage, ImageLocation};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    Bias, EditorCommand, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
-    LayoutConfig, LayoutPoint, LayoutSnapshot, ViewportConfig, ViewportSpan,
+    Bias, EditorCommand, EditorKey, EditorSelection, ImageProperties, KeyEvent, KeyModifiers,
+    KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, ViewportConfig, ViewportSpan,
 };
 use yu_font::{FontRequest, GlyphAtlasConfig};
 use yu_font_windows::DirectWriteShaper;
 use yu_render::SurfaceConfig;
-use yu_render_windows::{D3DRenderError, D3DRenderer};
+use yu_render_windows::{D3DRenderError, D3DRenderer, ResourceRasterizer};
 use yu_scene::Rect;
 use yu_storage::{ClosePrompt, CloseRequest, CloseTransition};
 use yu_workspace::{Appearance, ViewportFrameBuilder, ViewportRenderConfig};
@@ -96,6 +97,11 @@ use crate::chrome::{
     Chrome, ID_FILES, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY,
     ID_ROWS, ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction,
     menu_height, search_height, sidebar_width,
+};
+use crate::image_interaction::{
+    ID_IMAGE_ALT, ID_IMAGE_DESTINATION, ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE,
+    ImageInspector, ImageInteractionState, ImagePropertyDraft, ImageScalePreset,
+    edit_image_properties, is_inspector_control,
 };
 use crate::resources::ResourceHost;
 use crate::text_input::{
@@ -122,6 +128,23 @@ const ID_HELP_ABOUT: u16 = 1303;
 const ID_FOCUS_NEXT: u16 = 1202;
 const ID_FOCUS_PREVIOUS: u16 = 1203;
 const ID_MENU_FOCUS: u16 = 2100;
+const ID_IMAGE_CONTEXT_REPLACE: u16 = 3001;
+const ID_IMAGE_CONTEXT_OPEN: u16 = 3002;
+const ID_IMAGE_CONTEXT_REVEAL: u16 = 3003;
+const ID_IMAGE_CONTEXT_COPY: u16 = 3004;
+const ID_IMAGE_CONTEXT_COPY_ADDRESS: u16 = 3005;
+const ID_IMAGE_CONTEXT_PROPERTIES: u16 = 3006;
+const ID_IMAGE_CONTEXT_SOURCE: u16 = 3007;
+const ID_IMAGE_SCALE_25: u16 = 3025;
+const ID_IMAGE_SCALE_33: u16 = 3033;
+const ID_IMAGE_SCALE_50: u16 = 3050;
+const ID_IMAGE_SCALE_67: u16 = 3067;
+const ID_IMAGE_SCALE_80: u16 = 3080;
+const ID_IMAGE_SCALE_100: u16 = 3100;
+const ID_IMAGE_SCALE_150: u16 = 3150;
+const ID_IMAGE_SCALE_200: u16 = 3200;
+const ID_IMAGE_SCALE_ORIGINAL: u16 = 3201;
+const ID_IMAGE_SCALE_FIT: u16 = 3202;
 const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
 const DRAG_SCROLL_TIMER_ID: usize = 1;
@@ -132,6 +155,7 @@ const TRIPLE_CLICK_RADIUS_PX: i32 = 8;
 
 const CANCELLED_HRESULT: i32 = 0x8007_04c7_u32 as i32;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
+const CF_DIB_FORMAT: u32 = 8;
 
 pub(super) struct ComApartment;
 
@@ -190,6 +214,83 @@ fn write_unicode_clipboard(owner: HWND, text: &str) -> Result<(), ShellError> {
         let _ = GlobalUnlock(memory);
     }
     match unsafe { SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(memory.0)) } {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            unsafe {
+                let _ = GlobalFree(memory);
+            }
+            Err(platform_error(error))
+        }
+    }
+}
+
+fn write_dib_clipboard(owner: HWND, image: &DecodedImage) -> Result<(), ShellError> {
+    let width = image.width();
+    let height = image.height();
+    let pixel_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| ShellError::Platform("clipboard image is too large".into()))?;
+    let header_size = size_of::<BITMAPINFOHEADER>();
+    let total = header_size
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| ShellError::Platform("clipboard image is too large".into()))?;
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, total) }.map_err(platform_error)?;
+    let pointer = unsafe { GlobalLock(memory) };
+    if pointer.is_null() {
+        unsafe {
+            let _ = GlobalFree(memory);
+        }
+        return Err(platform_error(WindowsError::from_win32()));
+    }
+    let header = BITMAPINFOHEADER {
+        biSize: header_size as u32,
+        biWidth: i32::try_from(width)
+            .map_err(|_| ShellError::Platform("clipboard image width overflow".into()))?,
+        biHeight: i32::try_from(height)
+            .map_err(|_| ShellError::Platform("clipboard image height overflow".into()))?,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        biSizeImage: u32::try_from(pixel_bytes)
+            .map_err(|_| ShellError::Platform("clipboard image size overflow".into()))?,
+        ..Default::default()
+    };
+    unsafe {
+        ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&header).cast::<u8>(),
+            pointer.cast::<u8>(),
+            header_size,
+        );
+    }
+    let output = unsafe {
+        std::slice::from_raw_parts_mut(pointer.cast::<u8>().add(header_size), pixel_bytes)
+    };
+    let input = image.pixels();
+    let row_bytes = width as usize * 4;
+    for row in 0..height as usize {
+        let input_row = (height as usize - 1 - row) * row_bytes;
+        let output_row = row * row_bytes;
+        for column in 0..width as usize {
+            let source = input_row + column * 4;
+            let target = output_row + column * 4;
+            output[target] = input[source + 2];
+            output[target + 1] = input[source + 1];
+            output[target + 2] = input[source];
+            output[target + 3] = input[source + 3];
+        }
+    }
+    unsafe {
+        let _ = GlobalUnlock(memory);
+    }
+    let _guard = ClipboardGuard::open(owner)?;
+    unsafe { EmptyClipboard() }.map_err(platform_error)?;
+    match unsafe { SetClipboardData(CF_DIB_FORMAT, HANDLE(memory.0)) } {
         Ok(_) => Ok(()),
         Err(error) => {
             unsafe {
@@ -484,6 +585,8 @@ pub(crate) struct AppWindow {
     surface: HWND,
     status: HWND,
     chrome: Option<Chrome>,
+    image_inspector: Option<ImageInspector>,
+    selected_image: Option<ImageInteractionState>,
     menu: Option<Menu>,
     state: ShellState,
     render: Option<RenderHost>,
@@ -506,6 +609,8 @@ impl AppWindow {
             surface: HWND::default(),
             status: HWND::default(),
             chrome: None,
+            image_inspector: None,
+            selected_image: None,
             menu: None,
             state,
             render: None,
@@ -526,6 +631,10 @@ impl AppWindow {
             .map_err(|error| startup_error("install menu", error))?;
         self.create_children()
             .map_err(|error| startup_error("create child windows", error))?;
+        self.image_inspector = Some(
+            ImageInspector::new(self.hwnd, self.state.strings())
+                .map_err(|error| startup_error("create image inspector", error))?,
+        );
         self.accessibility = Some(AccessibilityHost::new(self.surface));
         self.refresh_chrome();
         self.update_layout();
@@ -571,7 +680,9 @@ impl AppWindow {
         self.render = Some(render);
         result?;
         self.sync_document_scrollbar()?;
-        self.publish_accessibility()
+        self.publish_accessibility()?;
+        self.sync_image_inspector();
+        Ok(())
     }
 
     fn sync_document_scrollbar(&self) -> Result<(), ShellError> {
@@ -1359,6 +1470,17 @@ impl AppWindow {
         }
 
         if key == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize
+            && self.selected_image.is_some()
+        {
+            self.dismiss_image_interaction();
+            return Ok(true);
+        }
+
+        if self.selected_image.is_some() {
+            self.dismiss_image_interaction();
+        }
+
+        if key == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize
             && self.state.search_visible()
         {
             self.handle_chrome_command(ID_SEARCH_CLOSE, 0)?;
@@ -1457,6 +1579,7 @@ impl AppWindow {
         let Some(character) = character else {
             return Ok(true);
         };
+        self.dismiss_image_interaction();
         self.execute_input_command(EditorCommand::insert_text(character.to_string()))
     }
 
@@ -1694,6 +1817,606 @@ impl AppWindow {
             .map_err(|error| ShellError::Platform(error.to_string()))?
             .map(|(_, hit)| hit.source())
             .unwrap_or(ByteOffset::ZERO))
+    }
+
+    fn image_hit_at(&self, x: i32, y: i32) -> Result<Option<(TextRange, Rect)>, ShellError> {
+        let surface = native_surface_config(self.surface)?;
+        let viewport = self
+            .render
+            .as_ref()
+            .map(|render| render.builder.config().viewport())
+            .ok_or_else(|| ShellError::Platform("render host is unavailable".to_owned()))?;
+        let point = LayoutPoint::new(
+            x as f32 / surface.scale() as f32,
+            y as f32 / surface.scale() as f32 + viewport.scroll_y(),
+        );
+        let Some((placed, hit)) = self
+            .input_layout()?
+            .hit_test(point)
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let Some(source) = hit.image() else {
+            return Ok(None);
+        };
+        let Some(image) = placed
+            .layout()
+            .images()
+            .iter()
+            .find(|image| image.source() == source)
+        else {
+            return Ok(None);
+        };
+        let bounds = image.bounds();
+        let origin = placed.document_point(LayoutPoint::new(bounds.x(), bounds.y()));
+        let bounds = Rect::new(origin.x(), origin.y(), bounds.width(), bounds.height())
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(Some((source, bounds)))
+    }
+
+    fn image_bounds_for_source(&self, source: TextRange) -> Option<Rect> {
+        let layout = self.render.as_ref()?.layout.as_ref()?;
+        for placed in layout.blocks() {
+            if let Some(image) = placed
+                .layout()
+                .images()
+                .iter()
+                .find(|image| image.source() == source)
+            {
+                let bounds = image.bounds();
+                let origin = placed.document_point(LayoutPoint::new(bounds.x(), bounds.y()));
+                return Rect::new(origin.x(), origin.y(), bounds.width(), bounds.height()).ok();
+            }
+        }
+        None
+    }
+
+    fn image_interaction_state(
+        &mut self,
+        source: TextRange,
+        document_bounds: Rect,
+    ) -> Result<Option<ImageInteractionState>, ShellError> {
+        let (revision, properties, source_text) = {
+            let editor = self.state.document().session().document().editor();
+            let Some(properties) = editor.image_properties(source) else {
+                return Ok(None);
+            };
+            let snapshot = editor.snapshot();
+            let start = usize::try_from(source.start().get())
+                .map_err(|_| ShellError::Platform("image source offset overflow".into()))?;
+            let end = usize::try_from(source.end().get())
+                .map_err(|_| ShellError::Platform("image source offset overflow".into()))?;
+            let source_text = snapshot
+                .as_str()
+                .get(start..end)
+                .ok_or_else(|| ShellError::Platform("image source range is stale".into()))?
+                .to_owned();
+            (editor.revision(), properties, source_text)
+        };
+        let intrinsic = self
+            .render
+            .as_mut()
+            .and_then(|render| render.resources.as_mut())
+            .and_then(|resources| resources.intrinsic_dimensions(source));
+        let displayed_destination = display_image_destination(&properties.destination);
+        Ok(Some(ImageInteractionState {
+            revision,
+            source,
+            document_bounds,
+            source_text,
+            properties,
+            displayed_destination,
+            intrinsic,
+        }))
+    }
+
+    fn select_image_at(&mut self, x: i32, y: i32) -> Result<bool, ShellError> {
+        let Some((source, bounds)) = self.image_hit_at(x, y)? else {
+            self.dismiss_image_interaction();
+            return Ok(false);
+        };
+        self.selected_image = self.image_interaction_state(source, bounds)?;
+        self.sync_image_inspector();
+        Ok(self.selected_image.is_some())
+    }
+
+    fn dismiss_image_interaction(&mut self) {
+        self.selected_image = None;
+        if let Some(inspector) = self.image_inspector.as_mut() {
+            inspector.hide();
+        }
+    }
+
+    fn sync_image_inspector(&mut self) {
+        let Some(mut selected) = self.selected_image.clone() else {
+            if let Some(inspector) = self.image_inspector.as_mut() {
+                inspector.hide();
+            }
+            return;
+        };
+        if selected.revision != self.state.document().session().revision() {
+            self.dismiss_image_interaction();
+            return;
+        }
+        let Some(bounds) = self.image_bounds_for_source(selected.source) else {
+            self.dismiss_image_interaction();
+            return;
+        };
+        selected.document_bounds = bounds;
+        if let Some(intrinsic) = self
+            .render
+            .as_mut()
+            .and_then(|render| render.resources.as_mut())
+            .and_then(|resources| resources.intrinsic_dimensions(selected.source))
+        {
+            selected.intrinsic = Some(intrinsic);
+        }
+        self.selected_image = Some(selected.clone());
+
+        let Some(render) = self.render.as_ref() else {
+            return;
+        };
+        let Ok(surface) = native_surface_config(self.surface) else {
+            return;
+        };
+        let viewport = render.builder.config().viewport();
+        let scale = surface.scale() as f32;
+        let mut surface_rect = RECT::default();
+        if unsafe { GetWindowRect(self.surface, &mut surface_rect) }.is_err() {
+            return;
+        }
+        let mut top_left = POINT {
+            x: surface_rect.left,
+            y: surface_rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: surface_rect.right,
+            y: surface_rect.bottom,
+        };
+        if !unsafe { ScreenToClient(self.hwnd, &mut top_left) }.as_bool()
+            || !unsafe { ScreenToClient(self.hwnd, &mut bottom_right) }.as_bool()
+        {
+            return;
+        }
+        let viewport_rect = RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        };
+        let image = RECT {
+            left: top_left.x + (bounds.x() * scale).round() as i32,
+            top: top_left.y + ((bounds.y() - viewport.scroll_y()) * scale).round() as i32,
+            right: top_left.x + ((bounds.x() + bounds.width()) * scale).round() as i32,
+            bottom: top_left.y
+                + ((bounds.y() + bounds.height() - viewport.scroll_y()) * scale).round() as i32,
+        };
+        if image.right <= viewport_rect.left
+            || image.left >= viewport_rect.right
+            || image.bottom <= viewport_rect.top
+            || image.top >= viewport_rect.bottom
+        {
+            if let Some(inspector) = self.image_inspector.as_mut() {
+                inspector.hide_for_scroll();
+            }
+            return;
+        }
+        if let Some(inspector) = self.image_inspector.as_mut() {
+            inspector.present(&selected, image, viewport_rect, self.state.metrics());
+        }
+    }
+
+    fn selected_local_image_path(&self) -> Option<PathBuf> {
+        let selected = self.selected_image.as_ref()?;
+        ImageLocation::resolve(
+            self.state.document().session().path(),
+            &selected.properties.destination,
+        )
+        .ok()
+        .map(|location| location.path().to_owned())
+    }
+
+    fn apply_image_properties(&mut self, desired: ImageProperties) -> Result<(), ShellError> {
+        let old_start = desired.source.start();
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let result = self
+            .state
+            .document_mut()
+            .session_mut()
+            .document_mut()
+            .editor_mut()
+            .update_image_properties(&desired)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        let changed = result.changed();
+        let new_source = self
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .image_references()
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .into_iter()
+            .find(|reference| reference.source.start() == old_start)
+            .map(|reference| reference.source);
+        self.refresh_chrome();
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, changed)?;
+        if let Some(source) = new_source
+            && let Some(bounds) = self.image_bounds_for_source(source)
+        {
+            self.selected_image = self.image_interaction_state(source, bounds)?;
+            self.sync_image_inspector();
+        }
+        Ok(())
+    }
+
+    fn commit_image_inspector_fields(&mut self) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.clone() else {
+            return Ok(());
+        };
+        let Some(inspector) = self.image_inspector.as_ref() else {
+            return Ok(());
+        };
+        let destination = inspector.destination();
+        let alternative = inspector.alternative();
+        if destination.trim().is_empty() {
+            return Ok(());
+        }
+        let mut desired = selected.properties;
+        desired.alternative = alternative;
+        desired.destination = canonical_image_destination(&destination)?;
+        self.apply_image_properties(desired)
+    }
+
+    fn edit_selected_image_properties(&mut self) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.clone() else {
+            return Ok(());
+        };
+        let draft = edit_image_properties(
+            self.hwnd,
+            self.state.strings(),
+            &selected.properties,
+            &selected.displayed_destination,
+            selected.intrinsic,
+        )?;
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
+        let Some(ImagePropertyDraft {
+            destination,
+            alternative,
+            width,
+            height,
+        }) = draft
+        else {
+            return Ok(());
+        };
+        let mut desired = selected.properties;
+        desired.destination = canonical_image_destination(&destination)?;
+        desired.alternative = alternative;
+        desired.width = width;
+        desired.height = height;
+        self.apply_image_properties(desired)
+    }
+
+    fn replace_selected_image(&mut self) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.clone() else {
+            return Ok(());
+        };
+        let Some(path) = open_image_dialog(self.hwnd)? else {
+            return Ok(());
+        };
+        let destination =
+            image_destination_for_path(self.state.document().session().path(), &path)?;
+        let mut desired = selected.properties;
+        desired.destination = destination;
+        self.apply_image_properties(desired)
+    }
+
+    fn scale_selected_image(&mut self, preset: ImageScalePreset) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.clone() else {
+            return Ok(());
+        };
+        let mut desired = selected.properties;
+        match preset {
+            ImageScalePreset::Original => {
+                desired.width = None;
+                desired.height = None;
+            }
+            ImageScalePreset::FitColumn => {
+                let width = self
+                    .render
+                    .as_ref()
+                    .map(|render| render.builder.config().scene_viewport().width())
+                    .unwrap_or(1.0)
+                    .round()
+                    .clamp(1.0, 100_000.0);
+                desired.width = Some(width as u32);
+                desired.height = None;
+            }
+            ImageScalePreset::Percent(percent) => {
+                let Some(intrinsic) = selected.intrinsic else {
+                    return Ok(());
+                };
+                let factor = percent as f64 / 100.0;
+                let width = (f64::from(intrinsic.width()) * factor)
+                    .round()
+                    .clamp(1.0, 100_000.0);
+                let height = (f64::from(intrinsic.height()) * factor)
+                    .round()
+                    .clamp(1.0, 100_000.0);
+                desired.width = Some(width as u32);
+                desired.height = Some(height as u32);
+            }
+        }
+        self.apply_image_properties(desired)
+    }
+
+    fn edit_selected_image_source(&mut self) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.clone() else {
+            return Ok(());
+        };
+        {
+            let editor = self
+                .state
+                .document_mut()
+                .session_mut()
+                .document_mut()
+                .editor_mut();
+            editor
+                .reveal_html_range(selected.source)
+                .map_err(|error| ShellError::Platform(error.to_string()))?;
+        }
+        let snapshot = self.state.document().session().snapshot();
+        let selection = EditorSelection::range(
+            &snapshot,
+            selected.source.start(),
+            selected.source.end(),
+            CaretAffinity::Downstream,
+        )
+        .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.state
+            .document_mut()
+            .session_mut()
+            .set_selection(selection)?;
+        self.dismiss_image_interaction();
+        self.render_current()?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_selection_change();
+        }
+        Ok(())
+    }
+
+    fn open_selected_image(&self) -> Result<(), ShellError> {
+        let Some(path) = self.selected_local_image_path() else {
+            return Ok(());
+        };
+        let path = wide(path.to_string_lossy().as_ref());
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                w!("open"),
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            return Err(ShellError::Platform(
+                "Windows could not open the image".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reveal_selected_image(&self) -> Result<(), ShellError> {
+        let Some(path) = self.selected_local_image_path() else {
+            return Ok(());
+        };
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| ShellError::Platform(error.to_string()))
+    }
+
+    fn copy_selected_image_address(&self) -> Result<(), ShellError> {
+        let Some(selected) = self.selected_image.as_ref() else {
+            return Ok(());
+        };
+        write_unicode_clipboard(self.hwnd, &selected.displayed_destination)
+    }
+
+    fn copy_selected_image(&self) -> Result<(), ShellError> {
+        let Some(path) = self.selected_local_image_path() else {
+            return Ok(());
+        };
+        let mut rasterizer =
+            ResourceRasterizer::new().map_err(|error| ShellError::Platform(error.to_string()))?;
+        let image = rasterizer
+            .decode_local(&path, 4096)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        write_dib_clipboard(self.hwnd, &image)
+    }
+
+    fn handle_image_action(&mut self, command: u16) -> Result<(), ShellError> {
+        match command {
+            ID_IMAGE_CONTEXT_REPLACE | ID_IMAGE_REPLACE => self.replace_selected_image(),
+            ID_IMAGE_CONTEXT_OPEN => self.open_selected_image(),
+            ID_IMAGE_CONTEXT_REVEAL => self.reveal_selected_image(),
+            ID_IMAGE_CONTEXT_COPY => self.copy_selected_image(),
+            ID_IMAGE_CONTEXT_COPY_ADDRESS => self.copy_selected_image_address(),
+            ID_IMAGE_CONTEXT_PROPERTIES => self.edit_selected_image_properties(),
+            ID_IMAGE_CONTEXT_SOURCE => self.edit_selected_image_source(),
+            ID_IMAGE_SCALE_25 => self.scale_selected_image(ImageScalePreset::Percent(25)),
+            ID_IMAGE_SCALE_33 => self.scale_selected_image(ImageScalePreset::Percent(33)),
+            ID_IMAGE_SCALE_50 => self.scale_selected_image(ImageScalePreset::Percent(50)),
+            ID_IMAGE_SCALE_67 => self.scale_selected_image(ImageScalePreset::Percent(67)),
+            ID_IMAGE_SCALE_80 => self.scale_selected_image(ImageScalePreset::Percent(80)),
+            ID_IMAGE_SCALE_100 => self.scale_selected_image(ImageScalePreset::Percent(100)),
+            ID_IMAGE_SCALE_150 => self.scale_selected_image(ImageScalePreset::Percent(150)),
+            ID_IMAGE_SCALE_200 => self.scale_selected_image(ImageScalePreset::Percent(200)),
+            ID_IMAGE_SCALE_ORIGINAL => self.scale_selected_image(ImageScalePreset::Original),
+            ID_IMAGE_SCALE_FIT => self.scale_selected_image(ImageScalePreset::FitColumn),
+            _ => Ok(()),
+        }
+    }
+
+    fn append_image_size_menu(&self, menu: HMENU) -> Result<(), ShellError> {
+        let has_intrinsic = self
+            .selected_image
+            .as_ref()
+            .is_some_and(|selected| selected.intrinsic.is_some());
+        for (id, percent) in [
+            (ID_IMAGE_SCALE_25, 25),
+            (ID_IMAGE_SCALE_33, 33),
+            (ID_IMAGE_SCALE_50, 50),
+            (ID_IMAGE_SCALE_67, 67),
+            (ID_IMAGE_SCALE_80, 80),
+            (ID_IMAGE_SCALE_100, 100),
+            (ID_IMAGE_SCALE_150, 150),
+            (ID_IMAGE_SCALE_200, 200),
+        ] {
+            let text = wide(&format!("{percent}%"));
+            unsafe {
+                AppendMenuW(
+                    menu,
+                    if has_intrinsic {
+                        MF_STRING
+                    } else {
+                        MF_STRING | MF_GRAYED
+                    },
+                    usize::from(id),
+                    PCWSTR(text.as_ptr()),
+                )
+            }
+            .map_err(platform_error)?;
+        }
+        unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }.map_err(platform_error)?;
+        unsafe {
+            append_string(
+                menu,
+                ID_IMAGE_SCALE_ORIGINAL,
+                self.state.strings().original_size(),
+            )?;
+            append_string(
+                menu,
+                ID_IMAGE_SCALE_FIT,
+                self.state.strings().fit_to_column(),
+            )
+        }
+    }
+
+    fn show_image_size_menu(&mut self, x: i32, y: i32) -> Result<(), ShellError> {
+        let menu = Menu(unsafe { CreatePopupMenu() }.map_err(platform_error)?);
+        self.append_image_size_menu(menu.0)?;
+        let command = unsafe {
+            TrackPopupMenuEx(
+                menu.0,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY).0,
+                x,
+                y,
+                self.hwnd,
+                None,
+            )
+        }
+        .0;
+        if command != 0 {
+            self.handle_image_action(command as u16)?;
+        }
+        Ok(())
+    }
+
+    fn show_image_context_menu(&mut self, x: i32, y: i32) -> Result<(), ShellError> {
+        let strings = self.state.strings();
+        let menu = Menu(unsafe { CreatePopupMenu() }.map_err(platform_error)?);
+        unsafe {
+            append_string(menu.0, ID_IMAGE_CONTEXT_REPLACE, strings.replace_image())?;
+        }
+        let local = self.selected_local_image_path().is_some();
+        if local {
+            unsafe {
+                append_string(menu.0, ID_IMAGE_CONTEXT_OPEN, strings.open_image())?;
+                append_string(menu.0, ID_IMAGE_CONTEXT_REVEAL, strings.show_in_explorer())?;
+                append_string(menu.0, ID_IMAGE_CONTEXT_COPY, strings.copy_image())?;
+            }
+        }
+        unsafe {
+            append_string(
+                menu.0,
+                ID_IMAGE_CONTEXT_COPY_ADDRESS,
+                strings.copy_image_address(),
+            )?;
+        }
+        unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()) }.map_err(platform_error)?;
+        let size = Menu(unsafe { CreatePopupMenu() }.map_err(platform_error)?);
+        self.append_image_size_menu(size.0)?;
+        unsafe {
+            append_popup(menu.0, size.0, strings.image_size())?;
+        }
+        std::mem::forget(size);
+        unsafe { AppendMenuW(menu.0, MF_SEPARATOR, 0, PCWSTR::null()) }.map_err(platform_error)?;
+        unsafe {
+            append_string(
+                menu.0,
+                ID_IMAGE_CONTEXT_PROPERTIES,
+                strings.image_properties(),
+            )?;
+            append_string(
+                menu.0,
+                ID_IMAGE_CONTEXT_SOURCE,
+                strings.edit_markdown_source(),
+            )?;
+        }
+        let command = unsafe {
+            TrackPopupMenuEx(
+                menu.0,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY).0,
+                x,
+                y,
+                self.hwnd,
+                None,
+            )
+        }
+        .0;
+        if command != 0 {
+            self.handle_image_action(command as u16)?;
+        }
+        Ok(())
+    }
+
+    fn handle_image_inspector_command(
+        &mut self,
+        command: u16,
+        notification: u16,
+    ) -> Result<(), ShellError> {
+        match command {
+            ID_IMAGE_ALT | ID_IMAGE_DESTINATION if u32::from(notification) == EN_KILLFOCUS => {
+                self.commit_image_inspector_fields()
+            }
+            ID_IMAGE_REPLACE => self.replace_selected_image(),
+            ID_IMAGE_SIZE | ID_IMAGE_MORE => {
+                let Some(button) = self
+                    .image_inspector
+                    .as_ref()
+                    .and_then(|inspector| inspector.button(command))
+                else {
+                    return Ok(());
+                };
+                let mut rect = RECT::default();
+                unsafe { GetWindowRect(button, &mut rect) }.map_err(platform_error)?;
+                if command == ID_IMAGE_SIZE {
+                    self.show_image_size_menu(rect.left, rect.bottom)
+                } else {
+                    self.show_image_context_menu(rect.left, rect.bottom)
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     fn set_mouse_selection(
@@ -2726,8 +3449,11 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_COMMAND => {
                 let command = (wparam.0 & 0xffff) as u16;
-                let result = if lparam.0 != 0 && (ID_FILES..=ID_SEARCH_NEXT).contains(&command) {
-                    app.handle_chrome_command(command, (wparam.0 >> 16) as u16)
+                let notification = (wparam.0 >> 16) as u16;
+                let result = if lparam.0 != 0 && is_inspector_control(command) {
+                    app.handle_image_inspector_command(command, notification)
+                } else if lparam.0 != 0 && (ID_FILES..=ID_SEARCH_NEXT).contains(&command) {
+                    app.handle_chrome_command(command, notification)
                 } else {
                     app.handle_command(command)
                 };
@@ -2853,6 +3579,13 @@ unsafe extern "system" fn window_proc(
             }
             WM_DRAWITEM => {
                 let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                if app
+                    .image_inspector
+                    .as_ref()
+                    .is_some_and(|inspector| inspector.draw(item))
+                {
+                    return LRESULT(1);
+                }
                 if app.chrome.as_ref().is_some_and(|chrome| chrome.draw(item)) {
                     return LRESULT(1);
                 }
@@ -2934,9 +3667,25 @@ unsafe extern "system" fn surface_proc(
             WM_LBUTTONDBLCLK => {
                 unsafe {
                     let _ = SetFocus(hwnd);
-                    let _ = SetCapture(hwnd);
                 }
                 let (x, y) = mouse_coordinates(lparam);
+                match app.select_image_at(x, y) {
+                    Ok(true) => {
+                        app.semantic_click = true;
+                        if let Err(error) = app.edit_selected_image_properties() {
+                            show_error(app.hwnd, &app.state, &error);
+                        }
+                        return LRESULT(0);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        show_error(app.hwnd, &app.state, &error);
+                        return LRESULT(0);
+                    }
+                }
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                }
                 app.record_double_click(x, y);
                 app.semantic_click = true;
                 if let Err(error) = app.set_semantic_mouse_selection(x, y, false) {
@@ -2947,9 +3696,29 @@ unsafe extern "system" fn surface_proc(
             WM_LBUTTONDOWN => {
                 unsafe {
                     let _ = SetFocus(hwnd);
-                    let _ = SetCapture(hwnd);
                 }
                 let (x, y) = mouse_coordinates(lparam);
+                let plain = wparam.0 & MK_SHIFT.0 as usize == 0
+                    && unsafe { GetKeyState(VK_CONTROL.0 as i32) } >= 0
+                    && unsafe { GetKeyState(VK_MENU.0 as i32) } >= 0;
+                if plain {
+                    match app.select_image_at(x, y) {
+                        Ok(true) => {
+                            app.semantic_click = true;
+                            return LRESULT(0);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            show_error(app.hwnd, &app.state, &error);
+                            return LRESULT(0);
+                        }
+                    }
+                } else {
+                    app.dismiss_image_interaction();
+                }
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                }
                 let triple = app.consume_triple_click(x, y);
                 app.semantic_click = triple;
                 let result = if triple {
@@ -2961,6 +3730,25 @@ unsafe extern "system" fn surface_proc(
                     show_error(app.hwnd, &app.state, &error);
                 }
                 return LRESULT(0);
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = mouse_coordinates(lparam);
+                match app.select_image_at(x, y) {
+                    Ok(true) => {
+                        let mut point = POINT { x, y };
+                        if unsafe { ClientToScreen(hwnd, &mut point) }.as_bool()
+                            && let Err(error) = app.show_image_context_menu(point.x, point.y)
+                        {
+                            show_error(app.hwnd, &app.state, &error);
+                        }
+                        return LRESULT(0);
+                    }
+                    Ok(false) => return LRESULT(0),
+                    Err(error) => {
+                        show_error(app.hwnd, &app.state, &error);
+                        return LRESULT(0);
+                    }
+                }
             }
             WM_MOUSEMOVE if wparam.0 & MK_LBUTTON.0 as usize != 0 => {
                 let (x, y) = mouse_coordinates(lparam);
@@ -3216,6 +4004,21 @@ fn open_file_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {
     show_file_dialog(owner, &dialog)
 }
 
+fn open_image_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {
+    let dialog: IFileOpenDialog =
+        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(platform_error)?;
+    unsafe {
+        let options = dialog.GetOptions().map_err(platform_error)?
+            | FOS_FORCEFILESYSTEM
+            | FOS_FILEMUSTEXIST
+            | FOS_PATHMUSTEXIST;
+        dialog.SetOptions(options).map_err(platform_error)?;
+        set_image_filter(&dialog)?;
+    }
+    show_file_dialog(owner, &dialog)
+}
+
 fn save_file_dialog(owner: HWND, document: &DocumentSlot) -> Result<Option<PathBuf>, ShellError> {
     let dialog: IFileSaveDialog =
         unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER) }
@@ -3257,6 +4060,29 @@ where
     let dialog: IFileDialog = dialog.cast().map_err(platform_error)?;
     let name = wide("Markdown (*.md;*.markdown)");
     let pattern = wide("*.md;*.markdown");
+    let all_name = wide("All files (*.*)");
+    let all_pattern = wide("*.*");
+    let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: PCWSTR(name.as_ptr()),
+            pszSpec: PCWSTR(pattern.as_ptr()),
+        },
+        COMDLG_FILTERSPEC {
+            pszName: PCWSTR(all_name.as_ptr()),
+            pszSpec: PCWSTR(all_pattern.as_ptr()),
+        },
+    ];
+    unsafe { dialog.SetFileTypes(&filters) }.map_err(platform_error)
+}
+
+unsafe fn set_image_filter<D>(dialog: &D) -> Result<(), ShellError>
+where
+    D: windows::core::Interface,
+{
+    use windows::Win32::UI::Shell::IFileDialog;
+    let dialog: IFileDialog = dialog.cast().map_err(platform_error)?;
+    let name = wide("Images (*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg)");
+    let pattern = wide("*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg");
     let all_name = wide("All files (*.*)");
     let all_pattern = wide("*.*");
     let filters = [
@@ -3368,6 +4194,54 @@ fn set_window_text(hwnd: HWND, text: &str) {
 
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
+}
+
+fn is_local_image_destination(value: &str) -> bool {
+    !value.contains("://") && !value.starts_with("data:")
+}
+
+fn display_image_destination(value: &str) -> String {
+    if !is_local_image_destination(value) {
+        return value.to_owned();
+    }
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = char::from(bytes[index + 1]).to_digit(16);
+            let low = char::from(bytes[index + 2]).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_owned())
+}
+
+fn canonical_image_destination(value: &str) -> Result<String, ShellError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ShellError::Platform("image destination is empty".into()));
+    }
+    if !is_local_image_destination(value) {
+        return Ok(value.to_owned());
+    }
+    let normalized = value.replace('\\', "/");
+    yu_editor::local_image_uri(&normalized)
+        .ok_or_else(|| ShellError::Platform("image destination is invalid".into()))
+}
+
+fn image_destination_for_path(document: &Path, path: &Path) -> Result<String, ShellError> {
+    let relative = document
+        .parent()
+        .and_then(|parent| path.strip_prefix(parent).ok())
+        .unwrap_or(path);
+    canonical_image_destination(relative.to_string_lossy().as_ref())
 }
 
 fn platform_error(error: WindowsError) -> ShellError {

@@ -184,6 +184,17 @@ impl ResourceHost {
         )
     }
 
+    pub fn intrinsic_dimensions(&mut self, source: TextRange) -> Option<ImageDimensions> {
+        let request = self
+            .image_occurrences
+            .iter()
+            .find(|request| request.source() == source)?
+            .clone();
+        self.images
+            .intrinsic_publication(&request)
+            .map(|publication| publication.dimensions())
+    }
+
     pub fn advance(&mut self, revision: Revision) -> bool {
         let mut changed = false;
         self.control.set_revision(revision.get());

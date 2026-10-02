@@ -61,6 +61,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     func makeTableMenu() -> NSMenu { textView.makeTableMenu() }
     @objc fileprivate func editImagePropertiesFromMenu(_ sender: NSMenuItem?) { textView.editImagePropertiesFromMenu(sender) }
     private let surfaceHostView = MacosSurfaceHostView()
+    private let imageInteractionOverlay = ImageInteractionOverlay()
+    private var imageInteractionState: NativeImageInteractionState?
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
     private let statusDetailLabel = NSTextField(labelWithString: "")
@@ -119,6 +121,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         surfaceCoordinator.onSurfaceStateChange = { [weak self] in
             self?.textView.refreshTableResizeAccessibility()
             self?.syncSourceGlyphVisibility()
+            DispatchQueue.main.async { [weak self] in self?.textView.refreshSelectedImageInteraction() }
         }
         surfaceCoordinator.onPresentationStorageError = { [weak self] error in
             self?.show(error)
@@ -225,14 +228,41 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         surfaceHostView.translatesAutoresizingMaskIntoConstraints = true
         surfaceHostView.autoresizingMask = []
         surfaceHostView.setAccessibilityElement(false)
+        imageInteractionOverlay.translatesAutoresizingMaskIntoConstraints = true
+        imageInteractionOverlay.autoresizingMask = []
+        imageInteractionOverlay.setAccessibilityElement(false)
         documentScrollView = scrollView
 
         do { try bridge.setFocusMode(NativeWritingPreferences.shared.focusMode) } catch { show(error) }
         textView.onImageImport = { [weak self] inputs, target in try self?.importImages(inputs, at: target) ?? false }
+        textView.onImageInteractionChange = { [weak self] state in
+            guard let self else { return }
+            self.imageInteractionState = state
+            self.syncImageInteractionOverlay()
+        }
+        textView.onImageReplaceRequest = { [weak self] properties in
+            self?.replaceImage(properties)
+        }
+        imageInteractionOverlay.onCommit = { [weak self] alternative, destination in
+            self?.textView.updateSelectedImageFields(alternative: alternative, displayedDestination: destination)
+        }
+        imageInteractionOverlay.onReplace = { [weak self] in
+            self?.textView.requestReplaceSelectedImage()
+        }
+        imageInteractionOverlay.onScale = { [weak self] preset in
+            self?.textView.scaleSelectedImage(preset)
+        }
+        imageInteractionOverlay.onMore = { [weak self] sourceView in
+            self?.textView.showSelectedImageContextMenu(relativeTo: sourceView)
+        }
         textView.isEditable = true
         textView.isSelectable = true
         textView.onSpellingChange = { [weak self] in self?.scheduleVisualSubmit() }
-        textView.onResourceChange = { [weak self] in self?.scheduleVisualSubmit() }
+        textView.onResourceChange = { [weak self] in
+            guard let self else { return }
+            self.scheduleVisualSubmit()
+            DispatchQueue.main.async { [weak self] in self?.textView.refreshSelectedImageInteraction() }
+        }
         textView.onDocumentChange = { [weak self] in
             guard let self else { return }
             self.view.window?.invalidateRestorableState()
@@ -350,6 +380,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
+            DispatchQueue.main.async { [weak self] in self?.textView.refreshSelectedImageInteraction() }
         }
         scrollView.contentView.postsBoundsChangedNotifications = true
         surfaceBoundsObserver = NotificationCenter.default.addObserver(
@@ -538,6 +569,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // remain owned by the input view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
         root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitHost)
+        // Image selection chrome is the only native layer above the Rust
+        // surface. Its hitTest accepts the compact inspector card only; the
+        // rest of this viewport-sized overlay remains click-through.
+        root.addSubview(imageInteractionOverlay, positioned: .above, relativeTo: surfaceHostView)
         let chromeTop = splitHost.topAnchor.constraint(equalTo: root.topAnchor, constant: 0)
         chromeTopConstraint = chromeTop
         NSLayoutConstraint.activate([
@@ -753,6 +788,32 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
+        if imageInteractionOverlay.frame != viewportFrame {
+            imageInteractionOverlay.frame = viewportFrame
+        }
+        syncImageInteractionOverlay()
+    }
+
+    private func syncImageInteractionOverlay() {
+        guard let state = imageInteractionState,
+              state.revision == bridge.revision,
+              imageInteractionOverlay.bounds.width > 0,
+              imageInteractionOverlay.bounds.height > 0 else {
+            imageInteractionOverlay.dismiss()
+            return
+        }
+        // Rust image geometry is measured from the reading-content origin;
+        // DocumentTextView itself additionally owns the native column/top inset.
+        let documentRect = state.documentBounds.offsetBy(
+            dx: textView.contentOrigin.x,
+            dy: textView.contentOrigin.y
+        )
+        let viewportRect = textView.convert(documentRect, to: imageInteractionOverlay)
+        guard viewportRect.intersects(imageInteractionOverlay.bounds) else {
+            imageInteractionOverlay.dismiss()
+            return
+        }
+        imageInteractionOverlay.present(state, imageRect: viewportRect)
     }
 
     override func viewWillLayout() {
@@ -1056,6 +1117,42 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             }
         focusDocument()
         return true
+    }
+
+    private func replaceImage(_ properties: NativeImageProperties) {
+        let panel = NSOpenPanel()
+        panel.title = L10n.tr("Replace Image")
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try replaceImage(properties, with: url) }
+        catch { show(error) }
+    }
+
+    private func replaceImage(_ properties: NativeImageProperties, with url: URL) throws {
+        let inputs: [NativeImageResources.Input] = [.file(url)]
+        try NativeImageResources.validate(inputs)
+        try textView.finishCompositionForFileOperation()
+        if persistence.isUntitled, !saveDocument() { return }
+        let access = SandboxDocumentAccess.shared
+        try access.rememberSelection(url)
+        let copiesFiles = NativeWritingPreferences.shared.imagePolicy != .reference
+        if copiesFiles, try !access.ensureDirectoryAccess(
+            documentURL.deletingLastPathComponent(),
+            writing: true,
+            message: L10n.tr("Allow access to the document folder to save image files beside the Markdown document.")
+        ) { return }
+        try NativeImageResources.withImports(
+            inputs,
+            document: documentURL,
+            directory: NativeWritingPreferences.shared.imageDirectory,
+            reference: NativeWritingPreferences.shared.imagePolicy == .reference
+        ) { images in
+            guard let replacement = images.first else { return }
+            try textView.replaceImageResource(properties, withLocalPath: replacement.image.destination)
+        }
+        focusDocument()
     }
 
     @objc fileprivate func saveAsFromMenu(_ sender: Any?) {

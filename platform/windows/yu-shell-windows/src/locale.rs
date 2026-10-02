@@ -328,6 +328,231 @@ impl Strings {
     }
 
     #[must_use]
+    pub const fn image_properties(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Image Properties",
+            Locale::SimplifiedChinese => "图片属性",
+            Locale::TraditionalChinese => "圖片屬性",
+            Locale::Japanese => "画像のプロパティ",
+            Locale::Korean => "이미지 속성",
+        }
+    }
+
+    #[must_use]
+    pub const fn image_source(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Image Source",
+            Locale::SimplifiedChinese => "图片源码",
+            Locale::TraditionalChinese => "圖片原始碼",
+            Locale::Japanese => "画像ソース",
+            Locale::Korean => "이미지 소스",
+        }
+    }
+
+    #[must_use]
+    pub const fn replace_image(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Replace Image…",
+            Locale::SimplifiedChinese => "替换图片…",
+            Locale::TraditionalChinese => "替換圖片…",
+            Locale::Japanese => "画像を置き換え…",
+            Locale::Korean => "이미지 교체…",
+        }
+    }
+
+    #[must_use]
+    pub const fn image_size(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Image Size",
+            Locale::SimplifiedChinese => "图片大小",
+            Locale::TraditionalChinese => "圖片大小",
+            Locale::Japanese => "画像サイズ",
+            Locale::Korean => "이미지 크기",
+        }
+    }
+
+    #[must_use]
+    pub const fn more_image_actions(self) -> &'static str {
+        match self.locale {
+            Locale::English => "More Image Actions",
+            Locale::SimplifiedChinese => "更多图片操作",
+            Locale::TraditionalChinese => "更多圖片操作",
+            Locale::Japanese => "その他の画像操作",
+            Locale::Korean => "추가 이미지 작업",
+        }
+    }
+
+    #[must_use]
+    pub const fn original_size(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Original Size",
+            Locale::SimplifiedChinese => "原始大小",
+            Locale::TraditionalChinese => "原始大小",
+            Locale::Japanese => "元のサイズ",
+            Locale::Korean => "원본 크기",
+        }
+    }
+
+    #[must_use]
+    pub const fn fit_to_column(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Fit to Column",
+            Locale::SimplifiedChinese => "适应正文宽度",
+            Locale::TraditionalChinese => "適應正文寬度",
+            Locale::Japanese => "本文幅に合わせる",
+            Locale::Korean => "본문 너비에 맞춤",
+        }
+    }
+
+    #[must_use]
+    pub const fn open_image(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Open Image",
+            Locale::SimplifiedChinese => "打开图片",
+            Locale::TraditionalChinese => "開啟圖片",
+            Locale::Japanese => "画像を開く",
+            Locale::Korean => "이미지 열기",
+        }
+    }
+
+    #[must_use]
+    pub const fn show_in_explorer(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Show in File Explorer",
+            Locale::SimplifiedChinese => "在文件资源管理器中显示",
+            Locale::TraditionalChinese => "在檔案總管中顯示",
+            Locale::Japanese => "エクスプローラーで表示",
+            Locale::Korean => "파일 탐색기에서 보기",
+        }
+    }
+
+    #[must_use]
+    pub const fn copy_image(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Copy Image",
+            Locale::SimplifiedChinese => "复制图片",
+            Locale::TraditionalChinese => "複製圖片",
+            Locale::Japanese => "画像をコピー",
+            Locale::Korean => "이미지 복사",
+        }
+    }
+
+    #[must_use]
+    pub const fn copy_image_address(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Copy Image Address",
+            Locale::SimplifiedChinese => "复制图片地址",
+            Locale::TraditionalChinese => "複製圖片位址",
+            Locale::Japanese => "画像アドレスをコピー",
+            Locale::Korean => "이미지 주소 복사",
+        }
+    }
+
+    #[must_use]
+    pub const fn edit_markdown_source(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Edit Markdown Source",
+            Locale::SimplifiedChinese => "编辑 Markdown 源码",
+            Locale::TraditionalChinese => "編輯 Markdown 原始碼",
+            Locale::Japanese => "Markdownソースを編集",
+            Locale::Korean => "Markdown 소스 편집",
+        }
+    }
+
+    #[must_use]
+    pub const fn image_address(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Image Address",
+            Locale::SimplifiedChinese => "图片地址",
+            Locale::TraditionalChinese => "圖片位址",
+            Locale::Japanese => "画像のアドレス",
+            Locale::Korean => "이미지 주소",
+        }
+    }
+
+    #[must_use]
+    pub const fn alternative_text(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Alternative Text",
+            Locale::SimplifiedChinese => "替代文字",
+            Locale::TraditionalChinese => "替代文字",
+            Locale::Japanese => "代替テキスト",
+            Locale::Korean => "대체 텍스트",
+        }
+    }
+
+    #[must_use]
+    pub const fn width(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Width",
+            Locale::SimplifiedChinese => "宽度",
+            Locale::TraditionalChinese => "寬度",
+            Locale::Japanese => "幅",
+            Locale::Korean => "너비",
+        }
+    }
+
+    #[must_use]
+    pub const fn height(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Height",
+            Locale::SimplifiedChinese => "高度",
+            Locale::TraditionalChinese => "高度",
+            Locale::Japanese => "高さ",
+            Locale::Korean => "높이",
+        }
+    }
+
+    #[must_use]
+    pub const fn lock_aspect_ratio(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Lock Aspect Ratio",
+            Locale::SimplifiedChinese => "锁定纵横比",
+            Locale::TraditionalChinese => "鎖定長寬比",
+            Locale::Japanese => "アスペクト比を固定",
+            Locale::Korean => "가로세로 비율 고정",
+        }
+    }
+
+    #[must_use]
+    pub const fn apply(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Apply",
+            Locale::SimplifiedChinese => "应用",
+            Locale::TraditionalChinese => "套用",
+            Locale::Japanese => "適用",
+            Locale::Korean => "적용",
+        }
+    }
+
+    #[must_use]
+    pub const fn cancel(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Cancel",
+            Locale::SimplifiedChinese | Locale::TraditionalChinese => "取消",
+            Locale::Japanese => "キャンセル",
+            Locale::Korean => "취소",
+        }
+    }
+
+    #[must_use]
+    pub const fn invalid_image_properties(self) -> &'static str {
+        match self.locale {
+            Locale::English => {
+                "Enter an image address. Width and height must be whole numbers from 1 to 100000, or left blank."
+            }
+            Locale::SimplifiedChinese => "请填写图片地址；宽度和高度须为 1–100000 的整数或留空。",
+            Locale::TraditionalChinese => "請填寫圖片位址；寬度與高度須為 1–100000 的整數或留白。",
+            Locale::Japanese => {
+                "画像のアドレスを入力してください。幅と高さは 1～100000 の整数にするか、空欄にしてください。"
+            }
+            Locale::Korean => {
+                "이미지 주소를 입력하십시오. 너비와 높이는 1–100000 사이의 정수이거나 비워 두어야 합니다."
+            }
+        }
+    }
+
+    #[must_use]
     pub const fn save_changes_question(self) -> &'static str {
         match self.locale {
             Locale::English => "Save changes before closing?",
@@ -416,6 +641,10 @@ mod tests {
             assert!(strings.save().contains("Ctrl+S"));
             assert!(!strings.editor_surface_pending().is_empty());
             assert!(!strings.save_changes_question().is_empty());
+            assert!(!strings.image_properties().is_empty());
+            assert!(!strings.replace_image().is_empty());
+            assert!(!strings.image_size().is_empty());
+            assert!(!strings.edit_markdown_source().is_empty());
         }
     }
 }

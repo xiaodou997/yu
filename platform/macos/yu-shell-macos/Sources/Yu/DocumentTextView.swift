@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 import QuartzCore
 import YuStorageFFI
@@ -23,6 +24,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     private lazy var spellingService = NativeSpellingService()
     private lazy var spellingCoordinator = NativeSpellingCoordinator(bridge: bridge) { [weak self] in self?.onSpellingChange?() }
     private var imagePropertiesPanel: ImagePropertiesPanel?
+    private var selectedImageSource: Int?
+    private var selectedImageDocumentBounds: NSRect?
     private var nativeSelection = NSRange(location: 0, length: 0)
     private var discardingComposition = false
     private(set) var selectedRanges: [NSValue] = []
@@ -55,6 +58,13 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         if event.keyCode == 53, bridge.composition.active {
             cancelInputComposition(cancelEvent: event)
             return
+        }
+        if event.keyCode == 53, selectedImageSource != nil {
+            dismissImageInteraction()
+            return
+        }
+        if selectedImageSource != nil {
+            dismissImageInteraction()
         }
         if routeListShortcut(event) || routeHistoryShortcut(event, entry: .keyDown) { return }
         let handled = inputContext?.handleEvent(event) == true
@@ -113,6 +123,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
     var onImageImport: (([NativeImageResources.Input], NativeSelectionEndpoints?) throws -> Bool)?
+    var onImageInteractionChange: ((NativeImageInteractionState?) -> Void)?
+    var onImageReplaceRequest: ((NativeImageProperties) -> Void)?
     var onSpellingChange: (() -> Void)?
     var onResourceChange: (() -> Void)?
     var onDocumentChange: (() -> Void)?
@@ -254,7 +266,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     /// visual 长度做上界校验——那等于用第二套布局系统验证第一套，
     /// 而第二套布局系统本身就是要消除的对象（不变量 I5、E1）。
     /// Rust 返回的 visualUTF16 已绑定同一 Revision，越界由 Rust 侧拒绝。
-    private func shapedVisualHit(at point: NSPoint) -> (offset: Int, source: Int, affinity: UInt8, image: NSRange?, content: NSRange?, target: NSRange?)? {
+    private func shapedVisualHit(at point: NSPoint) -> (offset: Int, source: Int, affinity: UInt8, image: NSRange?, imageBounds: NSRect?, content: NSRange?, target: NSRange?)? {
         guard point.x.isFinite,
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
@@ -272,7 +284,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
               visualOffset >= 0 else {
             return nil
         }
-        return (visualOffset, sourceOffset, hit.affinity, hit.imageSourceRange, hit.contentSourceRange, hit.navigationTarget)
+        return (visualOffset, sourceOffset, hit.affinity, hit.imageSourceRange, hit.imageBounds, hit.contentSourceRange, hit.navigationTarget)
     }
 
     @discardableResult
@@ -745,6 +757,28 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) {
             return canEditImage(at: (menuItem.representedObject as? NSNumber)?.intValue)
         }
+        if menuItem.action == #selector(replaceImageFromMenu(_:))
+            || menuItem.action == #selector(editImageSourceFromMenu(_:)) {
+            return canEditImage(at: (menuItem.representedObject as? NSNumber)?.intValue)
+        }
+        if menuItem.action == #selector(scaleImageFromMenu(_:)) {
+            guard canEditImage(at: (menuItem.representedObject as? NSNumber)?.intValue),
+                  let source = (menuItem.representedObject as? NSNumber)?.intValue,
+                  let properties = try? bridge.imageProperties(at: source) else { return false }
+            return menuItem.tag < 0 || localImageIntrinsicSize(properties) != nil
+        }
+        if menuItem.action == #selector(openImageFromMenu(_:))
+            || menuItem.action == #selector(revealImageFromMenu(_:))
+            || menuItem.action == #selector(copyImageFromMenu(_:)) {
+            guard let source = (menuItem.representedObject as? NSNumber)?.intValue,
+                  let properties = try? bridge.imageProperties(at: source),
+                  let url = localImageURL(for: properties) else { return false }
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+        if menuItem.action == #selector(copyImageAddressFromMenu(_:)) {
+            guard let source = (menuItem.representedObject as? NSNumber)?.intValue else { return false }
+            return (try? bridge.imageProperties(at: source)) != nil
+        }
         if menuItem.action == #selector(retryImageFromMenu(_:)) {
             guard isEditable, !bridge.composition.active,
                   let properties = menuItem.representedObject as? NativeImageProperties else { return false }
@@ -771,6 +805,18 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         let imageSource = initialHit?.image?.location
         guard applyVisualPointerSelection(at: visualPoint(for: event), extending: false) else {
             return super.menu(for: event)
+        }
+        if let image = initialHit?.image, let bounds = initialHit?.imageBounds {
+            selectImageInteraction(sourceRange: image, bounds: bounds)
+        } else {
+            dismissImageInteraction()
+        }
+        if let imageSource {
+            let imageMenu = NSMenu()
+            for item in imageContextMenuItems(at: imageSource) {
+                imageMenu.addItem(item)
+            }
+            return imageMenu.items.contains(where: { validateMenuItem($0) }) ? imageMenu : super.menu(for: event)
         }
         let tableMenu = makeTableMenu()
         // Keep disabled boundary actions while editing a table, but do not
@@ -818,13 +864,6 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
             item.target = self
             item.representedObject = NSNumber(value: diagnosticSource)
             menu.insertItem(item, at: 0)
-        }
-        if let imageSource, canEditImage(at: imageSource) {
-            let item = NSMenuItem(title: L10n.tr("Image Properties…"), action: #selector(editImagePropertiesFromMenu(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = NSNumber(value: imageSource)
-            menu.insertItem(item, at: 0)
-            if let resourceItem = imageResourceMenuItem(at: imageSource) { menu.insertItem(resourceItem, at: 0) }
         }
         return menu.items.contains(where: { validateMenuItem($0) }) ? menu : super.menu(for: event)
     }
@@ -935,6 +974,106 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         }
     }
 
+    private func displayedImageDestination(_ value: String) -> String {
+        Self.isLocalImageDestination(value) ? (value.removingPercentEncoding ?? value) : value
+    }
+
+    private static func isLocalImageDestination(_ value: String) -> Bool {
+        !value.contains("://") && !value.hasPrefix("data:")
+    }
+
+    private func localImageURL(for properties: NativeImageProperties) -> URL? {
+        guard Self.isLocalImageDestination(properties.destination) else { return nil }
+        let path = displayedImageDestination(properties.destination)
+        let url = path.hasPrefix("/") ? URL(fileURLWithPath: path)
+            : URL(fileURLWithPath: bridge.path).deletingLastPathComponent().appendingPathComponent(path)
+        return url.standardizedFileURL
+    }
+
+    private func localImageIntrinsicSize(_ properties: NativeImageProperties) -> NSSize? {
+        guard let url = localImageURL(for: properties),
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let values = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = values[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = values[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.doubleValue > 0, height.doubleValue > 0 else { return nil }
+        return NSSize(width: width.doubleValue, height: height.doubleValue)
+    }
+
+    private func imageInteractionState(sourceRange: NSRange, bounds: NSRect) -> NativeImageInteractionState? {
+        guard sourceRange.location >= 0, sourceRange.length > 0,
+              NSMaxRange(sourceRange) <= (canonicalSource as NSString).length,
+              let properties = try? bridge.imageProperties(at: sourceRange.location) else { return nil }
+        let range = NSRange(location: Int(properties.identity.start_utf16),
+            length: Int(properties.identity.end_utf16 - properties.identity.start_utf16))
+        guard range.location >= 0, range.length > 0,
+              NSMaxRange(range) <= (canonicalSource as NSString).length else { return nil }
+        return NativeImageInteractionState(
+            revision: bridge.revision,
+            sourceRange: range,
+            documentBounds: bounds,
+            sourceText: (canonicalSource as NSString).substring(with: range),
+            properties: properties,
+            displayedDestination: displayedImageDestination(properties.destination),
+            hasIntrinsicSize: localImageIntrinsicSize(properties) != nil
+        )
+    }
+
+    private func selectImageInteraction(sourceRange: NSRange, bounds: NSRect) {
+        guard let state = imageInteractionState(sourceRange: sourceRange, bounds: bounds) else {
+            dismissImageInteraction()
+            return
+        }
+        selectedImageSource = state.sourceRange.location
+        selectedImageDocumentBounds = bounds
+        onImageInteractionChange?(state)
+    }
+
+    func dismissImageInteraction() {
+        guard selectedImageSource != nil || selectedImageDocumentBounds != nil else { return }
+        selectedImageSource = nil
+        selectedImageDocumentBounds = nil
+        onImageInteractionChange?(nil)
+    }
+
+    func refreshSelectedImageInteraction() {
+        guard let source = selectedImageSource,
+              let properties = try? bridge.imageProperties(at: source) else {
+            dismissImageInteraction()
+            return
+        }
+        let range = NSRange(location: Int(properties.identity.start_utf16),
+            length: Int(properties.identity.end_utf16 - properties.identity.start_utf16))
+        var nextBounds = selectedImageDocumentBounds
+        if let (size, width) = visualLayoutMetrics(),
+           let caret = try? bridge.sourceCaret(revision: bridge.revision,
+               sourceUTF16: UInt64(range.location), affinity: UInt8(YU_STORAGE_CARET_AFFINITY_DOWNSTREAM),
+               size: size, maxWidth: width),
+           let hit = shapedVisualHit(at: NSPoint(x: caret.point.x + 1, y: caret.point.y + 1)),
+           hit.image?.location == range.location,
+           let bounds = hit.imageBounds {
+            nextBounds = bounds
+        }
+        guard let bounds = nextBounds,
+              let state = imageInteractionState(sourceRange: range, bounds: bounds) else {
+            dismissImageInteraction()
+            return
+        }
+        selectedImageSource = state.sourceRange.location
+        selectedImageDocumentBounds = bounds
+        onImageInteractionChange?(state)
+    }
+
+    private func applyImagePropertyUpdate(_ properties: NativeImageProperties, source: Int) throws {
+        apply(try bridge.updateImageProperties(properties))
+        synchronizeProjection()
+        postAccessibilityRefresh()
+        onDocumentChange?()
+        onCaretChange?()
+        selectedImageSource = source
+        refreshSelectedImageInteraction()
+    }
+
     func imageResourceMenuItem(at source: Int) -> NSMenuItem? {
         guard let properties = try? bridge.imageProperties(at: source),
               let status = try? bridge.imageResourceStatus(properties) else { return nil }
@@ -955,6 +1094,184 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         do {
             try bridge.retryImage(properties)
             onResourceChange?()
+        } catch { onError?(error) }
+    }
+
+    private func imageMenuItem(_ title: String, action: Selector, source: Int) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = NSNumber(value: source)
+        return item
+    }
+
+    private func imageSizeMenu(at source: Int, properties: NativeImageProperties) -> NSMenu {
+        let menu = NSMenu(title: L10n.tr("Image Size"))
+        let hasIntrinsic = localImageIntrinsicSize(properties) != nil
+        for percent in [25, 33, 50, 67, 80, 100, 150, 200] {
+            let item = imageMenuItem("\(percent)%", action: #selector(scaleImageFromMenu(_:)), source: source)
+            item.tag = percent
+            item.isEnabled = hasIntrinsic
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let original = imageMenuItem(L10n.tr("Original Size"), action: #selector(scaleImageFromMenu(_:)), source: source)
+        original.tag = -1
+        menu.addItem(original)
+        let fit = imageMenuItem(L10n.tr("Fit to Column"), action: #selector(scaleImageFromMenu(_:)), source: source)
+        fit.tag = -2
+        menu.addItem(fit)
+        return menu
+    }
+
+    func imageContextMenuItems(at source: Int) -> [NSMenuItem] {
+        guard let properties = try? bridge.imageProperties(at: source) else { return [] }
+        var items: [NSMenuItem] = []
+        items.append(imageMenuItem(L10n.tr("Replace Image…"), action: #selector(replaceImageFromMenu(_:)), source: source))
+        if let local = localImageURL(for: properties), FileManager.default.fileExists(atPath: local.path) {
+            items.append(imageMenuItem(L10n.tr("Open Image"), action: #selector(openImageFromMenu(_:)), source: source))
+            items.append(imageMenuItem(L10n.tr("Show in Finder"), action: #selector(revealImageFromMenu(_:)), source: source))
+            items.append(imageMenuItem(L10n.tr("Copy Image"), action: #selector(copyImageFromMenu(_:)), source: source))
+        }
+        items.append(imageMenuItem(L10n.tr("Copy Image Address"), action: #selector(copyImageAddressFromMenu(_:)), source: source))
+        items.append(.separator())
+        let size = NSMenuItem(title: L10n.tr("Image Size"), action: nil, keyEquivalent: "")
+        size.submenu = imageSizeMenu(at: source, properties: properties)
+        items.append(size)
+        items.append(.separator())
+        items.append(imageMenuItem(L10n.tr("Image Properties…"), action: #selector(editImagePropertiesFromMenu(_:)), source: source))
+        items.append(imageMenuItem(L10n.tr("Edit Markdown Source"), action: #selector(editImageSourceFromMenu(_:)), source: source))
+        if let resource = imageResourceMenuItem(at: source) {
+            items.insert(resource, at: 0)
+        }
+        return items
+    }
+
+    func showSelectedImageContextMenu(relativeTo view: NSView) {
+        guard let source = selectedImageSource else { return }
+        window?.makeFirstResponder(self)
+        let menu = NSMenu()
+        for item in imageContextMenuItems(at: source) {
+            menu.addItem(item)
+        }
+        guard !menu.items.isEmpty else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.height + 2), in: view)
+    }
+
+    func updateSelectedImageFields(alternative: String, displayedDestination: String) {
+        guard let source = selectedImageSource,
+              var properties = try? bridge.imageProperties(at: source),
+              !displayedDestination.isEmpty else { return }
+        properties.alternative = alternative
+        do {
+            if displayedDestination != self.displayedImageDestination(properties.destination) {
+                properties.destination = Self.isLocalImageDestination(displayedDestination)
+                    ? try StorageBridge.imageURI(forLocalPath: displayedDestination)
+                    : displayedDestination
+            }
+            try applyImagePropertyUpdate(properties, source: source)
+        } catch { onError?(error) }
+    }
+
+    func requestReplaceSelectedImage() {
+        guard let source = selectedImageSource,
+              let properties = try? bridge.imageProperties(at: source) else { return }
+        onImageReplaceRequest?(properties)
+    }
+
+    func replaceImageResource(_ properties: NativeImageProperties, withLocalPath path: String) throws {
+        var updated = properties
+        updated.destination = try StorageBridge.imageURI(forLocalPath: path)
+        try applyImagePropertyUpdate(updated, source: Int(properties.identity.start_utf16))
+    }
+
+    func scaleSelectedImage(_ preset: NativeImageScalePreset) {
+        guard let source = selectedImageSource else { return }
+        applyImageScale(preset, at: source)
+    }
+
+    private func applyImageScale(_ preset: NativeImageScalePreset, at source: Int) {
+        guard var properties = try? bridge.imageProperties(at: source) else { return }
+        switch preset {
+        case .original:
+            properties.identity.width = 0
+            properties.identity.height = 0
+        case .fitColumn:
+            guard let (_, width) = visualLayoutMetrics() else { return }
+            let theme = NativeTheme.spec()
+            let zoom = max((font?.pointSize ?? CGFloat(theme.body_size)) / CGFloat(theme.body_size), 0.01)
+            let logical = (CGFloat(width) / zoom).rounded()
+            guard logical >= 1, logical <= 100_000 else { return }
+            properties.identity.width = UInt32(logical)
+            properties.identity.height = 0
+        case .percent(let percent):
+            guard percent > 0, let intrinsic = localImageIntrinsicSize(properties) else { return }
+            let factor = CGFloat(percent) / 100
+            let width = (intrinsic.width * factor).rounded()
+            let height = (intrinsic.height * factor).rounded()
+            guard width >= 1, height >= 1, width <= 100_000, height <= 100_000 else { return }
+            properties.identity.width = UInt32(width)
+            properties.identity.height = UInt32(height)
+        }
+        do { try applyImagePropertyUpdate(properties, source: source) }
+        catch { onError?(error) }
+    }
+
+    @objc private func replaceImageFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source) else { return }
+        onImageReplaceRequest?(properties)
+    }
+
+    @objc private func openImageFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source),
+              let url = localImageURL(for: properties) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func revealImageFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source),
+              let url = localImageURL(for: properties) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func copyImageFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source),
+              let url = localImageURL(for: properties),
+              let image = NSImage(contentsOf: url) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.writeObjects([image])
+    }
+
+    @objc private func copyImageAddressFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(displayedImageDestination(properties.destination), forType: .string)
+    }
+
+    @objc private func scaleImageFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue else { return }
+        switch sender.tag {
+        case -1: applyImageScale(.original, at: source)
+        case -2: applyImageScale(.fitColumn, at: source)
+        default: applyImageScale(.percent(sender.tag), at: source)
+        }
+    }
+
+    @objc private func editImageSourceFromMenu(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let properties = try? bridge.imageProperties(at: source) else { return }
+        let range = NSRange(location: Int(properties.identity.start_utf16),
+            length: Int(properties.identity.end_utf16 - properties.identity.start_utf16))
+        do {
+            _ = try bridge.revealSourceRange(range)
+            dismissImageInteraction()
+            navigate(toSource: range)
         } catch { onError?(error) }
     }
 
@@ -1046,9 +1363,32 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         window?.makeFirstResponder(self)
         tableSelectionAnchor = nil
         pointerUnitAnchor = nil
+        let point = visualPoint(for: event)
+        let pointerHit = event.buttonNumber == 0 ? shapedVisualHit(at: point) : nil
+        if event.buttonNumber == 0, pointerHit?.image == nil {
+            dismissImageInteraction()
+        }
+        if event.buttonNumber == 0,
+           event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
+           let hit = pointerHit, let image = hit.image, let bounds = hit.imageBounds {
+            if event.clickCount >= 2 {
+                _ = applyVisualPointerSelection(at: point, extending: false)
+                selectImageInteraction(sourceRange: image, bounds: bounds)
+                let item = NSMenuItem()
+                item.representedObject = NSNumber(value: image.location)
+                editImagePropertiesFromMenu(item)
+                return
+            }
+            if event.clickCount == 1 {
+                _ = applyVisualPointerSelection(at: point, extending: false)
+                selectImageInteraction(sourceRange: image, bounds: bounds)
+                taskCheckboxPointerConsumed = false
+                return
+            }
+        }
         if event.buttonNumber == 0, event.clickCount == 1,
            event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
-           let hit = shapedVisualHit(at: visualPoint(for: event)),
+           let hit = pointerHit,
            let content = hit.content,
            let header = try? bridge.disclosureHeader(at: content.location, expectedRevision: bridge.revision),
            header.range.location == content.location {
@@ -1082,7 +1422,6 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         }
         taskCheckboxPointerConsumed = false
         if event.buttonNumber == 0 {
-            let point = visualPoint(for: event)
             let began = onTableResizeBegin?(point) == true
             if Self.traceNativeEvents {
                 let dividers = (tableResizeAccessibilityProvider?() ?? []).map { ["x": $0.rect.origin.x, "y": $0.rect.origin.y, "width": $0.rect.width, "height": $0.rect.height] }
@@ -1973,6 +2312,9 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     }
 
     private func apply(_ result: NativeCommandResult) {
+        if result.changed, selectedImageSource != nil {
+            dismissImageInteraction()
+        }
         switch result.sourceSync {
         case 0:
             break
