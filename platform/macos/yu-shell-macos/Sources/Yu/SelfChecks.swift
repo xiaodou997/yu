@@ -2910,6 +2910,24 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
         precondition(restored.alternative == "羽 <图>" && reopened.source == changed)
         let replacementURI = try StorageBridge.imageURI(forLocalPath: replacementName)
         precondition(restored.destination == replacementURI)
+        let interactionView = DocumentTextView(bridge: reopened)
+        interactionView.isEditable = true
+        let imageItems = interactionView.imageContextMenuItems(at: offset)
+        let imageTitles = Set(imageItems.map(\.title))
+        for title in [
+            L10n.tr("Replace Image…"), L10n.tr("Open Image"), L10n.tr("Show in Finder"),
+            L10n.tr("Copy Image"), L10n.tr("Copy Image Address"), L10n.tr("Image Size"),
+            L10n.tr("Image Properties…"), L10n.tr("Edit Markdown Source")
+        ] {
+            precondition(imageTitles.contains(title), "missing image context action: \(title)")
+        }
+        let sizeMenu = imageItems.first { $0.title == L10n.tr("Image Size") }?.submenu
+        let sizeTitles = Set(sizeMenu?.items.map(\.title) ?? [])
+        for title in ["25%", "33%", "50%", "67%", "80%", "100%", "150%", "200%",
+                      L10n.tr("Original Size"), L10n.tr("Fit to Column")] {
+            precondition(sizeTitles.contains(title), "missing image size action: \(title)")
+        }
+        precondition(sizeMenu?.item(withTitle: "50%")?.isEnabled == true)
         let saved = try Data(contentsOf: document)
         precondition(saved == Data([0xef, 0xbb, 0xbf]) + Data(changed.utf8))
         let cancelled = ImagePropertiesPanel(properties: restored, document: document,
@@ -2959,7 +2977,7 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
         let retrySaved = try Data(contentsOf: retryDocument)
         precondition(retrySaved == retryBytes)
         try FileManager.default.removeItem(at: root)
-        print("Yu image properties self-check: native controls, ratio, invalid dimensions, revision-bound FFI, undo/redo, BOM/CRLF save/reopen and failed-image menu target/action retry passed; real sheet/right-click events require window acceptance")
+        print("Yu image properties self-check: native controls, ratio, image action/size menus, revision-bound FFI, undo/redo, BOM/CRLF save/reopen and failed-image retry passed; real sheet/right-click events require window acceptance")
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu image properties self-check failed: \(error)\n", stderr)

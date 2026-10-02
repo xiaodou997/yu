@@ -20,6 +20,8 @@ mod chrome;
 #[cfg(target_os = "windows")]
 mod contrast;
 #[cfg(target_os = "windows")]
+mod image_interaction;
+#[cfg(target_os = "windows")]
 mod native;
 #[cfg(target_os = "windows")]
 mod resources;

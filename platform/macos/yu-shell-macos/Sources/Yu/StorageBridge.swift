@@ -189,6 +189,7 @@ struct NativeProjectionHit {
     let visualUTF16: UInt64
     let roundTripSourceUTF16: UInt64
     let imageSourceRange: NSRange?
+    let imageBounds: CGRect?
     let contentSourceRange: NSRange?
     let navigationTarget: NSRange?
     let line: UInt64
@@ -203,11 +204,17 @@ struct NativeProjectionHit {
         if value.image_source_start_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE
             || value.image_source_end_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE {
             imageSourceRange = nil
+            imageBounds = nil
         } else {
             imageSourceRange = NSRange(
                 location: Int(value.image_source_start_utf16),
                 length: Int(value.image_source_end_utf16 - value.image_source_start_utf16)
             )
+            let bounds = CGRect(x: CGFloat(value.image_x), y: CGFloat(value.image_y),
+                width: CGFloat(value.image_width), height: CGFloat(value.image_height))
+            imageBounds = bounds.origin.x.isFinite && bounds.origin.y.isFinite
+                && bounds.width.isFinite && bounds.height.isFinite
+                && bounds.width > 0 && bounds.height > 0 ? bounds : nil
         }
         if value.content_source_start_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE
             || value.content_source_end_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE {

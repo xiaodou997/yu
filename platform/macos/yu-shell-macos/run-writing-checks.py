@@ -680,12 +680,25 @@ def main():
             key(125); key(36); time.sleep(1)
             expect_source(missing_source,'image retry does not edit source')
             run('capture',str(out/'image-restored'))
+            run('click',x,y); time.sleep(.25)
+            inspector = controls()
+            assert any(c.get('AXIdentifier')=='yu-image-inline-alternative' for c in inspector), 'Single-click image inspector did not expose Alt text'
+            assert any(c.get('AXIdentifier')=='yu-image-inline-destination' for c in inspector), 'Single-click image inspector did not expose image address'
+            run('capture',str(out/'image-restored-selected'))
+            key(53)
+            run('double-click',x,y); time.sleep(.5)
+            sheet = controls()
+            assert any(c.get('AXIdentifier')=='yu-image-width' for c in sheet), 'Double-click image did not open Properties'
+            click(next(c for c in sheet if c.get('AXTitle')=='取消' and c.get('AXRole')=='AXButton'))
+            expect_source(missing_source,'image double-click properties cancel')
             # The failed-image retry item must disappear after success. The
-            # first enabled image action is then Properties, which opens the
-            # real native sheet. This is separate from screenshot inspection.
+            # restored image now has a dedicated menu: Replace/Open/Reveal/
+            # Copy/Address/Size, then Properties. Navigate to Properties with
+            # real menu key events rather than depending on AX menu children.
             run('right-click',x,y)
             run('capture',str(out/'image-restored-menu'))
-            key(125); key(36); time.sleep(.5)
+            for _ in range(7): key(125)
+            key(36); time.sleep(.5)
             sheet = controls()
             assert any(c.get('AXIdentifier')=='yu-image-width' for c in sheet), 'Recovered image did not expose its Properties sheet'
             run('capture',str(out/'image-restored-properties'))
@@ -698,7 +711,7 @@ def main():
             assert restored.read_bytes()==image.read_bytes()
             quit_app(); assert launch()['AXValue']==missing_source
             time.sleep(.5); run('capture',str(out/'image-restored-reopen'))
-            check('real failed-image right-click retry, restored Properties sheet, unchanged history/source and exact resource/save/reopen; screenshots require inspection')
+            check('real failed-image retry, single-click inspector, double-click/context Properties, unchanged history/source and exact resource/save/reopen; screenshots require inspection')
             quit_app(); result['passed']=True
             return 0
         if args.table_only:
