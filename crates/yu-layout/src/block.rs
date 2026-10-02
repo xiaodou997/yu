@@ -449,6 +449,7 @@ pub struct LayoutInput<'a> {
     runs: &'a [StyledRun],
     widgets: &'a [WidgetSpan],
     lines: &'a [LineSpan],
+    paragraph_end: bool,
 }
 
 impl<'a> LayoutInput<'a> {
@@ -459,6 +460,7 @@ impl<'a> LayoutInput<'a> {
             runs,
             widgets: &[],
             lines: &[],
+            paragraph_end: false,
         }
     }
 
@@ -480,6 +482,15 @@ impl<'a> LayoutInput<'a> {
     #[must_use]
     pub const fn with_line_styles(mut self, lines: &'a [LineSpan]) -> Self {
         self.lines = lines;
+        self
+    }
+
+    /// The final hard break terminates a paragraph rather than starting an
+    /// additional empty line. Source bytes and interior breaks are preserved.
+    /// Raw text layouts retain their trailing editing line by default.
+    #[must_use]
+    pub const fn with_paragraph_end(mut self) -> Self {
+        self.paragraph_end = true;
         self
     }
 
@@ -650,6 +661,8 @@ pub struct LineBox {
     /// 视觉坐标只有一套实现、空间进类型。
     bounds: LayoutRect,
     baseline: f32,
+    text_offset: f32,
+    text_height: f32,
     style: Option<LineStyleId>,
     clusters: Range<usize>,
     widgets: Range<usize>,
@@ -699,6 +712,17 @@ impl LineBox {
     #[must_use]
     pub const fn baseline(&self) -> f32 {
         self.baseline
+    }
+
+    /// Text ascent/descent band, excluding paragraph leading and tall objects.
+    #[must_use]
+    pub fn text_y(&self) -> f32 {
+        self.y() + self.text_offset
+    }
+
+    #[must_use]
+    pub const fn text_height(&self) -> f32 {
+        self.text_height
     }
 
     /// 这条行用的行级样式。`None` 表示没有行级装饰盖到行首。
@@ -1177,7 +1201,98 @@ impl BlockLayout {
             measured,
         )?;
         layout.substituted = substituted;
+        layout.apply_font_metrics(shaper)?;
         Ok(layout)
+    }
+
+    fn apply_font_metrics<S: ShapingProvider>(&mut self, shaper: &S) -> Result<(), LayoutError> {
+        let mut cache = std::collections::BTreeMap::new();
+        let mut inherited = None;
+        let mut y = 0.0;
+        for index in 0..self.lines.len() {
+            let start = self.glyphs.partition_point(|glyph| glyph.line < index);
+            let end = self.glyphs.partition_point(|glyph| glyph.line <= index);
+            let mut metrics: Option<(f32, f32)> = None;
+            for glyph in &self.glyphs[start..end] {
+                let key = (glyph.face.get(), glyph.size_scale.to_bits());
+                let value = if let Some(value) = cache.get(&key) {
+                    *value
+                } else {
+                    let value = shaper
+                        .font_metrics(glyph.face, glyph.size_scale)
+                        .map_err(|error| LayoutError::Shaping(error.to_string()))?;
+                    if value.is_some_and(|(ascent, descent)| {
+                        !ascent.is_finite()
+                            || !descent.is_finite()
+                            || ascent < 0.0
+                            || descent < 0.0
+                            || ascent + descent <= 0.0
+                    }) {
+                        return Err(LayoutError::Shaping("invalid font ascent/descent".into()));
+                    }
+                    cache.insert(key, value);
+                    value
+                };
+                if let Some((ascent, descent)) = value {
+                    let previous = metrics.unwrap_or((0.0, 0.0));
+                    let offset =
+                        glyph.origin.y() - self.lines[index].y() - self.lines[index].baseline;
+                    metrics = Some((
+                        previous.0.max(ascent - offset),
+                        previous.1.max(descent + offset),
+                    ));
+                }
+            }
+            let metrics = metrics.or(if start == end { inherited } else { None });
+            let strut = self
+                .start_line(index, self.lines[index].visual.start(), 0, 0)
+                .line_height;
+            let line = &mut self.lines[index];
+            let old_y = line.y();
+            let old_baseline = line.baseline;
+            if let Some((ascent, descent)) = metrics {
+                let leading = (strut - ascent - descent).max(0.0) / 2.0;
+                let mut baseline = leading + ascent;
+                let mut below = leading + descent;
+                for widget in &self.widgets[line.widgets.clone()] {
+                    baseline = baseline.max(widget.baseline);
+                    below = below.max(widget.bounds.height() - widget.baseline);
+                }
+                line.baseline = baseline;
+                line.text_offset = baseline - ascent;
+                line.text_height = ascent + descent;
+                line.bounds = LayoutRect::new(line.bounds.x(), y, line.width(), baseline + below)?;
+                inherited = Some((ascent, descent));
+            } else {
+                line.bounds = LayoutRect::new(line.bounds.x(), y, line.width(), line.height())?;
+            }
+            let delta = y - old_y + line.baseline - old_baseline;
+            for glyph in &mut self.glyphs[start..end] {
+                glyph.origin = LayoutPoint::new(glyph.origin.x(), glyph.origin.y() + delta);
+            }
+            for widget in &mut self.widgets[line.widgets.clone()] {
+                widget.bounds = LayoutRect::new(
+                    widget.bounds.x(),
+                    widget.bounds.y() + delta,
+                    widget.bounds.width(),
+                    widget.bounds.height(),
+                )?;
+            }
+            for fragment in &mut self.inline_boxes {
+                if fragment.range.start() < line.visual.end()
+                    && line.visual.start() < fragment.range.end()
+                {
+                    fragment.bounds = yu_core::Rect::new(
+                        fragment.bounds.x(),
+                        fragment.bounds.y() + delta,
+                        fragment.bounds.width(),
+                        fragment.bounds.height(),
+                    )?;
+                }
+            }
+            y += line.height();
+        }
+        Ok(())
     }
 
     fn build_native<T: StyleTable, W: WidgetMeasure, L: LineStyleTable>(
@@ -1299,6 +1414,8 @@ impl BlockLayout {
                 visual: line.range,
                 bounds: line.bounds,
                 baseline: line.baseline,
+                text_offset: 0.0,
+                text_height: line.bounds.height(),
                 style: result.line_attrs.first().map(|entry| entry.1),
                 clusters: cluster_start..result.clusters.len(),
                 widgets: widget_start..result.widgets.len(),
@@ -1449,9 +1566,9 @@ impl BlockLayout {
             return Err(LayoutError::WidgetNotAnchored);
         }
 
-        if layout.lines.is_empty() || !last_was_break {
+        if layout.lines.is_empty() || !last_was_break || cursor.has_content() {
             layout.push_line(&cursor, visual_len)?;
-        } else {
+        } else if !input.paragraph_end {
             let empty = cursor.visual_start;
             layout.push_line(
                 &LineCursor {
@@ -1724,7 +1841,7 @@ impl BlockLayout {
             return Ok(CaretBox {
                 visual,
                 line: line_index,
-                point: LayoutPoint::new(x, line.bounds.y()),
+                point: LayoutPoint::new(x, line.text_y()),
                 boundary_affinity: Some(affinity),
                 line_affinity: affinity,
             });
@@ -1740,7 +1857,7 @@ impl BlockLayout {
         Ok(CaretBox {
             visual,
             line: line_index,
-            point: LayoutPoint::new(x, line.bounds.y()),
+            point: LayoutPoint::new(x, line.text_y()),
             boundary_affinity: secondary.map(|_| affinity),
             line_affinity: affinity,
         })
@@ -1822,7 +1939,7 @@ impl BlockLayout {
         Ok(CaretBox {
             visual: position.visual,
             line: line_index,
-            point: LayoutPoint::new(position.x, line.bounds.y()),
+            point: LayoutPoint::new(position.x, line.text_y()),
             boundary_affinity: position.boundary_affinity,
             line_affinity: position.boundary_affinity.unwrap_or(line_affinity),
         })
@@ -2117,6 +2234,8 @@ impl BlockLayout {
             visual,
             bounds: LayoutRect::new(0.0, y, cursor.width, height)?,
             baseline,
+            text_offset: 0.0,
+            text_height: height,
             style: cursor.style,
             clusters: cursor.cluster_start..self.clusters.len(),
             widgets: widget_start..self.widgets.len(),
@@ -2198,8 +2317,36 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
             });
         }
     }
+    let mut measured = coalesce_crlf(input.text(), measured)?;
     apply_inline_insets(&mut measured, styles)?;
     Ok(measured)
+}
+
+// Native shaping can expose CR and LF as separate clusters or runs. Unicode
+// treats the adjacent pair as one hard break, even across source styles.
+fn coalesce_crlf(text: &str, measured: Vec<Measured>) -> Result<Vec<Measured>, LayoutError> {
+    if !text.contains("\r\n") {
+        return Ok(measured);
+    }
+    let mut breaks: Vec<Measured> = Vec::with_capacity(measured.len());
+    for cluster in measured {
+        if cluster.mandatory_break
+            && let Some(previous) = breaks.last_mut()
+            && previous.mandatory_break
+            && previous.visual.end() == cluster.visual.start()
+            && text
+                .get(previous.visual.start().get() as usize..previous.visual.end().get() as usize)
+                == Some("\r")
+            && text.get(cluster.visual.start().get() as usize..cluster.visual.end().get() as usize)
+                == Some("\n")
+        {
+            previous.visual = VisualRange::new(previous.visual.start(), cluster.visual.end())
+                .ok_or(LayoutError::OffsetOverflow)?;
+        } else {
+            breaks.push(cluster);
+        }
+    }
+    Ok(breaks)
 }
 
 /// 第一遍的 shaping 版本：把每个 run 交给 shaper，一个 source cluster 一个
@@ -2540,6 +2687,7 @@ fn measure_shaped<T: StyleTable, S: ShapingProvider>(
             }
         }
     }
+    let mut measured = coalesce_crlf(input.text(), measured)?;
     apply_inline_insets(&mut measured, styles)?;
     Ok((measured, substituted))
 }
@@ -2806,6 +2954,7 @@ mod tests {
     /// 一个 grapheme 一个字形，推进量固定；`ligate` 里的两个字节连成一个。
     struct TestShaper {
         advance: f32,
+        metrics: Option<(f32, f32)>,
         ligate: Option<&'static str>,
         /// 每个字形往上抬多少。用来验证 y 偏移进了 origin。
         rise: f32,
@@ -2817,6 +2966,7 @@ mod tests {
         const fn new(advance: f32) -> Self {
             Self {
                 advance,
+                metrics: None,
                 ligate: None,
                 rise: 0.0,
                 shift: 0.0,
@@ -2826,6 +2976,16 @@ mod tests {
 
     impl ShapingProvider for TestShaper {
         type Error = String;
+
+        fn font_metrics(
+            &self,
+            _face: FontFaceId,
+            scale: f32,
+        ) -> Result<Option<(f32, f32)>, String> {
+            Ok(self
+                .metrics
+                .map(|(ascent, descent)| (ascent * scale, descent * scale)))
+        }
 
         fn shape(
             &self,
@@ -2915,6 +3075,150 @@ mod tests {
             assert_eq!(glyph.face(), FontFaceId::from_raw(7));
             assert_eq!(glyph.size_scale(), 1.0);
         }
+    }
+
+    #[test]
+    fn crlf_is_one_break_even_when_native_clusters_or_style_runs_split_it() {
+        let text = "a\r\nb";
+        let runs = [
+            StyledRun::new(visual(0, 2), StyleId(0)),
+            StyledRun::new(visual(2, 4), StyleId(0)),
+        ];
+        let input = LayoutInput::new(text, &runs);
+        let config = LayoutConfig::new(200.0, 24.0);
+        let shaped = BlockLayout::build_shaped(
+            input,
+            config,
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &TestShaper::new(5.0),
+        )
+        .expect("split shaping runs");
+        let measured = BlockLayout::build(
+            input,
+            config,
+            &UniformStyleTable::default(),
+            &MonospaceMetrics::new(5.0),
+        )
+        .expect("split metric runs");
+        for layout in [shaped, measured] {
+            assert_eq!(layout.lines().len(), 2);
+            assert_eq!(layout.clusters().len(), 3);
+            assert_eq!(layout.clusters()[1].visual(), visual(1, 3));
+            assert!(layout.clusters()[1].is_line_break());
+            assert_eq!(
+                layout
+                    .caret(VisualOffset::new(3), CaretAffinity::Downstream)
+                    .expect("after CRLF")
+                    .line(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_end_keeps_source_breaks_without_a_phantom_trailing_line() {
+        for text in ["a\n\nb\n", "a\r\n\r\nb\r\n"] {
+            let runs = plain(text);
+            let build = |input| {
+                BlockLayout::build_shaped(
+                    input,
+                    LayoutConfig::new(200.0, 24.0),
+                    &UniformStyleTable::default(),
+                    &NoWidgets,
+                    &NoLineStyles,
+                    &TestShaper::new(5.0),
+                )
+                .expect("paragraph")
+            };
+            let raw = build(LayoutInput::new(text, &runs));
+            let paragraph = build(LayoutInput::new(text, &runs).with_paragraph_end());
+            assert_eq!(raw.lines().len(), 4, "raw text retains its editing line");
+            assert_eq!(
+                paragraph.lines().len(),
+                3,
+                "interior empty line is retained"
+            );
+            assert_eq!(paragraph.height(), 72.0);
+            assert_eq!(paragraph.clusters(), raw.clusters());
+            let end = VisualOffset::new(text.len() as u64);
+            assert_eq!(paragraph.lines().last().expect("last").visual().end(), end);
+            assert_eq!(
+                paragraph
+                    .caret(end, CaretAffinity::Downstream)
+                    .expect("caret")
+                    .line(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn font_metrics_exclude_leading_from_caret_and_keep_empty_line_spacing() {
+        let text = "ab\n\ncd";
+        let shaper = TestShaper {
+            metrics: Some((8.0, 2.0)),
+            ..TestShaper::new(5.0)
+        };
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(200.0, 24.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &shaper,
+        )
+        .expect("font metrics layout");
+        assert_eq!(layout.lines().len(), 3);
+        assert_eq!(
+            layout.height(),
+            72.0,
+            "paragraph leading remains in line spacing"
+        );
+        for (index, line) in layout.lines().iter().enumerate() {
+            assert_eq!(line.text_height(), 10.0);
+            assert_eq!(line.text_y(), index as f32 * 24.0 + 7.0);
+            let caret = layout
+                .caret(line.visual().start(), CaretAffinity::Downstream)
+                .expect("caret");
+            assert_eq!(caret.point().y(), line.text_y());
+            assert_eq!(
+                layout
+                    .hit(LayoutPoint::new(caret.point().x(), caret.point().y() + 5.0))
+                    .expect("hit")
+                    .point(),
+                caret.point()
+            );
+        }
+        for glyph in layout.glyphs() {
+            let line = &layout.lines()[glyph.line()];
+            assert_eq!(glyph.origin().y(), line.y() + 15.0);
+        }
+    }
+
+    #[test]
+    fn scaled_font_metrics_grow_the_text_band_without_using_the_paragraph_strut() {
+        let text = "Title";
+        let shaper = TestShaper {
+            metrics: Some((8.0, 2.0)),
+            ..TestShaper::new(5.0)
+        };
+        let attrs = TextAttrs::new(yu_core::TextStyle::Strong)
+            .with_size_scale(2.0)
+            .expect("scaled font");
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(200.0, 48.0),
+            &UniformStyleTable::new(attrs),
+            &NoWidgets,
+            &NoLineStyles,
+            &shaper,
+        )
+        .expect("title layout");
+        assert_eq!(layout.lines()[0].height(), 48.0);
+        assert_eq!(layout.lines()[0].text_height(), 20.0);
+        assert_eq!(layout.lines()[0].text_y(), 14.0);
     }
 
     /// 字形偏移必须进 origin。丢掉它不会 panic，只会让重音记号落在错的地方。

@@ -17,7 +17,6 @@ pub enum SidebarMode {
     #[default]
     Files,
     Outline,
-    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -197,6 +196,7 @@ pub struct ShellState {
     locale: Locale,
     appearance: Appearance,
     sidebar: SidebarMode,
+    search_visible: bool,
     metrics: WindowMetrics,
     document: DocumentSlot,
 }
@@ -208,6 +208,7 @@ impl ShellState {
             locale,
             appearance: Appearance::Light,
             sidebar: SidebarMode::Files,
+            search_visible: false,
             metrics: WindowMetrics::default(),
             document: DocumentSlot::new_untitled(),
         }
@@ -245,6 +246,15 @@ impl ShellState {
 
     pub fn set_sidebar(&mut self, sidebar: SidebarMode) {
         self.sidebar = sidebar;
+    }
+
+    #[must_use]
+    pub const fn search_visible(&self) -> bool {
+        self.search_visible
+    }
+
+    pub fn set_search_visible(&mut self, visible: bool) {
+        self.search_visible = visible;
     }
 
     pub fn toggle_sidebar(&mut self) {

@@ -719,6 +719,34 @@ impl DirectWriteShaper {
 impl ShapingProvider for DirectWriteShaper {
     type Error = ShapeError;
 
+    fn font_metrics(
+        &self,
+        face: FontFaceId,
+        scale: f32,
+    ) -> Result<Option<(f32, f32)>, Self::Error> {
+        let metrics = (|| -> Result<_, DirectWriteError> {
+            let entry = self
+                .faces
+                .with_entry(face, Clone::clone)?
+                .ok_or(DirectWriteError::UnknownFace(face))?;
+            let mut native = DWRITE_FONT_METRICS::default();
+            unsafe { entry.face.GetMetrics(&mut native) };
+            if native.designUnitsPerEm == 0 || !scale.is_finite() || scale <= 0.0 {
+                return Err(DirectWriteError::InvalidAnalysis(
+                    "invalid font metrics scale",
+                ));
+            }
+            let factor = self.request.size() * entry.size_factor * scale
+                / f32::from(native.designUnitsPerEm);
+            Ok((
+                f32::from(native.ascent) * factor,
+                f32::from(native.descent) * factor,
+            ))
+        })()
+        .map_err(|error| ShapeError::Backend(Arc::from(error.to_string())))?;
+        Ok(Some(metrics))
+    }
+
     fn shape(
         &self,
         text: &str,

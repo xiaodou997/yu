@@ -54,19 +54,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ACCEL, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
-    DestroyWindow, DispatchMessageW, EN_CHANGE, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
-    GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW, HACCEL, HMENU, HWND_TOP, IDC_ARROW,
-    IsDialogMessageW, KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR,
-    MB_ICONWARNING, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetMenu, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, FALT, FCONTROL, FSHIFT, FVIRTKEY,
+    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetSubMenu, GetWindowLongPtrW,
+    GetWindowRect, HACCEL, HMENU, HWND_TOP, IDC_ARROW, IsDialogMessageW, KillTimer, LBN_DBLCLK,
+    LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
+    TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+    WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
+    WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
@@ -87,7 +89,9 @@ use crate::accessibility::{
     WM_APP_UIA_ACTION,
 };
 use crate::chrome::{
-    Chrome, ID_FILES, ID_OUTLINE, ID_QUERY, ID_ROWS, ID_SEARCH, PanelAction, sidebar_width,
+    Chrome, ID_FILES, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY, ID_ROWS,
+    ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height,
+    search_height, sidebar_width,
 };
 use crate::resources::ResourceHost;
 use crate::text_input::{
@@ -110,6 +114,7 @@ const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
 const ID_FOCUS_NEXT: u16 = 1202;
 const ID_FOCUS_PREVIOUS: u16 = 1203;
+const ID_MENU_FOCUS: u16 = 2100;
 const WM_APP_RENDER: u32 = WM_APP + 1;
 const BODY_FONT_SIZE: f32 = 16.0;
 const DRAG_SCROLL_TIMER_ID: usize = 1;
@@ -428,6 +433,15 @@ impl RenderHost {
     }
 }
 
+struct Menu(HMENU);
+impl Drop for Menu {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyMenu(self.0);
+        }
+    }
+}
+
 pub(crate) struct AppWindow {
     editor_focused: bool,
     contrast: Option<yu_scene::ContrastPalette>,
@@ -436,6 +450,7 @@ pub(crate) struct AppWindow {
     surface: HWND,
     status: HWND,
     chrome: Option<Chrome>,
+    menu: Option<Menu>,
     state: ShellState,
     render: Option<RenderHost>,
     tsf: Option<TsfHost>,
@@ -457,6 +472,7 @@ impl AppWindow {
             surface: HWND::default(),
             status: HWND::default(),
             chrome: None,
+            menu: None,
             state,
             render: None,
             tsf: None,
@@ -1266,6 +1282,13 @@ impl AppWindow {
             return Ok(true);
         }
 
+        if key == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize
+            && self.state.search_visible()
+        {
+            self.handle_chrome_command(ID_SEARCH_CLOSE, 0)?;
+            return Ok(true);
+        }
+
         if key == VK_UP.0 as usize || key == VK_DOWN.0 as usize {
             let extend = modifiers.contains(KeyModifiers::SHIFT);
             return self.execute_vertical_input(key == VK_UP.0 as usize, extend);
@@ -1561,30 +1584,70 @@ impl AppWindow {
         Ok(())
     }
 
-    fn install_menu(&self) -> Result<(), ShellError> {
+    fn install_menu(&mut self) -> Result<(), ShellError> {
         let strings = self.state.strings();
         unsafe {
-            let root = CreateMenu().map_err(platform_error)?;
-            let file = CreatePopupMenu().map_err(platform_error)?;
-            append_string(file, ID_FILE_NEW, strings.new_document())?;
-            append_string(file, ID_FILE_OPEN, strings.open())?;
-            AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
-            append_string(file, ID_FILE_SAVE, strings.save())?;
-            append_string(file, ID_FILE_SAVE_AS, strings.save_as())?;
-            AppendMenuW(file, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
-            append_string(file, ID_FILE_EXIT, strings.exit())?;
-            append_popup(root, file, strings.file())?;
+            let root = Menu(CreateMenu().map_err(platform_error)?);
+            let file = Menu(CreatePopupMenu().map_err(platform_error)?);
+            append_string(file.0, ID_FILE_NEW, strings.new_document())?;
+            append_string(file.0, ID_FILE_OPEN, strings.open())?;
+            AppendMenuW(file.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
+            append_string(file.0, ID_FILE_SAVE, strings.save())?;
+            append_string(file.0, ID_FILE_SAVE_AS, strings.save_as())?;
+            AppendMenuW(file.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
+            append_string(file.0, ID_FILE_EXIT, strings.exit())?;
+            append_popup(root.0, file.0, strings.file())?;
+            std::mem::forget(file);
 
-            let edit = CreatePopupMenu().map_err(platform_error)?;
-            append_string(edit, ID_EDIT_UNDO, strings.undo())?;
-            append_string(edit, ID_EDIT_REDO, strings.redo())?;
-            append_popup(root, edit, strings.edit())?;
+            let edit = Menu(CreatePopupMenu().map_err(platform_error)?);
+            append_string(edit.0, ID_EDIT_UNDO, strings.undo())?;
+            append_string(edit.0, ID_EDIT_REDO, strings.redo())?;
+            AppendMenuW(edit.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
+            append_string(edit.0, ID_SEARCH, &format!("{}\tCtrl+F", strings.search()))?;
+            append_popup(root.0, edit.0, strings.edit())?;
+            std::mem::forget(edit);
 
-            let view = CreatePopupMenu().map_err(platform_error)?;
-            append_string(view, ID_VIEW_SIDEBAR, strings.toggle_sidebar())?;
-            append_popup(root, view, strings.view())?;
+            let view = Menu(CreatePopupMenu().map_err(platform_error)?);
+            append_string(view.0, ID_VIEW_SIDEBAR, strings.toggle_sidebar())?;
+            append_popup(root.0, view.0, strings.view())?;
+            std::mem::forget(view);
 
-            SetMenu(self.hwnd, root).map_err(platform_error)?;
+            self.menu = Some(root);
+        }
+        Ok(())
+    }
+
+    fn show_menu(&mut self, index: usize) -> Result<(), ShellError> {
+        let Some(root) = self.menu.as_ref() else {
+            return Ok(());
+        };
+        let Some(button) = self
+            .chrome
+            .as_ref()
+            .and_then(|chrome| chrome.menu_buttons.get(index))
+            .copied()
+        else {
+            return Ok(());
+        };
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(button, &mut rect) }.map_err(platform_error)?;
+        let popup = unsafe { GetSubMenu(root.0, index as i32) };
+        let command = unsafe {
+            TrackPopupMenuEx(
+                popup,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY).0,
+                rect.left,
+                rect.bottom,
+                self.hwnd,
+                None,
+            )
+        }
+        .0;
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
+        if command != 0 {
+            self.handle_command(command as u16)?;
         }
         Ok(())
     }
@@ -1658,7 +1721,12 @@ impl AppWindow {
             .min(metrics.px(spec.column_width))
             .max(1);
         let surface_x = sidebar_w + (available_w - surface_w) / 2;
-        let surface_y = metrics.px(spec.top).min((content_h - 1) / 4);
+        let find_h = search_height(metrics, self.state.search_visible());
+        let surface_y = menu_height(metrics)
+            + find_h
+            + metrics
+                .px(spec.top)
+                .min((content_h - find_h - 1).max(0) / 4);
         let bottom = metrics.px(16.0).min((content_h - 1) / 4);
         let surface_h = (content_h - surface_y - bottom).max(1);
 
@@ -1676,6 +1744,7 @@ impl AppWindow {
             && let Err(error) = chrome.layout(
                 self.state.metrics(),
                 self.state.sidebar(),
+                self.state.search_visible(),
                 self.state.appearance(),
             )
         {
@@ -1721,6 +1790,16 @@ impl AppWindow {
 
     fn handle_command(&mut self, command: u16) -> Result<(), ShellError> {
         match command {
+            ID_MENU_FOCUS => {
+                if let Some(chrome) = self.chrome.as_ref() {
+                    unsafe {
+                        let _ = SetFocus(chrome.menu_buttons[0]);
+                    }
+                }
+            }
+            ID_MENU_FILE | ID_MENU_EDIT | ID_MENU_VIEW => {
+                self.show_menu(usize::from(command - ID_MENU_FILE))?;
+            }
             ID_FOCUS_NEXT | ID_FOCUS_PREVIOUS => {
                 let mut targets = vec![self.surface];
                 if let Some(chrome) = self.chrome.as_ref() {
@@ -1823,27 +1902,40 @@ impl AppWindow {
 
     fn handle_chrome_command(&mut self, command: u16, notification: u16) -> Result<(), ShellError> {
         match command {
-            ID_FILES | ID_OUTLINE | ID_SEARCH => {
+            ID_FILES | ID_OUTLINE => {
                 self.state.set_sidebar(match command {
                     ID_FILES => SidebarMode::Files,
                     ID_OUTLINE => SidebarMode::Outline,
-                    _ => SidebarMode::Search,
+                    _ => SidebarMode::Outline,
                 });
                 self.update_layout();
                 self.render_current()?;
                 if let Some(tsf) = self.tsf.as_ref() {
                     tsf.notify_layout_change();
                 }
-                if command == ID_SEARCH
-                    && let Some(chrome) = self.chrome.as_ref()
-                {
+            }
+            ID_SEARCH | ID_SEARCH_CLOSE => {
+                self.state.set_search_visible(command == ID_SEARCH);
+                self.update_layout();
+                self.render_current()?;
+                if let Some(tsf) = self.tsf.as_ref() {
+                    tsf.notify_layout_change();
+                }
+                if let Some(chrome) = self.chrome.as_ref() {
                     unsafe {
-                        let _ = SetFocus(chrome.query);
+                        let _ = SetFocus(if command == ID_SEARCH {
+                            chrome.query
+                        } else {
+                            self.surface
+                        });
                     }
                 }
             }
             ID_QUERY if notification == EN_CHANGE as u16 => {
                 self.render_current()?;
+            }
+            ID_SEARCH_PREVIOUS | ID_SEARCH_NEXT => {
+                self.advance_search(command == ID_SEARCH_NEXT)?;
             }
             ID_ROWS
                 if (notification == LBN_SELCHANGE as u16 || notification == LBN_DBLCLK as u16)
@@ -1857,12 +1949,53 @@ impl AppWindow {
         Ok(())
     }
 
+    fn advance_search(&mut self, forward: bool) -> Result<(), ShellError> {
+        if !self.state.search_visible() {
+            return Ok(());
+        }
+        self.refresh_chrome();
+        let selection = self.state.document().session().selection().ordered_range();
+        let action = self
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .search()
+            .and_then(|search| {
+                let matches = search.matches();
+                if forward {
+                    matches
+                        .iter()
+                        .find(|hit| hit.start() > selection.start())
+                        .or_else(|| matches.first())
+                } else {
+                    matches
+                        .iter()
+                        .rev()
+                        .find(|hit| hit.start() < selection.start())
+                        .or_else(|| matches.last())
+                }
+                .copied()
+                .map(PanelAction::Select)
+            });
+        self.activate_panel_action(action, false)
+    }
+
     fn activate_panel_row(&mut self, focus_editor: bool) -> Result<(), ShellError> {
+        let action = self.chrome.as_ref().and_then(Chrome::selected_action);
+        self.activate_panel_action(action, focus_editor)
+    }
+
+    fn activate_panel_action(
+        &mut self,
+        action: Option<PanelAction>,
+        focus_editor: bool,
+    ) -> Result<(), ShellError> {
         // TSF owns active preedit. Navigation must not replace its canonical range.
         if self.state.document().session().composition().is_some() {
             return Ok(());
         }
-        let action = self.chrome.as_ref().and_then(Chrome::selected_action);
         let before = self.input_projection()?;
         let before_selection = self.state.document().session().selection();
         let mut document_changed = false;
@@ -2197,6 +2330,26 @@ fn create_accelerators() -> Result<HACCEL, ShellError> {
     let entries = [
         ACCEL {
             fVirt: FVIRTKEY,
+            key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F10.0,
+            cmd: ID_MENU_FOCUS,
+        },
+        ACCEL {
+            fVirt: FALT | FVIRTKEY,
+            key: b'F' as u16,
+            cmd: ID_MENU_FILE,
+        },
+        ACCEL {
+            fVirt: FALT | FVIRTKEY,
+            key: b'E' as u16,
+            cmd: ID_MENU_EDIT,
+        },
+        ACCEL {
+            fVirt: FALT | FVIRTKEY,
+            key: b'V' as u16,
+            cmd: ID_MENU_VIEW,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
             key: VK_F6.0,
             cmd: ID_FOCUS_NEXT,
         },
@@ -2263,6 +2416,35 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
             let app = unsafe { &mut *app_ptr };
             match message.message {
                 WM_KEYDOWN
+                    if app
+                        .chrome
+                        .as_ref()
+                        .is_some_and(|chrome| chrome.menu_buttons.contains(&message.hwnd))
+                        && [VK_LEFT.0, VK_RIGHT.0, VK_DOWN.0, VK_UP.0, VK_RETURN.0]
+                            .contains(&(message.wParam.0 as u16)) =>
+                {
+                    let buttons = app.chrome.as_ref().expect("menu buttons").menu_buttons;
+                    let index = buttons
+                        .iter()
+                        .position(|button| *button == message.hwnd)
+                        .expect("focused menu");
+                    if message.wParam.0 == VK_LEFT.0 as usize
+                        || message.wParam.0 == VK_RIGHT.0 as usize
+                    {
+                        let next = if message.wParam.0 == VK_RIGHT.0 as usize {
+                            (index + 1) % buttons.len()
+                        } else {
+                            (index + buttons.len() - 1) % buttons.len()
+                        };
+                        unsafe {
+                            let _ = SetFocus(buttons[next]);
+                        }
+                    } else if let Err(error) = app.show_menu(index) {
+                        show_error(hwnd, &app.state, &error);
+                    }
+                    true
+                }
+                WM_KEYDOWN
                     if app.chrome.as_ref().is_some_and(|chrome| {
                         message.hwnd == chrome.query || message.hwnd == chrome.list
                     }) && message.wParam.0 == VK_RETURN.0 as usize
@@ -2270,12 +2452,16 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                             message.hwnd == chrome.query && chrome.query_is_composing()
                         }) =>
                 {
-                    if let Some(chrome) = app.chrome.as_ref()
-                        && message.hwnd == chrome.query
-                    {
-                        chrome.select_first();
-                    }
-                    if let Err(error) = app.activate_panel_row(true) {
+                    let search = app
+                        .chrome
+                        .as_ref()
+                        .is_some_and(|chrome| message.hwnd == chrome.query);
+                    let result = if search {
+                        app.advance_search(unsafe { GetKeyState(VK_SHIFT.0 as i32) } >= 0)
+                    } else {
+                        app.activate_panel_row(true)
+                    };
+                    if let Err(error) = result {
                         show_error(hwnd, &app.state, &error);
                     }
                     true
@@ -2289,6 +2475,11 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                             message.hwnd == chrome.query && chrome.query_is_composing()
                         }) =>
                 {
+                    if app.state.search_visible()
+                        && let Err(error) = app.handle_chrome_command(ID_SEARCH_CLOSE, 0)
+                    {
+                        show_error(hwnd, &app.state, &error);
+                    }
                     unsafe {
                         let _ = SetFocus(app.surface);
                     }
@@ -2352,7 +2543,7 @@ unsafe extern "system" fn window_proc(
         match message {
             WM_COMMAND => {
                 let command = (wparam.0 & 0xffff) as u16;
-                let result = if lparam.0 != 0 && (ID_FILES..=ID_ROWS).contains(&command) {
+                let result = if lparam.0 != 0 && (ID_FILES..=ID_SEARCH_NEXT).contains(&command) {
                     app.handle_chrome_command(command, (wparam.0 >> 16) as u16)
                 } else {
                     app.handle_command(command)
@@ -2450,6 +2641,7 @@ unsafe extern "system" fn window_proc(
                 return LRESULT(0);
             }
             WM_DESTROY => {
+                app.menu.take();
                 if let Some(chrome) = app.chrome.as_ref() {
                     chrome.clear_accessibility_annotations();
                 }
@@ -2796,7 +2988,9 @@ fn viewport_render_config(
 fn editor_viewport_config(logical_width: f32, appearance: Appearance) -> ViewportConfig {
     let line_height = BODY_FONT_SIZE * appearance.theme_id().spec().body_line_ratio;
     ViewportConfig::new(
-        LayoutConfig::new(logical_width, line_height)
+        // Shared block styles apply their own line-height ratios. This input
+        // is the base font size, independent of physical monitor DPI.
+        LayoutConfig::new(logical_width, BODY_FONT_SIZE)
             .with_default_advance(BODY_FONT_SIZE * 0.5)
             .with_theme(appearance.theme_id()),
         line_height,
@@ -3349,6 +3543,73 @@ mod tests {
     }
 
     #[test]
+    fn native_paragraph_spacing_applies_theme_ratios_once_and_preserves_source() {
+        let _com = ComApartment::initialize().expect("COM");
+        let window = Window(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Yu paragraph spacing regression"),
+                WS_POPUP,
+                0,
+                0,
+                1200,
+                1000,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("hidden surface")
+        });
+        for appearance in [Appearance::YuLight, Appearance::YuDark] {
+            for newline in ["\n", "\r\n"] {
+                let source = ["# Title", "", "body line", "", "## Next", ""].join(newline);
+                let mut state = ShellState::new(Locale::English);
+                state.set_appearance(appearance);
+                state
+                    .document_mut()
+                    .session_mut()
+                    .execute(EditorCommand::insert_text(source.as_str()))
+                    .expect("source");
+                let revision = state.document().session().revision();
+                let mut render = RenderHost::new(window.0, appearance).expect("renderer");
+                render.render(&mut state).expect("Present");
+                let layout = render.layout.as_ref().expect("measured layout");
+                assert_eq!(layout.config().line_height(), BODY_FONT_SIZE);
+                let blocks: Vec<_> = layout
+                    .blocks()
+                    .iter()
+                    .filter(|block| block.metadata().kind() != yu_markdown::BlockKind::BlankLine)
+                    .collect();
+                assert_eq!(blocks.len(), 3);
+                for block in &blocks {
+                    assert_eq!(
+                        block.layout().lines().len(),
+                        1,
+                        "no paragraph tail line: {appearance:?} {newline:?} {:?} {:?}",
+                        block.metadata().kind(),
+                        block.layout().visual().text()
+                    );
+                }
+                let body_height = BODY_FONT_SIZE * appearance.theme_id().spec().body_line_ratio;
+                assert!((blocks[1].layout().height() - body_height).abs() < 0.01);
+                let heading_gap =
+                    blocks[1].content_y() - blocks[0].content_y() - blocks[0].layout().height();
+                assert!(
+                    (BODY_FONT_SIZE..=BODY_FONT_SIZE + 3.0).contains(&heading_gap),
+                    "heading gap {heading_gap}: {appearance:?} {newline:?}"
+                );
+                let body_gap =
+                    blocks[2].content_y() - blocks[1].content_y() - blocks[1].layout().height();
+                assert!((body_gap - BODY_FONT_SIZE).abs() < 0.01);
+                assert_eq!(state.document().session().revision(), revision);
+                assert_eq!(state.document().session().snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[test]
     fn native_render_uses_surface_width_and_readable_lines_after_resize() {
         let _com = ComApartment::initialize().expect("COM");
         let window = Window(unsafe {
@@ -3712,7 +3973,7 @@ mod tests {
         register_classes().expect("classes");
         let mut state = ShellState::new(Locale::English);
         let source = format!(
-            "# First\n\n{}\n\n## **目标**\n\n中文😀 result\n",
+            "# First\n\n{}\n\n## **目标**\n\n中文😀 result\n\n中文😀 second result\n",
             "filler paragraph\n\n".repeat(60)
         );
         state
@@ -3754,16 +4015,32 @@ mod tests {
             unsafe { SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0,
             2
         );
-        app.handle_chrome_command(ID_SEARCH, 0).expect("search tab");
+        app.handle_chrome_command(ID_SEARCH, 0).expect("find panel");
+        assert_eq!(
+            app.state.sidebar(),
+            SidebarMode::Outline,
+            "find must preserve the selected sidebar tab"
+        );
         let query = app.chrome.as_ref().expect("chrome").query;
         set_window_text(query, "中文😀");
         assert_eq!(
             unsafe { SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0,
-            1
+            2,
+            "outline remains available during search"
         );
-        app.chrome.as_ref().expect("chrome").select_first();
-        app.activate_panel_row(false)
-            .expect("jump to search result");
+        assert_eq!(
+            app.state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .matches()
+                .len(),
+            2
+        );
+        app.advance_search(true).expect("jump to search result");
         let range = app.state.document().session().selection().ordered_range();
         assert_eq!(
             range.start().get(),
@@ -3829,6 +4106,113 @@ mod tests {
             )
             .expect("caret point hit after inset");
         assert!(selection.range.contains(hit));
+        app.advance_search(true).expect("next match");
+        let second = app.state.document().session().selection().ordered_range();
+        assert_eq!(
+            second.start().get(),
+            source.rfind("中文😀").expect("second hit") as u64
+        );
+        app.advance_search(true).expect("wrap forward");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            range
+        );
+        app.advance_search(false).expect("wrap backward");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            second
+        );
+        app.advance_search(false).expect("previous match");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            range
+        );
+
+        app.handle_command(ID_VIEW_SIDEBAR)
+            .expect("hide sidebar while finding");
+        assert_eq!(app.state.sidebar(), SidebarMode::Hidden);
+        assert!(app.state.search_visible());
+        app.advance_search(true).expect("find with hidden sidebar");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            second
+        );
+        app.handle_chrome_command(ID_OUTLINE, 0)
+            .expect("restore outline while finding");
+        assert!(app.state.search_visible());
+        app.handle_chrome_command(ID_SEARCH_CLOSE, 0)
+            .expect("close find");
+        assert!(!app.state.search_visible());
+        assert_eq!(app.state.sidebar(), SidebarMode::Outline);
+        assert!(
+            app.state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .is_none(),
+            "closing find must remove highlights"
+        );
+        assert!(
+            app.input_screen_ext().expect("restored editor").top < view.top,
+            "closing find restores editor height"
+        );
+        assert_eq!(
+            unsafe { GetFocus() },
+            app.surface,
+            "Done returns focus to the editor"
+        );
+        app.handle_chrome_command(ID_SEARCH, 0)
+            .expect("reopen find");
+        set_window_text(query, "First");
+        app.advance_search(true).expect("heading match");
+        let render = app.render.as_ref().expect("render");
+        let heading = &render
+            .layout
+            .as_ref()
+            .expect("layout")
+            .blocks()
+            .first()
+            .expect("heading")
+            .layout()
+            .layout()
+            .lines()[0];
+        assert!(heading.text_height() <= heading.height());
+        assert!(heading.height() < BODY_FONT_SIZE * 3.0);
+        let frame = render.builder.last_publication().expect("frame").frame();
+        for role in [
+            EditorDecorationPrimitiveRole::Caret,
+            EditorDecorationPrimitiveRole::Selection,
+            EditorDecorationPrimitiveRole::SearchCurrent,
+        ] {
+            let bounds = frame
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .find_map(|primitive| match primitive {
+                    Primitive::EditorDecoration(decoration) if decoration.role() == role => {
+                        Some(decoration.bounds())
+                    }
+                    _ => None,
+                })
+                .expect("heading decoration");
+            assert!(
+                (bounds.height() - heading.text_height()).abs() < 0.01,
+                "{role:?} must exclude paragraph leading"
+            );
+        }
+        assert_eq!(
+            unsafe { GetFocus() },
+            query,
+            "Ctrl+F returns focus to the query"
+        );
+        app.handle_key_down(WPARAM(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as usize,
+        ))
+        .expect("Escape closes find");
+        assert!(!app.state.search_visible());
         assert_eq!(app.state.document().session().revision(), revision);
         assert_eq!(app.state.document().session().snapshot().as_str(), source);
         drop(window);

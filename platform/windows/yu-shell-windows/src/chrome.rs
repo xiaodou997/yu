@@ -31,7 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 use yu_core::{Revision, TextRange};
-use yu_editor::{OutlineTree, SearchResults};
+use yu_editor::OutlineTree;
 use yu_workspace::Appearance;
 
 pub(crate) const ID_FILES: u16 = 2001;
@@ -39,6 +39,12 @@ pub(crate) const ID_OUTLINE: u16 = 2002;
 pub(crate) const ID_SEARCH: u16 = 2003;
 pub(crate) const ID_QUERY: u16 = 2004;
 pub(crate) const ID_ROWS: u16 = 2005;
+pub(crate) const ID_SEARCH_PREVIOUS: u16 = 2006;
+pub(crate) const ID_SEARCH_CLOSE: u16 = 2007;
+pub(crate) const ID_SEARCH_NEXT: u16 = 2008;
+pub(crate) const ID_MENU_FILE: u16 = 2101;
+pub(crate) const ID_MENU_EDIT: u16 = 2102;
+pub(crate) const ID_MENU_VIEW: u16 = 2103;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -238,7 +244,14 @@ pub(crate) struct Chrome {
     pub(crate) status: HWND,
     pub(crate) query: HWND,
     pub(crate) list: HWND,
-    tabs: [HWND; 3],
+    pub(crate) menu_buttons: [HWND; 3],
+    menu_background: HWND,
+    search_previous: HWND,
+    search_next: HWND,
+    search_background: HWND,
+    search_caption: HWND,
+    search_close: HWND,
+    tabs: [HWND; 2],
     caption: HWND,
     empty: HWND,
     query_frame: HWND,
@@ -252,10 +265,13 @@ pub(crate) struct Chrome {
     appearance: Appearance,
     mode: SidebarMode,
     rows: Vec<Row>,
-    cache: Option<(PathBuf, Revision, SidebarMode, String)>,
+    search_cache: Option<(PathBuf, Revision, String, bool)>,
+    search_caption_text: String,
+    cache: Option<(PathBuf, Revision, SidebarMode)>,
     empty_text: String,
     caption_text: String,
-    tab_text: [String; 3],
+    tab_text: [String; 2],
+    menu_text: [String; 3],
 }
 
 impl Chrome {
@@ -276,10 +292,17 @@ impl Chrome {
     }
 
     pub(crate) fn focus_targets(&self) -> Vec<HWND> {
-        self.tabs
+        self.menu_buttons
             .iter()
             .copied()
-            .chain([self.query, self.list])
+            .chain(self.tabs)
+            .chain([
+                self.list,
+                self.query,
+                self.search_previous,
+                self.search_next,
+                self.search_close,
+            ])
             .filter(|hwnd| {
                 unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*hwnd) }.as_bool()
             })
@@ -289,6 +312,34 @@ impl Chrome {
         let strings = state.strings();
         let canvas = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2014, false)?;
         let background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2010, false)?;
+        let menu_text = [strings.file(), strings.edit(), strings.view()].map(menu_label);
+        let menu_background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2019, false)?;
+        let menu_buttons = [
+            child(
+                parent,
+                w!("BUTTON"),
+                &menu_text[0],
+                BS_OWNERDRAW as u32,
+                ID_MENU_FILE,
+                true,
+            )?,
+            child(
+                parent,
+                w!("BUTTON"),
+                &menu_text[1],
+                BS_OWNERDRAW as u32,
+                ID_MENU_EDIT,
+                true,
+            )?,
+            child(
+                parent,
+                w!("BUTTON"),
+                &menu_text[2],
+                BS_OWNERDRAW as u32,
+                ID_MENU_VIEW,
+                true,
+            )?,
+        ];
         let tabs = [
             child(
                 parent,
@@ -306,16 +357,8 @@ impl Chrome {
                 ID_OUTLINE,
                 true,
             )?,
-            child(
-                parent,
-                w!("BUTTON"),
-                strings.search(),
-                BS_OWNERDRAW as u32,
-                ID_SEARCH,
-                true,
-            )?,
         ];
-        for tab in tabs {
+        for tab in tabs.into_iter().chain(menu_buttons) {
             if !unsafe { SetWindowSubclass(tab, Some(tab_subclass), 1, 0) }.as_bool() {
                 return Err(error(windows::core::Error::from_win32()));
             }
@@ -344,11 +387,74 @@ impl Chrome {
         )?;
         let empty = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2012, false)?;
         let status = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2013, false)?;
+        let search_background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2016, false)?;
+        let search_caption = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2017, false)?;
+        let search_close = child(
+            parent,
+            w!("BUTTON"),
+            search_done(state.locale()),
+            BS_OWNERDRAW as u32,
+            ID_SEARCH_CLOSE,
+            true,
+        )?;
+        let search_previous = child(
+            parent,
+            w!("BUTTON"),
+            search_step(state.locale(), false),
+            BS_OWNERDRAW as u32,
+            ID_SEARCH_PREVIOUS,
+            true,
+        )?;
+        let search_next = child(
+            parent,
+            w!("BUTTON"),
+            search_step(state.locale(), true),
+            BS_OWNERDRAW as u32,
+            ID_SEARCH_NEXT,
+            true,
+        )?;
+        for button in [search_previous, search_next, search_close] {
+            if !unsafe { SetWindowSubclass(button, Some(tab_subclass), 1, 0) }.as_bool() {
+                return Err(error(windows::core::Error::from_win32()));
+            }
+        }
+        unsafe {
+            SetWindowPos(
+                search_background,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .map_err(error)?;
+        }
         let cue = wide(strings.search());
         unsafe {
             // This background is a sibling, so it must sit beneath the controls.
             SetWindowPos(
                 background,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .map_err(error)?;
+            SetWindowPos(
+                canvas,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .map_err(error)?;
+            SetWindowPos(
+                menu_background,
                 HWND_BOTTOM,
                 0,
                 0,
@@ -405,6 +511,13 @@ impl Chrome {
             status,
             query,
             list,
+            menu_buttons,
+            menu_background,
+            search_previous,
+            search_next,
+            search_background,
+            search_caption,
+            search_close,
             tabs,
             caption,
             empty,
@@ -419,19 +532,19 @@ impl Chrome {
             appearance: state.appearance(),
             mode: state.sidebar(),
             rows: Vec::new(),
+            search_cache: None,
+            search_caption_text: String::new(),
             cache: None,
             empty_text: String::new(),
             caption_text: String::new(),
-            tab_text: [
-                strings.files().into(),
-                strings.outline().into(),
-                strings.search().into(),
-            ],
+            tab_text: [strings.files().into(), strings.outline().into()],
+            menu_text,
         })
     }
 
     pub(crate) fn invalidate_content(&mut self) {
         self.cache = None;
+        self.search_cache = None;
     }
     pub(crate) fn invalidate_font(&mut self) {
         self.dpi = 0;
@@ -452,15 +565,9 @@ impl Chrome {
             .and_then(|index| self.rows.get(index))
             .map(|row| row.action.clone())
     }
-    pub(crate) fn select_first(&self) {
-        if !self.rows.is_empty() {
-            unsafe {
-                SendMessageW(self.list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
-            }
-        }
-    }
 
     pub(crate) fn refresh(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
+        self.refresh_search(state)?;
         let mode = state.sidebar();
         if mode == SidebarMode::Hidden {
             self.mode = mode;
@@ -468,8 +575,7 @@ impl Chrome {
         }
         let path = state.document().session().path().to_owned();
         let revision = state.document().session().revision();
-        let query = self.query_text();
-        let key = (path.clone(), revision, mode, query.clone());
+        let key = (path.clone(), revision, mode);
         // File lists do not depend on source edits; refresh on navigation or path changes.
         if self.cache.as_ref().is_some_and(|old| {
             old == &key || (mode == SidebarMode::Files && old.0 == path && old.2 == mode)
@@ -515,26 +621,6 @@ impl Chrome {
                     .collect();
                 (rows, document_name, panel_hint(locale, 1).into())
             }
-            SidebarMode::Search => {
-                editor.set_search_query(&query);
-                let matches = SearchResults::build(editor).map_err(error)?;
-                let rows = matches
-                    .rows()
-                    .iter()
-                    .map(|row| Row {
-                        label: row.label().to_owned(),
-                        identity: format!("{}", row.hit().start().get()),
-                        indent: 0,
-                        action: PanelAction::Select(row.hit()),
-                    })
-                    .collect::<Vec<_>>();
-                let caption = format!("{} · {}", strings.search(), rows.len());
-                (
-                    rows,
-                    caption,
-                    panel_hint(locale, if query.is_empty() { 2 } else { 3 }).into(),
-                )
-            }
             SidebarMode::Hidden => unreachable!(),
         };
         let old_index = unsafe { SendMessageW(self.list, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
@@ -552,7 +638,7 @@ impl Chrome {
                 match mode {
                     SidebarMode::Files => strings.files(),
                     SidebarMode::Outline => strings.outline(),
-                    _ => strings.search(),
+                    SidebarMode::Hidden => unreachable!(),
                 },
             ),
             (self.caption, self.caption_text.as_str()),
@@ -605,8 +691,82 @@ impl Chrome {
             SendMessageW(self.list, WM_SETREDRAW, WPARAM(1), LPARAM(0));
         }
         self.cache = Some(key);
-        self.layout(state.metrics(), state.sidebar(), state.appearance())?;
+        self.layout(
+            state.metrics(),
+            state.sidebar(),
+            state.search_visible(),
+            state.appearance(),
+        )?;
         self.repaint();
+        Ok(())
+    }
+
+    fn refresh_search(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
+        let visible = state.search_visible();
+        let query = if visible {
+            self.query_text()
+        } else {
+            String::new()
+        };
+        let key = (
+            state.document().session().path().to_owned(),
+            state.document().session().revision(),
+            query.clone(),
+            visible,
+        );
+        let selection = state.document().session().selection().ordered_range();
+        let editor = state
+            .document_mut()
+            .session_mut()
+            .document_mut()
+            .editor_mut();
+        let changed = self.search_cache.as_ref() != Some(&key);
+        if changed {
+            if visible {
+                editor.set_search_query(&query);
+            } else {
+                editor.clear_search();
+            }
+        }
+        let caption = editor
+            .search()
+            .filter(|search| !search.query().is_empty())
+            .map_or_else(String::new, |search| {
+                format!(
+                    "{}/{}",
+                    search.current(selection).map_or(0, |index| index + 1),
+                    search.matches().len()
+                )
+            });
+        if self.search_caption_text != caption {
+            self.search_caption_text = caption;
+            let label = wide(&format!(
+                "{} {}",
+                state.strings().search(),
+                self.search_caption_text
+            ));
+            unsafe {
+                self.accessibility
+                    .SetHwndPropStr(
+                        self.search_caption,
+                        (-4i32) as u32,
+                        0,
+                        Name_Property_GUID,
+                        PCWSTR(label.as_ptr()),
+                    )
+                    .map_err(error)?;
+                let _ = InvalidateRect(self.search_caption, None, false);
+            }
+        }
+        if changed {
+            self.search_cache = Some(key);
+            self.layout(
+                state.metrics(),
+                state.sidebar(),
+                visible,
+                state.appearance(),
+            )?;
+        }
         Ok(())
     }
 
@@ -614,6 +774,7 @@ impl Chrome {
         &mut self,
         metrics: WindowMetrics,
         mode: SidebarMode,
+        search_visible: bool,
         appearance: Appearance,
     ) -> Result<(), ShellError> {
         self.mode = mode;
@@ -622,7 +783,9 @@ impl Chrome {
             let secondary_font = Font::for_dpi(metrics.dpi(), 11.0, false, self.locale)?;
             let tab_font = Font::for_dpi(metrics.dpi(), 13.0, true, self.locale)?;
             for hwnd in self.controls() {
-                let handle = if hwnd == self.status || hwnd == self.caption || hwnd == self.empty {
+                let handle = if [self.status, self.caption, self.empty, self.search_caption]
+                    .contains(&hwnd)
+                {
                     secondary_font.0
                 } else if self.tabs.contains(&hwnd) {
                     tab_font.0
@@ -657,12 +820,31 @@ impl Chrome {
         let (width, height) = (metrics.width_px() as i32, metrics.height_px() as i32);
         let status_h = metrics.px(24.0).min(height);
         let content_h = (height - status_h).max(1);
+        let header_h = menu_height(metrics);
         let sidebar_w = sidebar_width(metrics, mode);
         let padding = metrics.px(12.0);
         let inner = (sidebar_w - padding * 2).max(1);
         unsafe {
             let _ = MoveWindow(self.canvas, 0, 0, width, content_h, true);
-            let _ = MoveWindow(self.background, 0, 0, sidebar_w, content_h, true);
+            let _ = MoveWindow(
+                self.background,
+                0,
+                header_h,
+                sidebar_w,
+                (content_h - header_h).max(1),
+                true,
+            );
+            let _ = MoveWindow(self.menu_background, 0, 0, width, header_h, true);
+            for (index, button) in self.menu_buttons.iter().enumerate() {
+                let _ = MoveWindow(
+                    *button,
+                    padding + metrics.px(68.0) * index as i32,
+                    metrics.px(6.0),
+                    metrics.px(64.0),
+                    metrics.px(28.0),
+                    true,
+                );
+            }
             let _ = MoveWindow(self.status, 0, content_h, width, status_h, true);
             let _ = ShowWindow(
                 self.background,
@@ -673,12 +855,12 @@ impl Chrome {
                 },
             );
             for (index, tab) in self.tabs.iter().enumerate() {
-                let left = padding + inner * index as i32 / 3;
-                let right = padding + inner * (index as i32 + 1) / 3;
+                let left = padding + inner * index as i32 / 2;
+                let right = padding + inner * (index as i32 + 1) / 2;
                 let _ = MoveWindow(
                     *tab,
                     left + metrics.px(3.0),
-                    padding + metrics.px(3.0),
+                    header_h + padding + metrics.px(3.0),
                     right - left - metrics.px(6.0),
                     metrics.px(28.0),
                     true,
@@ -695,32 +877,12 @@ impl Chrome {
             let _ = MoveWindow(
                 self.caption,
                 padding,
-                metrics.px(56.0),
+                header_h + metrics.px(56.0),
                 inner,
                 metrics.px(20.0),
                 true,
             );
-            let _ = MoveWindow(
-                self.query_frame,
-                padding,
-                metrics.px(84.0),
-                inner,
-                metrics.px(32.0),
-                true,
-            );
-            let _ = MoveWindow(
-                self.query,
-                padding + metrics.px(10.0),
-                metrics.px(90.0),
-                (inner - metrics.px(20.0)).max(1),
-                metrics.px(20.0),
-                true,
-            );
-            let top = metrics.px(if mode == SidebarMode::Search {
-                128.0
-            } else {
-                84.0
-            });
+            let top = header_h + metrics.px(84.0);
             let panel_height = (content_h - top - padding).max(1);
             let _ = MoveWindow(self.list, padding, top, inner, panel_height, true);
             let _ = MoveWindow(
@@ -734,22 +896,6 @@ impl Chrome {
             let visible = mode != SidebarMode::Hidden;
             let _ = ShowWindow(self.caption, if visible { SW_SHOW } else { SW_HIDE });
             let _ = ShowWindow(
-                self.query_frame,
-                if visible && mode == SidebarMode::Search {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
-            let _ = ShowWindow(
-                self.query,
-                if visible && mode == SidebarMode::Search {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
-            let _ = ShowWindow(
                 self.list,
                 if visible && !self.rows.is_empty() {
                     SW_SHOW
@@ -757,6 +903,55 @@ impl Chrome {
                     SW_HIDE
                 },
             );
+            let search_w = (width - sidebar_w).max(1);
+            let search_h = search_height(metrics, search_visible);
+            let search_left = sidebar_w + padding;
+            let gap = metrics.px(8.0);
+            let button_w = metrics.px(28.0);
+            let close_w = metrics.px(60.0);
+            let count_w = metrics.px(56.0);
+            let query_w =
+                (search_w - padding * 2 - gap * 4 - count_w - button_w * 2 - close_w).max(1);
+            let top = header_h + metrics.px(12.0);
+            let control_h = metrics.px(32.0);
+            let _ = MoveWindow(
+                self.search_background,
+                sidebar_w,
+                header_h,
+                search_w,
+                search_h.max(1),
+                true,
+            );
+            let _ = MoveWindow(self.query_frame, search_left, top, query_w, control_h, true);
+            let _ = MoveWindow(
+                self.query,
+                search_left + metrics.px(10.0),
+                top + metrics.px(6.0),
+                (query_w - metrics.px(20.0)).max(1),
+                metrics.px(20.0),
+                true,
+            );
+            let mut left = search_left + query_w + gap;
+            for (hwnd, control_w) in [
+                (self.search_caption, count_w),
+                (self.search_previous, button_w),
+                (self.search_next, button_w),
+                (self.search_close, close_w),
+            ] {
+                let _ = MoveWindow(hwnd, left, top, control_w, control_h, true);
+                left += control_w + gap;
+            }
+            for hwnd in [
+                self.search_background,
+                self.query_frame,
+                self.query,
+                self.search_close,
+                self.search_caption,
+                self.search_previous,
+                self.search_next,
+            ] {
+                let _ = ShowWindow(hwnd, if search_visible { SW_SHOW } else { SW_HIDE });
+            }
             let _ = ShowWindow(
                 self.empty,
                 if visible && self.rows.is_empty() {
@@ -770,23 +965,39 @@ impl Chrome {
         Ok(())
     }
 
-    fn controls(&self) -> [HWND; 11] {
+    fn controls(&self) -> [HWND; 19] {
         [
             self.canvas,
             self.background,
             self.status,
+            self.menu_background,
+            self.menu_buttons[0],
+            self.menu_buttons[1],
+            self.menu_buttons[2],
             self.tabs[0],
             self.tabs[1],
-            self.tabs[2],
             self.caption,
             self.query,
             self.list,
             self.empty,
             self.query_frame,
+            self.search_background,
+            self.search_caption,
+            self.search_previous,
+            self.search_next,
+            self.search_close,
         ]
     }
     pub(crate) fn clear_accessibility_annotations(&self) {
-        for hwnd in [self.query, self.list, self.caption, self.empty] {
+        for hwnd in [
+            self.query,
+            self.list,
+            self.caption,
+            self.empty,
+            self.search_previous,
+            self.search_next,
+            self.search_caption,
+        ] {
             unsafe {
                 let _ = self.accessibility.ClearHwndProps(
                     hwnd,
@@ -834,22 +1045,71 @@ impl Chrome {
                 &rect,
                 if hwnd == self.canvas {
                     self.palette.canvas.0
+                } else if [
+                    self.search_background,
+                    self.search_caption,
+                    self.query_frame,
+                    self.search_previous,
+                    self.search_next,
+                    self.search_close,
+                ]
+                .contains(&hwnd)
+                {
+                    self.palette.input.0
                 } else {
                     self.palette.background.0
                 },
             );
-            let font = if hwnd == self.status || hwnd == self.caption || hwnd == self.empty {
-                &self.secondary_font
-            } else if self.tabs.contains(&hwnd) {
-                &self.tab_font
-            } else {
-                &self.font
-            };
+            let font =
+                if [self.status, self.caption, self.empty, self.search_caption].contains(&hwnd) {
+                    &self.secondary_font
+                } else if self.tabs.contains(&hwnd) {
+                    &self.tab_font
+                } else {
+                    &self.font
+                };
             let previous = font.as_ref().map(|font| SelectObject(item.hDC, font.0));
             SetBkMode(item.hDC, TRANSPARENT);
             let mut text_color = self.palette.text;
             let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-            let text = if hwnd == self.canvas {
+            let text = if hwnd == self.menu_background {
+                let line = RECT {
+                    top: rect.bottom - 1,
+                    ..rect
+                };
+                FillRect(item.hDC, &line, self.palette.border.0);
+                String::new()
+            } else if let Some(index) = self.menu_buttons.iter().position(|button| *button == hwnd)
+            {
+                if pointer_inside(hwnd) || item.itemState.0 & ODS_SELECTED.0 != 0 {
+                    round_fill(item.hDC, &rect, px(6), self.palette.hover.0);
+                }
+                flags |= DT_CENTER;
+                self.menu_text[index].clone()
+            } else if hwnd == self.search_background {
+                FillRect(item.hDC, &rect, self.palette.input.0);
+                let line = RECT {
+                    top: rect.bottom - 1,
+                    ..rect
+                };
+                FillRect(item.hDC, &line, self.palette.border.0);
+                String::new()
+            } else if [self.search_close, self.search_previous, self.search_next].contains(&hwnd) {
+                let brush = if pointer_inside(hwnd) || item.itemState.0 & ODS_SELECTED.0 != 0 {
+                    self.palette.hover.0
+                } else {
+                    self.palette.track.0
+                };
+                round_fill(item.hDC, &rect, px(6), brush);
+                flags |= DT_CENTER;
+                if hwnd == self.search_close {
+                    search_done(self.locale).into()
+                } else if hwnd == self.search_next {
+                    "↓".into()
+                } else {
+                    "↑".into()
+                }
+            } else if hwnd == self.canvas {
                 String::new()
             } else if hwnd == self.background {
                 let line = RECT {
@@ -886,11 +1146,7 @@ impl Chrome {
                 }
             } else if let Some(index) = self.tabs.iter().position(|tab| *tab == hwnd) {
                 FillRect(item.hDC, &rect, self.palette.track.0);
-                let selected_mode = [
-                    SidebarMode::Files,
-                    SidebarMode::Outline,
-                    SidebarMode::Search,
-                ][index];
+                let selected_mode = [SidebarMode::Files, SidebarMode::Outline][index];
                 if self.mode == selected_mode || item.itemState.0 & ODS_SELECTED.0 != 0 {
                     round_fill(item.hDC, &rect, px(6), self.palette.nav_selected.0);
                     text_color = self.palette.accent;
@@ -899,6 +1155,11 @@ impl Chrome {
                 }
                 flags |= DT_CENTER;
                 self.tab_text[index].clone()
+            } else if hwnd == self.search_caption {
+                FillRect(item.hDC, &rect, self.palette.input.0);
+                text_color = self.palette.muted;
+                flags |= DT_CENTER;
+                self.search_caption_text.clone()
             } else if hwnd == self.caption {
                 text_color = self.palette.muted;
                 self.caption_text.clone()
@@ -953,6 +1214,53 @@ impl Chrome {
             }
         }
         true
+    }
+}
+
+fn menu_label(text: &str) -> String {
+    text.split('(')
+        .next()
+        .unwrap_or(text)
+        .replace('&', "")
+        .trim()
+        .to_owned()
+}
+
+pub(crate) fn menu_height(metrics: WindowMetrics) -> i32 {
+    metrics.px(40.0)
+}
+
+fn search_step(locale: Locale, forward: bool) -> &'static str {
+    match (locale, forward) {
+        (Locale::English, false) => "Previous match",
+        (Locale::English, true) => "Next match",
+        (Locale::SimplifiedChinese, false) => "上一个匹配",
+        (Locale::SimplifiedChinese, true) => "下一个匹配",
+        (Locale::TraditionalChinese, false) => "上一個符合項目",
+        (Locale::TraditionalChinese, true) => "下一個符合項目",
+        (Locale::Japanese, false) => "前の一致",
+        (Locale::Japanese, true) => "次の一致",
+        (Locale::Korean, false) => "이전 일치",
+        (Locale::Korean, true) => "다음 일치",
+    }
+}
+
+fn search_done(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "Done",
+        Locale::SimplifiedChinese | Locale::TraditionalChinese => "完成",
+        Locale::Japanese => "完了",
+        Locale::Korean => "완료",
+    }
+}
+
+pub(crate) fn search_height(metrics: WindowMetrics, visible: bool) -> i32 {
+    if visible {
+        metrics
+            .px(56.0)
+            .min((metrics.height_px() as i32 - metrics.px(24.0)).max(1) / 3)
+    } else {
+        0
     }
 }
 
@@ -1229,6 +1537,7 @@ mod tests {
             .layout(
                 WindowMetrics::new(1200, 800, 96),
                 SidebarMode::Files,
+                false,
                 Appearance::Light,
             )
             .expect("96 DPI");
@@ -1239,7 +1548,8 @@ mod tests {
         chrome
             .layout(
                 WindowMetrics::new(2400, 1600, 192),
-                SidebarMode::Search,
+                SidebarMode::Files,
+                true,
                 Appearance::Dark,
             )
             .expect("192 DPI");
@@ -1255,6 +1565,7 @@ mod tests {
             .layout(
                 WindowMetrics::new(1200, 800, 96),
                 SidebarMode::Outline,
+                false,
                 Appearance::Light,
             )
             .expect("restore DPI");
@@ -1285,23 +1596,43 @@ mod tests {
         assert_eq!(chrome.rows[0].label, "中文 😀");
         assert_eq!(chrome.rows[1].label, "Child code");
         let revision = state.document().session().revision();
-        state.set_sidebar(SidebarMode::Search);
+        state.set_search_visible(true);
         let query = wide("中文😀");
         unsafe {
             SetWindowTextW(chrome.query, PCWSTR(query.as_ptr())).expect("query");
         }
         chrome.refresh(&mut state).expect("search");
-        assert_eq!(chrome.rows.len(), 2);
+        assert_eq!(
+            state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .matches()
+                .len(),
+            2
+        );
+        assert_eq!(
+            chrome.rows[0].label, "中文 😀",
+            "search must preserve the outline"
+        );
         let start = source.find("中文😀").expect("match") as u64;
         assert_eq!(
-            chrome.rows[0].action,
-            PanelAction::Select(
-                TextRange::new(
-                    yu_core::ByteOffset::new(start),
-                    yu_core::ByteOffset::new(start + "中文😀".len() as u64)
-                )
-                .expect("range")
+            state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .matches()[0],
+            TextRange::new(
+                yu_core::ByteOffset::new(start),
+                yu_core::ByteOffset::new(start + "中文😀".len() as u64)
             )
+            .expect("range")
         );
         assert_eq!(
             state.document().session().revision(),
@@ -1317,7 +1648,14 @@ mod tests {
             .refresh(&mut state)
             .expect("refresh search after undo");
         assert!(
-            chrome.rows.is_empty(),
+            state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .is_empty(),
             "old search ranges must not survive source edits"
         );
         state.set_sidebar(SidebarMode::Outline);
