@@ -138,20 +138,41 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         surfaceCoordinator.detach()
     }
 
+    fileprivate func persistentDocumentScrollerForSelfCheck() -> Bool {
+        guard let scrollView = documentScrollView else {
+            fputs("Yu scroller self-check: document scroll view is unavailable\n", stderr)
+            return false
+        }
+        let valid = scrollView.hasVerticalScroller
+            && !scrollView.autohidesScrollers
+            && scrollView.scrollerStyle == .legacy
+        if !valid {
+            fputs(
+                "Yu scroller self-check: vertical=\(scrollView.hasVerticalScroller) autohide=\(scrollView.autohidesScrollers) style=\(scrollView.scrollerStyle.rawValue)\n",
+                stderr
+            )
+        }
+        return valid
+    }
+
     override func loadView() {
         let root = NSView()
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
+        // Keep the document position visible for long files. A persistent
+        // native scroller gives continuous position/extent feedback and stays
+        // draggable even when macOS would normally fade overlay scrollers away.
+        scrollView.autohidesScrollers = false
         // The seamless shell and reading geometry already own all top/bottom
         // insets. AppKit's extra titlebar inset would create false overflow.
         scrollView.automaticallyAdjustsContentInsets = false
         scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-        // Reserve the native scroller's width in the reading viewport, as in
-        // the fixed Typora reference. All input and Metal geometry use this
-        // same clip view; no compensating offset is added to the text.
-        scrollView.scrollerStyle = .overlay
+        // AppKit's persistent scroller is the legacy native style. Keep it
+        // small; it only reserves its narrow right-edge width, never footer
+        // height, and the native clip view remains the single geometry authority.
+        scrollView.scrollerStyle = .legacy
+        scrollView.verticalScroller?.controlSize = .small
         scrollView.verticalScrollElasticity = .automatic
         scrollView.drawsBackground = true
         scrollView.backgroundColor = YuVisualTokens.canvas
@@ -3237,6 +3258,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                           !controller.validateMenuItem(reloadItem) else {
                         let state = bridge.state
                         fputs("Yu window self-check failed: clean document chrome or menu validation toolbar=\(window.toolbar != nil) dirty=\(state.dirty) revision=\(state.revision) saved=\(state.savedRevision) disk=\(state.disk) save=\(controller.validateMenuItem(saveItem)) reload=\(controller.validateMenuItem(reloadItem))\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                    guard controller.persistentDocumentScrollerForSelfCheck() else {
+                        fputs("Yu window self-check failed: document scroller is not persistent native chrome\n", stderr)
                         exit(EXIT_FAILURE)
                     }
                     let helpMenu = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == L10n.tr("Help") })?.submenu

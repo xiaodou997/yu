@@ -35,7 +35,9 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::Accessibility::{UiaRect, UiaReturnRawElementProvider};
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
+use windows::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, SetScrollInfo, ShowScrollBar,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
@@ -55,11 +57,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateAcceleratorTableW, CreateMenu, CreatePopupMenu, CreateWindowExW, DLGC_WANTALLKEYS,
     DLGC_WANTARROWS, DLGC_WANTCHARS, DLGC_WANTTAB, DefWindowProcW, DestroyAcceleratorTable,
     DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, FALT, FCONTROL, FSHIFT, FVIRTKEY,
-    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetSubMenu, GetWindowLongPtrW,
-    GetWindowRect, HACCEL, HMENU, HWND_TOP, IDC_ARROW, IsDialogMessageW, KillTimer, LBN_DBLCLK,
-    LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
+    GWLP_USERDATA, GetClientRect, GetMessageW, GetParent, GetScrollInfo, GetSubMenu,
+    GetWindowLongPtrW, GetWindowRect, HACCEL, HMENU, HWND_TOP, IDC_ARROW, IsDialogMessageW,
+    KillTimer, LBN_DBLCLK, LBN_SELCHANGE, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONWARNING,
+    MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, SB_BOTTOM, SB_CTL, SB_LINEDOWN,
+    SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SCROLLINFO,
+    SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     ShowWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
     TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
@@ -67,8 +71,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
     WM_NCCREATE, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_core::{ByteOffset, CaretAffinity, TextRange, Utf16Offset, Utf16Range};
@@ -320,6 +324,33 @@ impl RenderHost {
         Ok(true)
     }
 
+    fn scroll_to(&mut self, target: f32) -> Result<bool, ShellError> {
+        if !target.is_finite() {
+            return Ok(false);
+        }
+        let config = self.builder.config();
+        let viewport = config.viewport();
+        let content_height = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.content_height())
+            .unwrap_or(viewport.height());
+        let max_scroll = (content_height - viewport.height()).max(0.0);
+        let target = target.clamp(0.0, max_scroll);
+        if (target - viewport.scroll_y()).abs() <= f32::EPSILON {
+            return Ok(false);
+        }
+        let surface = self.renderer.surface();
+        self.builder
+            .update_config(viewport_render_config(
+                surface,
+                config.appearance(),
+                target,
+            )?)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(true)
+    }
+
     fn render(&mut self, state: &mut ShellState) -> Result<(), ShellError> {
         let session = state.document_mut().session_mut();
         let viewport_config = editor_viewport_config(
@@ -539,7 +570,49 @@ impl AppWindow {
         }
         self.render = Some(render);
         result?;
+        self.sync_document_scrollbar()?;
         self.publish_accessibility()
+    }
+
+    fn sync_document_scrollbar(&self) -> Result<(), ShellError> {
+        let Some(chrome) = self.chrome.as_ref() else {
+            return Ok(());
+        };
+        let Some(render) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let viewport = render.builder.config().viewport();
+        let content_height = render
+            .layout
+            .as_ref()
+            .map(|layout| layout.content_height())
+            .unwrap_or(viewport.height());
+        let overflow = content_height > viewport.height() + 0.5;
+        if !overflow {
+            unsafe {
+                ShowScrollBar(chrome.document_scrollbar, SB_CTL, BOOL(0))
+                    .map_err(platform_error)?;
+            }
+            return Ok(());
+        }
+
+        let content_units = content_height.ceil().clamp(1.0, i32::MAX as f32) as i32;
+        let page_units = viewport.height().floor().clamp(1.0, u32::MAX as f32) as u32;
+        let position = viewport.scroll_y().round().clamp(0.0, i32::MAX as f32) as i32;
+        let info = SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: content_units.saturating_sub(1),
+            nPage: page_units,
+            nPos: position,
+            ..Default::default()
+        };
+        unsafe {
+            SetScrollInfo(chrome.document_scrollbar, SB_CTL, &info, BOOL(1));
+            ShowScrollBar(chrome.document_scrollbar, SB_CTL, BOOL(1)).map_err(platform_error)?;
+        }
+        Ok(())
     }
 
     fn publish_accessibility(&mut self) -> Result<(), ShellError> {
@@ -1403,6 +1476,75 @@ impl AppWindow {
             tsf.notify_layout_change();
         }
         Ok(true)
+    }
+
+    fn scroll_to_and_render(&mut self, target: f32) -> Result<bool, ShellError> {
+        let Some(render) = self.render.as_mut() else {
+            return Err(ShellError::Platform(
+                "render host is unavailable".to_owned(),
+            ));
+        };
+        if !render.scroll_to(target)? {
+            return Ok(true);
+        }
+        self.render_current()?;
+        if let Some(tsf) = self.tsf.as_ref() {
+            tsf.notify_layout_change();
+        }
+        Ok(true)
+    }
+
+    fn handle_document_scrollbar(
+        &mut self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<bool, ShellError> {
+        let Some(chrome) = self.chrome.as_ref() else {
+            return Ok(false);
+        };
+        if lparam.0 == 0 || lparam.0 != chrome.document_scrollbar.0 as isize {
+            return Ok(false);
+        }
+        let Some(render) = self.render.as_ref() else {
+            return Ok(true);
+        };
+        let viewport = render.builder.config().viewport();
+        let current = viewport.scroll_y();
+        let page = viewport.height().max(1.0);
+        let line = render
+            .layout
+            .as_ref()
+            .map(|layout| layout.config().line_height())
+            .unwrap_or(BODY_FONT_SIZE * 1.5)
+            .max(1.0);
+        let command = (wparam.0 & 0xffff) as i32;
+        let target = if command == SB_LINEUP.0 {
+            current - line
+        } else if command == SB_LINEDOWN.0 {
+            current + line
+        } else if command == SB_PAGEUP.0 {
+            current - page * 0.9
+        } else if command == SB_PAGEDOWN.0 {
+            current + page * 0.9
+        } else if command == SB_TOP.0 {
+            0.0
+        } else if command == SB_BOTTOM.0 {
+            f32::MAX
+        } else if command == SB_THUMBTRACK.0 || command == SB_THUMBPOSITION.0 {
+            let mut info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_TRACKPOS,
+                ..Default::default()
+            };
+            unsafe {
+                GetScrollInfo(chrome.document_scrollbar, SB_CTL, &mut info)
+                    .map_err(platform_error)?;
+            }
+            info.nTrackPos.max(0) as f32
+        } else {
+            return Ok(true);
+        };
+        self.scroll_to_and_render(target)
     }
 
     fn handle_mouse_wheel(&mut self, wparam: WPARAM) -> Result<bool, ShellError> {
@@ -2594,6 +2736,14 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
+            WM_VSCROLL => match app.handle_document_scrollbar(wparam, lparam) {
+                Ok(true) => return LRESULT(0),
+                Ok(false) => {}
+                Err(error) => {
+                    show_error(hwnd, &app.state, &error);
+                    return LRESULT(0);
+                }
+            },
             WM_SIZE => {
                 app.update_layout();
                 if let Err(error) = app.render_current() {
