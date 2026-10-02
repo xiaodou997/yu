@@ -26,8 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, MoveWindow,
     NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETFONT, WM_SETREDRAW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 use yu_core::{Revision, TextRange};
@@ -402,6 +402,9 @@ impl Chrome {
         )?;
         let empty = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2012, false)?;
         let status = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2013, false)?;
+        if !unsafe { SetWindowSubclass(status, Some(overlay_subclass), 1, 0) }.as_bool() {
+            return Err(error(windows::core::Error::from_win32()));
+        }
         let search_background = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2016, false)?;
         let search_caption = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2017, false)?;
         let search_close = child(
@@ -833,8 +836,9 @@ impl Chrome {
             self.appearance = appearance;
         }
         let (width, height) = (metrics.width_px() as i32, metrics.height_px() as i32);
+        let content_h = height.max(1);
         let status_h = metrics.px(24.0).min(height);
-        let content_h = (height - status_h).max(1);
+        let status_w = metrics.px(180.0).min(width);
         let header_h = menu_height(metrics);
         let sidebar_w = sidebar_width(metrics, mode);
         let padding = metrics.px(12.0);
@@ -860,7 +864,23 @@ impl Chrome {
                     true,
                 );
             }
-            let _ = MoveWindow(self.status, 0, content_h, width, status_h, true);
+            let _ = MoveWindow(
+                self.status,
+                (width - status_w).max(0),
+                (height - status_h).max(0),
+                status_w,
+                status_h,
+                true,
+            );
+            let _ = SetWindowPos(
+                self.status,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
             let _ = ShowWindow(
                 self.background,
                 if mode == SidebarMode::Hidden {
@@ -1142,24 +1162,15 @@ impl Chrome {
                 round_fill(item.hDC, &track, px(8), self.palette.track.0);
                 String::new()
             } else if hwnd == self.status {
+                // Lightweight document details overlay: no reserved footer,
+                // divider, or persistent "Ready" state. The small canvas-colored
+                // patch only clears stale text when the character count changes.
                 FillRect(item.hDC, &rect, self.palette.canvas.0);
-                let line = RECT {
-                    bottom: rect.top + 1,
-                    ..rect
-                };
-                FillRect(item.hDC, &line, self.palette.border.0);
-                rect.left += px(12);
+                rect.left += px(8);
                 rect.right -= px(12);
                 text_color = self.palette.muted;
-                let status = window_text(hwnd);
-                if let Some((ready, details)) = status.split_once('·') {
-                    SetTextColor(item.hDC, text_color);
-                    let mut details: Vec<u16> = details.trim().encode_utf16().collect();
-                    DrawTextW(item.hDC, &mut details, &mut rect, flags | DT_RIGHT);
-                    ready.trim().to_owned()
-                } else {
-                    status
-                }
+                flags |= DT_RIGHT;
+                window_text(hwnd)
             } else if let Some(index) = self.tabs.iter().position(|tab| *tab == hwnd) {
                 FillRect(item.hDC, &rect, self.palette.track.0);
                 let selected_mode = [SidebarMode::Files, SidebarMode::Outline][index];
@@ -1274,7 +1285,7 @@ pub(crate) fn search_height(metrics: WindowMetrics, visible: bool) -> i32 {
     if visible {
         metrics
             .px(56.0)
-            .min((metrics.height_px() as i32 - metrics.px(24.0)).max(1) / 3)
+            .min((metrics.height_px() as i32).max(1) / 3)
     } else {
         0
     }
@@ -1289,6 +1300,27 @@ fn pointer_inside(hwnd: HWND) -> bool {
             && GetClientRect(hwnd, &mut rect).is_ok()
     };
     valid && point.x >= 0 && point.y >= 0 && point.x < rect.right && point.y < rect.bottom
+}
+
+unsafe extern "system" fn overlay_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if message == WM_NCHITTEST {
+        // Match the macOS overlay: status text is visual only and never steals
+        // pointer input from the editor beneath it.
+        return LRESULT(-1);
+    }
+    if message == WM_NCDESTROY {
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(overlay_subclass), 1);
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 unsafe extern "system" fn tab_subclass(
