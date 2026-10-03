@@ -4,6 +4,60 @@ use yu_editor::{
 };
 
 #[test]
+fn source_edit_roundtrip() {
+    let original = "正文\r\n\r\n![A](a.png) ![B](b.jpg)\r\n\r\nTAIL\r\n";
+    let mut document = EditorDocument::new(original);
+    let range = document.image_references().expect("images")[1].source;
+    let current = document.image_properties(range).expect("B properties");
+    document
+        .update_image_source(
+            &current,
+            "<img src=\"中文%20图片.png\" alt=\"新图\" width=\"180\">",
+        )
+        .expect("edit image source");
+    let changed = document.snapshot().as_str().to_owned();
+    assert_eq!(
+        changed,
+        "正文\r\n\r\n![A](a.png) <img src=\"中文%20图片.png\" alt=\"新图\" width=\"180\">\r\n\r\nTAIL\r\n"
+    );
+    assert!(
+        document
+            .update_image_source(&current, "![stale](x.png)")
+            .is_err()
+    );
+    document.undo().expect("undo source");
+    assert_eq!(document.snapshot().as_str(), original);
+    document.redo().expect("redo source");
+    assert_eq!(document.snapshot().as_str(), changed);
+}
+
+#[test]
+fn source_edit_validation() {
+    let original = "![A][shared]\n\n[shared]: a.png\n";
+    let mut document = EditorDocument::new(original);
+    let range = document.image_references().expect("images")[0].source;
+    let current = document.image_properties(range).expect("properties");
+    for invalid in ["text", "![A](a.png) ![B](b.png)", "![A](a.png)\nTAIL", ""] {
+        assert!(document.update_image_source(&current, invalid).is_err());
+        assert_eq!(document.snapshot().as_str(), original);
+        assert_eq!(document.revision(), current.revision);
+    }
+    assert!(
+        !document
+            .update_image_source(&current, "![A][shared]")
+            .expect("same source")
+            .changed()
+    );
+    document
+        .update_image_source(&current, "![新图][shared]")
+        .expect("reference context");
+    assert_eq!(
+        document.snapshot().as_str(),
+        "![新图][shared]\n\n[shared]: a.png\n"
+    );
+}
+
+#[test]
 fn local_image_insertion_is_one_undo_step_and_keeps_surrounding_bytes() {
     let original = "# 标题\r\n\r\nKEEP\r\n";
     let mut document = EditorDocument::new(original);

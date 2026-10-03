@@ -6,17 +6,22 @@
 #![cfg(target_os = "windows")]
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_HIGHLIGHT, FillRect, GetSysColorBrush};
+use windows::Win32::Graphics::Gdi::{
+    DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawFocusRect, DrawTextW, FillRect, HDC,
+    InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+};
 use windows::Win32::System::SystemServices::SS_OWNERDRAW;
-use windows::Win32::UI::Controls::{BST_CHECKED, DRAWITEMSTRUCT, EM_SETCUEBANNER};
+use windows::Win32::UI::Controls::{BST_CHECKED, DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, CreateWindowExW, DestroyWindow, DispatchMessageW, EN_KILLFOCUS,
-    ES_AUTOHSCROLL, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU, IsDialogMessageW,
-    MSG, MoveWindow, SW_HIDE, SW_SHOW, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WS_BORDER,
-    WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    BM_GETCHECK, BM_SETCHECK, BS_OWNERDRAW, CreateWindowExW, DestroyWindow, DispatchMessageW,
+    EN_KILLFOCUS, ES_AUTOHSCROLL, GetMessageW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    HMENU, IsDialogMessageW, MSG, MoveWindow, SW_HIDE, SW_SHOW, SendMessageW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND, WM_NCDESTROY, WM_SETFONT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_DISABLED, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
 };
 use windows::core::{PCWSTR, w};
 use yu_assets::ImageDimensions;
@@ -24,10 +29,10 @@ use yu_core::{Revision, TextRange};
 use yu_editor::ImageProperties;
 use yu_scene::Rect;
 
-use crate::{ShellError, Strings, WindowMetrics};
+use crate::chrome::{Brush, Font, pointer_inside, round_fill, tab_subclass};
+use crate::{Locale, ShellError, Strings, WindowMetrics};
 
-pub(crate) const ID_IMAGE_ALT: u16 = 2201;
-pub(crate) const ID_IMAGE_DESTINATION: u16 = 2202;
+pub(crate) const ID_IMAGE_SOURCE: u16 = 2201;
 pub(crate) const ID_IMAGE_REPLACE: u16 = 2203;
 pub(crate) const ID_IMAGE_SIZE: u16 = 2204;
 pub(crate) const ID_IMAGE_MORE: u16 = 2205;
@@ -130,7 +135,7 @@ pub(crate) struct ImagePropertyDraft {
 pub(crate) fn is_inspector_control(id: u16) -> bool {
     matches!(
         id,
-        ID_IMAGE_ALT | ID_IMAGE_DESTINATION | ID_IMAGE_REPLACE | ID_IMAGE_SIZE | ID_IMAGE_MORE
+        ID_IMAGE_SOURCE | ID_IMAGE_REPLACE | ID_IMAGE_SIZE | ID_IMAGE_MORE
     )
 }
 
@@ -138,17 +143,150 @@ pub(crate) struct ImageInspector {
     borders: [HWND; 4],
     panel: HWND,
     source: HWND,
-    alternative: HWND,
-    destination: HWND,
     replace: HWND,
     size: HWND,
     more: HWND,
     identity: Option<(Revision, TextRange)>,
     visible: bool,
+    locale: Locale,
+    font: Option<Font>,
+    source_font: Option<Font>,
+    font_dpi: u32,
+    palette: InspectorPalette,
+    appearance: yu_workspace::Appearance,
+    contrast: Option<yu_scene::ContrastPalette>,
+}
+
+struct InspectorPalette {
+    canvas: Brush,
+    background: Brush,
+    field: Brush,
+    field_border: Brush,
+    border: Brush,
+    hover: Brush,
+    accent: Brush,
+    shadow_far: Brush,
+    shadow_mid: Brush,
+    shadow_near: Brush,
+    text: windows::Win32::Foundation::COLORREF,
+    muted: windows::Win32::Foundation::COLORREF,
+    field_color: windows::Win32::Foundation::COLORREF,
+}
+
+impl InspectorPalette {
+    fn new(
+        appearance: yu_workspace::Appearance,
+        contrast: Option<yu_scene::ContrastPalette>,
+    ) -> Self {
+        let dark = matches!(
+            appearance,
+            yu_workspace::Appearance::Dark | yu_workspace::Appearance::YuDark
+        );
+        let color =
+            |light, dark_color| crate::contrast::colorref(if dark { dark_color } else { light });
+        let background = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(241, 245, 250, 255),
+                    yu_scene::Rgba8::new(46, 51, 61, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.background),
+        );
+        let field = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(255, 255, 255, 255),
+                    yu_scene::Rgba8::new(32, 36, 44, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.background),
+        );
+        let text = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(52, 58, 68, 255),
+                    yu_scene::Rgba8::new(232, 234, 238, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.foreground),
+        );
+        let muted = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(83, 96, 115, 255),
+                    yu_scene::Rgba8::new(185, 195, 212, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.foreground),
+        );
+        let border = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(180, 194, 214, 255),
+                    yu_scene::Rgba8::new(94, 107, 127, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.foreground),
+        );
+        let hover = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(222, 233, 248, 255),
+                    yu_scene::Rgba8::new(66, 79, 101, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.selection),
+        );
+        let accent = contrast.map_or_else(
+            || {
+                color(
+                    yu_scene::Rgba8::new(76, 127, 206, 255),
+                    yu_scene::Rgba8::new(125, 168, 237, 255),
+                )
+            },
+            |value| crate::contrast::colorref(value.foreground),
+        );
+        Self {
+            canvas: Brush::new(contrast.map_or_else(
+                || crate::contrast::colorref(appearance.background()),
+                |value| crate::contrast::colorref(value.background),
+            )),
+            background: Brush::new(background),
+            field: Brush::new(field),
+            field_border: Brush::new(contrast.map_or_else(
+                || {
+                    color(
+                        yu_scene::Rgba8::new(208, 218, 232, 255),
+                        yu_scene::Rgba8::new(78, 91, 111, 255),
+                    )
+                },
+                |value| crate::contrast::colorref(value.foreground),
+            )),
+            border: Brush::new(border),
+            hover: Brush::new(hover),
+            accent: Brush::new(accent),
+            shadow_far: Brush::new(color(
+                yu_scene::Rgba8::new(244, 247, 251, 255),
+                yu_scene::Rgba8::new(24, 27, 33, 255),
+            )),
+            shadow_mid: Brush::new(color(
+                yu_scene::Rgba8::new(234, 239, 246, 255),
+                yu_scene::Rgba8::new(17, 20, 26, 255),
+            )),
+            shadow_near: Brush::new(color(
+                yu_scene::Rgba8::new(220, 229, 241, 255),
+                yu_scene::Rgba8::new(10, 13, 19, 255),
+            )),
+            text,
+            muted,
+            field_color: field,
+        }
+    }
 }
 
 impl ImageInspector {
-    pub(crate) fn new(parent: HWND, strings: Strings) -> Result<Self, ShellError> {
+    pub(crate) fn new(parent: HWND, locale: Locale) -> Result<Self, ShellError> {
         let border = |id| {
             child(
                 parent,
@@ -159,50 +297,55 @@ impl ImageInspector {
                 false,
             )
         };
-        let panel = child(parent, w!("STATIC"), "", 2270, WS_BORDER.0, false)?;
-        let source = child(parent, w!("STATIC"), "", 2271, 0, false)?;
-        let alternative = child(
+        let panel = child(
+            parent,
+            w!("STATIC"),
+            "",
+            2270,
+            SS_OWNERDRAW.0 | WS_DISABLED.0,
+            false,
+        )?;
+        let source = child(
             parent,
             w!("EDIT"),
             "",
-            ID_IMAGE_ALT,
-            WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+            ID_IMAGE_SOURCE,
+            ES_AUTOHSCROLL as u32,
             true,
         )?;
-        let destination = child(
+        if !unsafe { SetWindowSubclass(source, Some(source_subclass), 1, 0) }.as_bool() {
+            return Err(error(windows::core::Error::from_win32()));
+        }
+        let replace = child(
             parent,
-            w!("EDIT"),
-            "",
-            ID_IMAGE_DESTINATION,
-            WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+            w!("BUTTON"),
+            replace_label(locale),
+            ID_IMAGE_REPLACE,
+            BS_OWNERDRAW as u32,
             true,
         )?;
-        let replace = child(parent, w!("BUTTON"), "…", ID_IMAGE_REPLACE, 0, true)?;
         let size = child(
             parent,
             w!("BUTTON"),
-            strings.image_size(),
+            "100% ▾",
             ID_IMAGE_SIZE,
-            0,
+            BS_OWNERDRAW as u32,
             true,
         )?;
-        let more = child(parent, w!("BUTTON"), "⋯", ID_IMAGE_MORE, 0, true)?;
-        let alt_cue = wide(strings.alternative_text());
-        let destination_cue = wide(strings.image_address());
-        unsafe {
-            SendMessageW(
-                alternative,
-                EM_SETCUEBANNER,
-                WPARAM(1),
-                LPARAM(alt_cue.as_ptr() as isize),
-            );
-            SendMessageW(
-                destination,
-                EM_SETCUEBANNER,
-                WPARAM(1),
-                LPARAM(destination_cue.as_ptr() as isize),
-            );
+        let more = child(
+            parent,
+            w!("BUTTON"),
+            "···",
+            ID_IMAGE_MORE,
+            BS_OWNERDRAW as u32,
+            true,
+        )?;
+        for button in [replace, size, more] {
+            if !unsafe { SetWindowSubclass(button, Some(tab_subclass), 1, 0) }.as_bool() {
+                return Err(error(windows::core::Error::from_win32()));
+            }
         }
+        let appearance = yu_workspace::Appearance::YuLight;
         let result = Self {
             borders: [
                 border(ID_IMAGE_BORDER_TOP)?,
@@ -212,24 +355,38 @@ impl ImageInspector {
             ],
             panel,
             source,
-            alternative,
-            destination,
             replace,
             size,
             more,
             identity: None,
             visible: false,
+            locale,
+            font: None,
+            source_font: None,
+            font_dpi: 0,
+            palette: InspectorPalette::new(appearance, None),
+            appearance,
+            contrast: None,
         };
         result.hide_windows();
         Ok(result)
     }
 
-    pub(crate) fn alternative(&self) -> String {
-        window_text(self.alternative)
+    pub(crate) fn source_text(&self) -> Option<String> {
+        self.visible.then(|| window_text(self.source))
     }
 
-    pub(crate) fn destination(&self) -> String {
-        window_text(self.destination)
+    pub(crate) fn is_source(&self, hwnd: HWND) -> bool {
+        self.visible && hwnd == self.source && !self.is_composing(hwnd)
+    }
+
+    pub(crate) fn is_composing(&self, hwnd: HWND) -> bool {
+        hwnd == self.source
+            && unsafe {
+                !windows::Win32::UI::WindowsAndMessaging::GetPropW(hwnd, w!("YuImageComposition"))
+                    .0
+                    .is_null()
+            }
     }
 
     pub(crate) const fn button(&self, id: u16) -> Option<HWND> {
@@ -243,8 +400,7 @@ impl ImageInspector {
 
     pub(crate) fn hide(&mut self) {
         self.identity = None;
-        self.visible = false;
-        self.hide_windows();
+        self.hide_for_scroll();
     }
 
     pub(crate) fn hide_for_scroll(&mut self) {
@@ -257,8 +413,6 @@ impl ImageInspector {
             for hwnd in self.borders.iter().copied().chain([
                 self.panel,
                 self.source,
-                self.alternative,
-                self.destination,
                 self.replace,
                 self.size,
                 self.more,
@@ -273,148 +427,366 @@ impl ImageInspector {
         state: &ImageInteractionState,
         image: RECT,
         viewport: RECT,
+        inspector_bounds: RECT,
         metrics: WindowMetrics,
+        theme: (yu_workspace::Appearance, Option<yu_scene::ContrastPalette>),
     ) {
-        let same = self.identity == Some((state.revision, state.source));
-        self.identity = Some((state.revision, state.source));
-        if !same {
-            set_text(self.alternative, &state.properties.alternative);
-            set_text(self.destination, &state.displayed_destination);
+        let (appearance, contrast) = theme;
+        if self.appearance != appearance || self.contrast != contrast {
+            self.palette = InspectorPalette::new(appearance, contrast);
+            self.appearance = appearance;
+            self.contrast = contrast;
         }
-        set_text(self.source, &state.source_text);
-
-        let thickness = metrics.px(2.0).max(2);
-        let image_width = (image.right - image.left).max(1);
-        let image_height = (image.bottom - image.top).max(1);
-        unsafe {
-            let _ = MoveWindow(
-                self.borders[0],
-                image.left - thickness,
-                image.top - thickness,
-                image_width + thickness * 2,
+        if self.font_dpi != metrics.dpi()
+            && let (Ok(font), Ok(source_font)) = (
+                Font::for_dpi(metrics.dpi(), 12.0, false, self.locale),
+                Font::monospace(metrics.dpi(), 11.0),
+            )
+        {
+            unsafe {
+                for hwnd in [self.replace, self.size, self.more] {
+                    SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0.0 as usize), LPARAM(1));
+                }
+                SendMessageW(
+                    self.source,
+                    WM_SETFONT,
+                    WPARAM(source_font.0.0 as usize),
+                    LPARAM(1),
+                );
+            }
+            self.font = Some(font);
+            self.source_font = Some(source_font);
+            self.font_dpi = metrics.dpi();
+        }
+        let identity = Some((state.revision, state.source));
+        if self.identity != identity {
+            set_text(self.source, &state.source_text);
+        }
+        self.identity = identity;
+        let percent = state.intrinsic.map(|size| {
+            (state.document_bounds.width() / size.width() as f32 * 100.0).round() as u32
+        });
+        set_text(
+            self.size,
+            &percent.map_or_else(|| "↔ ▾".to_owned(), |percent| format!("{percent}% ▾")),
+        );
+        let thickness = metrics.px(1.0).max(1);
+        let border_rects = [
+            child_rect(image.left, image.top, image.right - image.left, thickness),
+            child_rect(
+                image.left,
+                image.bottom - thickness,
+                image.right - image.left,
                 thickness,
-                true,
-            );
-            let _ = MoveWindow(
-                self.borders[1],
-                image.left - thickness,
-                image.bottom,
-                image_width + thickness * 2,
-                thickness,
-                true,
-            );
-            let _ = MoveWindow(
-                self.borders[2],
-                image.left - thickness,
+            ),
+            child_rect(image.left, image.top, thickness, image.bottom - image.top),
+            child_rect(
+                image.right - thickness,
                 image.top,
                 thickness,
-                image_height,
-                true,
-            );
-            let _ = MoveWindow(
-                self.borders[3],
-                image.right,
-                image.top,
-                thickness,
-                image_height,
-                true,
-            );
-        }
-
-        let padding = metrics.px(8.0).max(6);
-        let gap = metrics.px(6.0).max(4);
-        let row_h = metrics.px(28.0).max(24);
-        let source_h = metrics.px(20.0).max(18);
-        let panel_h = padding * 2 + source_h + gap + row_h;
-        let available = (viewport.right - viewport.left - metrics.px(24.0)).max(metrics.px(320.0));
-        let panel_w = metrics.px(720.0).min(available);
-        let mut panel_x = image.left + image_width / 2 - panel_w / 2;
-        panel_x = panel_x.clamp(viewport.left + padding, viewport.right - panel_w - padding);
-        let mut panel_y = image.bottom + gap;
-        if panel_y + panel_h > viewport.bottom - padding {
-            panel_y = image.top - panel_h - gap;
-        }
-        panel_y = panel_y.clamp(viewport.top + padding, viewport.bottom - panel_h - padding);
-
-        let button_w = metrics.px(34.0).max(30);
-        let size_w = metrics.px(94.0).max(84);
-        let content_w = panel_w - padding * 2;
-        let fixed = button_w * 2 + size_w + gap * 4;
-        let fields = (content_w - fixed).max(metrics.px(200.0));
-        let alt_w = (fields * 2 / 5).max(metrics.px(110.0));
-        let destination_w = (fields - alt_w).max(metrics.px(130.0));
-        let row_y = panel_y + padding + source_h + gap;
-        let mut x = panel_x + padding;
-
+                image.bottom - image.top,
+            ),
+        ];
         unsafe {
-            let _ = MoveWindow(self.panel, panel_x, panel_y, panel_w, panel_h, true);
-            let _ = MoveWindow(
-                self.source,
-                panel_x + padding,
-                panel_y + padding,
-                content_w,
-                source_h,
-                true,
-            );
-            let _ = MoveWindow(self.alternative, x, row_y, alt_w, row_h, true);
-            x += alt_w + gap;
-            let _ = MoveWindow(self.destination, x, row_y, destination_w, row_h, true);
-            x += destination_w + gap;
-            let _ = MoveWindow(self.replace, x, row_y, button_w, row_h, true);
-            x += button_w + gap;
-            let _ = MoveWindow(self.size, x, row_y, size_w, row_h, true);
-            x += size_w + gap;
-            let _ = MoveWindow(self.more, x, row_y, button_w, row_h, true);
-
-            for hwnd in [
+            for (hwnd, rect) in self.borders.iter().zip(border_rects) {
+                if let Some(rect) = intersect_rect(rect, viewport) {
+                    place(*hwnd, rect);
+                    let _ = ShowWindow(*hwnd, SW_SHOW);
+                } else {
+                    let _ = ShowWindow(*hwnd, SW_HIDE);
+                }
+            }
+        }
+        let panel = inspector_panel_rect(image, inspector_bounds, metrics);
+        if panel.bottom - panel.top < metrics.px(24.0)
+            || panel.right - panel.left < metrics.px(100.0)
+        {
+            self.hide_for_scroll();
+            return;
+        }
+        let padding = metrics.px(4.0);
+        let row_h = metrics
+            .px(28.0)
+            .min(panel.bottom - panel.top - padding * 2)
+            .max(1);
+        let top = panel.top + (panel.bottom - panel.top - row_h) / 2;
+        let content = panel.right - panel.left - padding * 2;
+        let compact = content < metrics.px(300.0);
+        let more_w = metrics.px(28.0);
+        let size_w = if compact { 0 } else { metrics.px(68.0) };
+        let replace_w = if compact { 0 } else { metrics.px(58.0) };
+        let label_w = if compact { 0 } else { metrics.px(34.0) };
+        let field_w = (content - label_w - replace_w - size_w - more_w - padding * 3).max(1);
+        let source_left = panel.left + padding + label_w;
+        unsafe {
+            place(
                 self.panel,
+                RECT {
+                    right: panel.right + metrics.px(4.0),
+                    bottom: panel.bottom + metrics.px(4.0),
+                    ..panel
+                },
+            );
+            place(
                 self.source,
-                self.alternative,
-                self.destination,
+                child_rect(
+                    source_left + padding,
+                    top + metrics.px(4.0),
+                    field_w - padding * 2,
+                    row_h - metrics.px(8.0),
+                ),
+            );
+            place(
                 self.replace,
+                child_rect(
+                    source_left + field_w + padding,
+                    top,
+                    replace_w.max(1),
+                    row_h,
+                ),
+            );
+            place(
                 self.size,
+                child_rect(
+                    source_left + field_w + padding + replace_w,
+                    top,
+                    size_w.max(1),
+                    row_h,
+                ),
+            );
+            place(
                 self.more,
-            ] {
-                let _ = SetWindowPos(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
+                child_rect(panel.right - padding - more_w, top, more_w, row_h),
+            );
+            for hwnd in [self.panel, self.source, self.more] {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
-            for hwnd in self.borders {
-                let _ = SetWindowPos(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                );
-                let _ = ShowWindow(hwnd, SW_SHOW);
+            for hwnd in [self.replace, self.size] {
+                let _ = ShowWindow(hwnd, if compact { SW_HIDE } else { SW_SHOW });
             }
+            let _ = InvalidateRect(self.panel, None, false);
         }
         self.visible = true;
     }
 
-    pub(crate) fn draw(&self, item: &DRAWITEMSTRUCT) -> bool {
-        if !self.borders.contains(&item.hwndItem) {
-            return false;
+    pub(crate) fn control_color(&self, dc: HDC, hwnd: HWND) -> Option<LRESULT> {
+        if hwnd != self.source {
+            return None;
         }
         unsafe {
-            let _ = FillRect(item.hDC, &item.rcItem, GetSysColorBrush(COLOR_HIGHLIGHT));
+            SetTextColor(dc, self.palette.text);
+            SetBkColor(dc, self.palette.field_color);
+        }
+        Some(LRESULT(self.palette.field.0.0 as isize))
+    }
+
+    pub(crate) fn draw(&self, item: &DRAWITEMSTRUCT) -> bool {
+        let hwnd = item.hwndItem;
+        let metrics = WindowMetrics::new(0, 0, self.font_dpi.max(96));
+        let mut rect = item.rcItem;
+        unsafe {
+            if self.borders.contains(&hwnd) {
+                FillRect(item.hDC, &rect, self.palette.accent.0);
+                return true;
+            }
+            if hwnd == self.panel {
+                FillRect(item.hDC, &rect, self.palette.canvas.0);
+                if self.contrast.is_none() {
+                    for (offset, brush) in [
+                        (4.0, &self.palette.shadow_far),
+                        (3.0, &self.palette.shadow_mid),
+                        (2.0, &self.palette.shadow_near),
+                    ] {
+                        let shadow = RECT {
+                            left: rect.left + metrics.px(offset),
+                            top: rect.top + metrics.px(offset),
+                            right: rect.right - metrics.px(4.0 - offset),
+                            bottom: rect.bottom - metrics.px(4.0 - offset),
+                        };
+                        round_fill(item.hDC, &shadow, metrics.px(8.0), brush.0);
+                    }
+                }
+                rect.right -= metrics.px(4.0);
+                rect.bottom -= metrics.px(4.0);
+                round_fill(item.hDC, &rect, metrics.px(8.0), self.palette.border.0);
+                let stroke = metrics.px(1.0).max(1);
+                rect.left += stroke;
+                rect.top += stroke;
+                rect.right -= stroke;
+                rect.bottom -= stroke;
+                round_fill(item.hDC, &rect, metrics.px(8.0), self.palette.background.0);
+                let compact = rect.right - rect.left < metrics.px(312.0);
+                let field = RECT {
+                    left: metrics.px(if compact { 4.0 } else { 38.0 }),
+                    top: metrics.px(6.0),
+                    right: rect.right + stroke - metrics.px(if compact { 44.0 } else { 170.0 }),
+                    bottom: rect.bottom + stroke - metrics.px(6.0),
+                };
+                round_fill(
+                    item.hDC,
+                    &field,
+                    metrics.px(5.0),
+                    self.palette.field_border.0,
+                );
+                let field_inner = RECT {
+                    left: field.left + stroke,
+                    top: field.top + stroke,
+                    right: field.right - stroke,
+                    bottom: field.bottom - stroke,
+                };
+                round_fill(
+                    item.hDC,
+                    &field_inner,
+                    metrics.px(5.0),
+                    self.palette.field.0,
+                );
+                if !compact {
+                    let mut label = RECT {
+                        left: metrics.px(7.0),
+                        top: 0,
+                        right: metrics.px(39.0),
+                        bottom: rect.bottom,
+                    };
+                    let mut text = wide(image_label(self.locale));
+                    let previous = self
+                        .font
+                        .as_ref()
+                        .map(|font| SelectObject(item.hDC, font.0));
+                    SetBkMode(item.hDC, TRANSPARENT);
+                    SetTextColor(item.hDC, self.palette.muted);
+                    let length = text.len() - 1;
+                    DrawTextW(
+                        item.hDC,
+                        &mut text[..length],
+                        &mut label,
+                        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                    if let Some(previous) = previous {
+                        SelectObject(item.hDC, previous);
+                    }
+                }
+                return true;
+            }
+            if ![self.replace, self.size, self.more].contains(&hwnd) {
+                return false;
+            }
+            FillRect(item.hDC, &rect, self.palette.background.0);
+            if pointer_inside(hwnd) || item.itemState.0 & ODS_SELECTED.0 != 0 {
+                round_fill(item.hDC, &rect, metrics.px(5.0), self.palette.hover.0);
+            }
+            let previous = self
+                .font
+                .as_ref()
+                .map(|font| SelectObject(item.hDC, font.0));
+            SetBkMode(item.hDC, TRANSPARENT);
+            SetTextColor(item.hDC, self.palette.text);
+            let mut text = wide(&window_text(hwnd));
+            let length = text.len() - 1;
+            DrawTextW(
+                item.hDC,
+                &mut text[..length],
+                &mut rect,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+            if item.itemState.0 & ODS_FOCUS.0 != 0 {
+                let _ = DrawFocusRect(item.hDC, &rect);
+            }
+            if let Some(previous) = previous {
+                SelectObject(item.hDC, previous);
+            }
         }
         true
     }
+}
+
+unsafe extern "system" fn source_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        RemovePropW, SetPropW, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    };
+    unsafe {
+        if message == WM_IME_STARTCOMPOSITION {
+            let _ = SetPropW(
+                hwnd,
+                w!("YuImageComposition"),
+                windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut()),
+            );
+        } else if message == WM_IME_ENDCOMPOSITION || message == WM_NCDESTROY {
+            let _ = RemovePropW(hwnd, w!("YuImageComposition"));
+            if message == WM_NCDESTROY {
+                let _ = RemoveWindowSubclass(hwnd, Some(source_subclass), 1);
+            }
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+}
+
+unsafe fn place(hwnd: HWND, rect: RECT) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+            rect.left,
+            rect.top,
+            (rect.right - rect.left).max(1),
+            (rect.bottom - rect.top).max(1),
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn replace_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "Replace",
+        Locale::SimplifiedChinese => "替换",
+        Locale::TraditionalChinese => "替換",
+        Locale::Japanese => "変更",
+        Locale::Korean => "교체",
+    }
+}
+
+fn image_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "Image",
+        Locale::SimplifiedChinese => "图片",
+        Locale::TraditionalChinese => "圖片",
+        Locale::Japanese => "画像",
+        Locale::Korean => "이미지",
+    }
+}
+
+fn intersect_rect(rect: RECT, viewport: RECT) -> Option<RECT> {
+    let clipped = RECT {
+        left: rect.left.max(viewport.left),
+        top: rect.top.max(viewport.top),
+        right: rect.right.min(viewport.right),
+        bottom: rect.bottom.min(viewport.bottom),
+    };
+    (clipped.right > clipped.left && clipped.bottom > clipped.top).then_some(clipped)
+}
+
+fn inspector_panel_rect(image: RECT, viewport: RECT, metrics: WindowMetrics) -> RECT {
+    let width = (viewport.right - viewport.left).max(1);
+    let height = (viewport.bottom - viewport.top).max(1);
+    let padding = metrics.px(2.0).min((width - 1) / 2).min((height - 1) / 2);
+    let shadow = metrics.px(4.0).min((width - 1) / 2).min((height - 1) / 2);
+    let panel_height = metrics.px(32.0).min((height - padding * 2 - shadow).max(1));
+    let panel_width = metrics.px(640.0).min((width - padding * 2 - shadow).max(1));
+    let left = image.left.clamp(
+        viewport.left + padding,
+        viewport.right - padding - shadow - panel_width,
+    );
+    let top = (image.top - metrics.px(8.0) - panel_height).clamp(
+        viewport.top + padding,
+        viewport.bottom - padding - shadow - panel_height,
+    );
+    child_rect(left, top, panel_width, panel_height)
 }
 
 struct PropertiesDialogState {
@@ -496,7 +868,7 @@ unsafe extern "system" fn properties_subclass(
                 synchronize_dimension(state, id);
                 return LRESULT(0);
             }
-            if id == ID_PROPERTIES_APPLY {
+            if matches!(id, ID_PROPERTIES_APPLY | 1) {
                 let destination = window_text(state.destination);
                 let alternative = window_text(state.alternative);
                 let Some(mut width) = dimension(&window_text(state.width)) else {
@@ -544,7 +916,7 @@ unsafe extern "system" fn properties_subclass(
                 }
                 return LRESULT(0);
             }
-            if id == ID_PROPERTIES_CANCEL {
+            if matches!(id, ID_PROPERTIES_CANCEL | 2) {
                 state.done = true;
                 unsafe {
                     let _ = DestroyWindow(hwnd);
@@ -591,13 +963,14 @@ fn dialog_child(
     tabstop: bool,
 ) -> Result<HWND, ShellError> {
     let hwnd = child(parent, class, text, id, style, tabstop)?;
+    let metrics = WindowMetrics::new(0, 0, unsafe { GetDpiForWindow(parent) });
     unsafe {
         let _ = MoveWindow(
             hwnd,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            metrics.px(rect.left as f32),
+            metrics.px(rect.top as f32),
+            metrics.px((rect.right - rect.left) as f32),
+            metrics.px((rect.bottom - rect.top) as f32),
             true,
         );
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -616,22 +989,34 @@ const fn child_rect(x: i32, y: i32, width: i32, height: i32) -> RECT {
 
 pub(crate) fn edit_image_properties(
     owner: HWND,
-    strings: Strings,
+    locale: Locale,
     properties: &ImageProperties,
     displayed_destination: &str,
     intrinsic: Option<ImageDimensions>,
 ) -> Result<Option<ImagePropertyDraft>, ShellError> {
+    let strings = locale.strings();
+    let dpi = unsafe { GetDpiForWindow(owner) };
+    let metrics = WindowMetrics::new(0, 0, dpi);
+    let font = Font::for_dpi(dpi, 13.0, false, locale)?;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let ex_style = windows::Win32::UI::WindowsAndMessaging::WS_EX_DLGMODALFRAME;
+    let mut frame = child_rect(0, 0, metrics.px(560.0), metrics.px(300.0));
+    unsafe { AdjustWindowRectExForDpi(&mut frame, style, false, ex_style, dpi) }.map_err(error)?;
+    let mut owner_rect = RECT::default();
+    unsafe { GetWindowRect(owner, &mut owner_rect) }.map_err(error)?;
+    let window_w = frame.right - frame.left;
+    let window_h = frame.bottom - frame.top;
     let title = wide(strings.image_properties());
     let dialog = unsafe {
         CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WS_EX_DLGMODALFRAME,
-            w!("STATIC"),
+            ex_style,
+            w!("#32770"),
             PCWSTR(title.as_ptr()),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
-            windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
-            windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
-            560,
-            330,
+            style,
+            owner_rect.left + (owner_rect.right - owner_rect.left - window_w) / 2,
+            owner_rect.top + (owner_rect.bottom - owner_rect.top - window_h) / 2,
+            window_w,
+            window_h,
             owner,
             None,
             None,
@@ -757,6 +1142,13 @@ pub(crate) fn edit_image_properties(
         true,
     )?;
     let _ = (cancel, apply);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(
+            dialog,
+            Some(set_dialog_font),
+            LPARAM(font.0.0 as isize),
+        );
+    }
 
     let ratio = match (properties.width, properties.height) {
         (Some(w), Some(h)) if h > 0 => Some(f64::from(w) / f64::from(h)),
@@ -812,4 +1204,92 @@ pub(crate) fn edit_image_properties(
         let _ = SetFocus(owner);
     }
     Ok(state.result.clone())
+}
+
+unsafe extern "system" fn set_dialog_font(
+    hwnd: HWND,
+    font: LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    unsafe {
+        SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+    }
+    windows::Win32::Foundation::BOOL(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partially_visible_image_borders_are_clipped_to_the_surface() {
+        let viewport = child_rect(400, 300, 800, 600);
+        assert!(intersect_rect(child_rect(400, 240, 320, 4), viewport).is_none());
+        let side = intersect_rect(child_rect(400, 240, 4, 150), viewport)
+            .expect("the visible side intersects the viewport");
+        assert_eq!((side.top, side.bottom), (300, 390));
+        assert!(intersect_rect(child_rect(400, 100, 320, 150), viewport).is_none());
+    }
+
+    #[test]
+    fn inspector_stays_inside_narrow_and_short_viewports_at_all_dpis() {
+        for dpi in [96, 120, 144, 192] {
+            for width in [1, 100, 250, 640, 1200] {
+                for height in [1, 100, 600] {
+                    let viewport = child_rect(400, 120, width, height);
+                    let image = child_rect(500, 250, 160, 120);
+                    let panel =
+                        inspector_panel_rect(image, viewport, WindowMetrics::new(0, 0, dpi));
+                    assert!(panel.left >= viewport.left && panel.right <= viewport.right);
+                    assert!(panel.top >= viewport.top && panel.bottom <= viewport.bottom);
+                    assert!(panel.right > panel.left && panel.bottom > panel.top);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inspector_tracks_image_above_with_a_dpi_scaled_gap() {
+        for dpi in [96, 120, 144, 192] {
+            let metrics = WindowMetrics::new(0, 0, dpi);
+            let viewport = child_rect(100, 100, 1800, 1500);
+            let image = child_rect(300, 600, 200, 180);
+            let panel = inspector_panel_rect(image, viewport, metrics);
+            assert_eq!(panel.left, image.left);
+            assert_eq!(panel.bottom, image.top - metrics.px(8.0));
+            assert_eq!(panel.right - panel.left, metrics.px(640.0));
+            let scrolled = child_rect(image.left, image.top - 80, 200, 180);
+            let moved = inspector_panel_rect(scrolled, viewport, metrics);
+            assert_eq!(moved.top, panel.top - 80);
+            assert_eq!(moved.bottom, panel.bottom - 80);
+        }
+    }
+
+    #[test]
+    fn inspector_avoids_top_and_right_edges() {
+        for dpi in [96, 120, 144, 192] {
+            let metrics = WindowMetrics::new(0, 0, dpi);
+            let viewport = child_rect(100, 100, 1000, 700);
+            let image = child_rect(980, 80, 100, 160);
+            let panel = inspector_panel_rect(image, viewport, metrics);
+            assert_eq!(panel.top, viewport.top + metrics.px(2.0));
+            assert_eq!(panel.right, viewport.right - metrics.px(6.0));
+            assert!(panel.left >= viewport.left);
+            assert!(panel.bottom <= viewport.bottom);
+        }
+    }
+
+    #[test]
+    fn inspector_shadow_fits_viewport() {
+        for dpi in [96, 120, 144, 192] {
+            let metrics = WindowMetrics::new(0, 0, dpi);
+            for width in [100, 250, 640, 1200] {
+                let viewport = child_rect(100, 100, metrics.px(width as f32), metrics.px(300.0));
+                let image = child_rect(viewport.right - 30, viewport.bottom + 100, 100, 160);
+                let panel = inspector_panel_rect(image, viewport, metrics);
+                assert!(panel.right + metrics.px(4.0) <= viewport.right);
+                assert!(panel.bottom + metrics.px(4.0) <= viewport.bottom);
+                assert!(panel.left >= viewport.left && panel.top >= viewport.top);
+            }
+        }
+    }
 }

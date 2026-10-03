@@ -127,6 +127,46 @@ impl EditorDocument {
 
     /// The inspector captures a revision and exact image range. Reject stale
     /// requests instead of changing a different image after intervening input.
+    pub fn update_image_source(
+        &mut self,
+        current: &ImageProperties,
+        replacement: &str,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        if self.composition().is_some() {
+            return Err(EditorDocumentError::CompositionActive);
+        }
+        if current.revision != self.revision()
+            || self.image_properties(current.source).is_none()
+            || replacement.contains(['\r', '\n'])
+        {
+            return Err(EditorDocumentError::InvalidImageProperties);
+        }
+        let snapshot = self.snapshot();
+        let start = current.source.start().get() as usize;
+        let end = current.source.end().get() as usize;
+        if snapshot.as_str().get(start..end) == Some(replacement) {
+            return Ok(self.command_result(false));
+        }
+        let mut candidate = snapshot.as_str().to_owned();
+        candidate.replace_range(start..end, replacement);
+        let candidate = Self::new(candidate);
+        let valid = candidate.image_references()?.into_iter().any(|image| {
+            image.source.start() == current.source.start()
+                && image.source.end().get()
+                    == current.source.start().get() + replacement.len() as u64
+        });
+        if !valid {
+            return Err(EditorDocumentError::InvalidImageProperties);
+        }
+        self.state.history.break_group();
+        self.apply_transaction(&Transaction::new(
+            self.revision(),
+            [Edit::new(current.source, replacement)],
+        ))?;
+        self.state.history.break_group();
+        Ok(self.command_result(true))
+    }
+
     pub fn update_image_properties(
         &mut self,
         desired: &ImageProperties,

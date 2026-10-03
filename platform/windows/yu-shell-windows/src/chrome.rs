@@ -55,9 +55,22 @@ fn error(error: impl std::fmt::Display) -> ShellError {
     ShellError::Platform(error.to_string())
 }
 
-struct Font(HFONT);
+pub(crate) struct Font(pub(crate) HFONT);
 impl Font {
-    fn for_dpi(dpi: u32, size: f32, bold: bool, locale: Locale) -> Result<Self, ShellError> {
+    pub(crate) fn for_dpi(
+        dpi: u32,
+        size: f32,
+        bold: bool,
+        locale: Locale,
+    ) -> Result<Self, ShellError> {
+        Self::for_family(dpi, size, bold, ui_font_family(locale))
+    }
+
+    pub(crate) fn monospace(dpi: u32, size: f32) -> Result<Self, ShellError> {
+        Self::for_family(dpi, size, false, "Consolas")
+    }
+
+    fn for_family(dpi: u32, size: f32, bold: bool, family: &str) -> Result<Self, ShellError> {
         let mut metrics = NONCLIENTMETRICSW {
             cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
             ..Default::default()
@@ -78,11 +91,7 @@ impl Font {
         font.lfHeight = -(size * dpi as f32 / 96.0 * scale).round() as i32;
         font.lfWeight = if bold { 600 } else { 400 };
         font.lfFaceName.fill(0);
-        for (target, unit) in font
-            .lfFaceName
-            .iter_mut()
-            .zip(ui_font_family(locale).encode_utf16())
-        {
+        for (target, unit) in font.lfFaceName.iter_mut().zip(family.encode_utf16()) {
             *target = unit;
         }
         let handle = unsafe { CreateFontIndirectW(&font) };
@@ -99,9 +108,9 @@ impl Drop for Font {
         }
     }
 }
-struct Brush(HBRUSH);
+pub(crate) struct Brush(pub(crate) HBRUSH);
 impl Brush {
-    fn new(color: COLORREF) -> Self {
+    pub(crate) fn new(color: COLORREF) -> Self {
         Self(unsafe { CreateSolidBrush(color) })
     }
 }
@@ -874,10 +883,10 @@ impl Chrome {
             for (index, button) in self.menu_buttons.iter().enumerate() {
                 let _ = MoveWindow(
                     *button,
-                    padding + metrics.px(68.0) * index as i32,
-                    metrics.px(6.0),
-                    metrics.px(64.0),
-                    metrics.px(28.0),
+                    padding + metrics.px(52.0) * index as i32,
+                    metrics.px(3.0),
+                    metrics.px(48.0),
+                    metrics.px(26.0),
                     true,
                 );
             }
@@ -1155,6 +1164,7 @@ impl Chrome {
                     round_fill(item.hDC, &rect, px(6), self.palette.hover.0);
                 }
                 flags |= DT_CENTER;
+                text_color = self.palette.muted;
                 self.menu_text[index].clone()
             } else if hwnd == self.search_background {
                 FillRect(item.hDC, &rect, self.palette.input.0);
@@ -1288,7 +1298,7 @@ fn menu_label(text: &str) -> String {
 }
 
 pub(crate) fn menu_height(metrics: WindowMetrics) -> i32 {
-    metrics.px(40.0)
+    metrics.px(32.0)
 }
 
 fn search_step(locale: Locale, forward: bool) -> &'static str {
@@ -1325,7 +1335,7 @@ pub(crate) fn search_height(metrics: WindowMetrics, visible: bool) -> i32 {
     }
 }
 
-fn pointer_inside(hwnd: HWND) -> bool {
+pub(crate) fn pointer_inside(hwnd: HWND) -> bool {
     let mut point = POINT::default();
     let mut rect = RECT::default();
     let valid = unsafe {
@@ -1357,7 +1367,7 @@ unsafe extern "system" fn overlay_subclass(
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
-unsafe extern "system" fn tab_subclass(
+pub(crate) unsafe extern "system" fn tab_subclass(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -1433,7 +1443,7 @@ pub(crate) fn ui_font_family(locale: Locale) -> &'static str {
     }
 }
 
-unsafe fn round_fill(dc: HDC, rect: &RECT, radius: i32, brush: HBRUSH) {
+pub(crate) unsafe fn round_fill(dc: HDC, rect: &RECT, radius: i32, brush: HBRUSH) {
     unsafe {
         let region = CreateRoundRectRgn(
             rect.left,
