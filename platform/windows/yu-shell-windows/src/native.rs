@@ -35,6 +35,11 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT};
 use windows::Win32::UI::Accessibility::{UiaRect, UiaReturnRawElementProvider};
+use windows::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_ENABLESIZING, OFN_EXPLORER,
+    OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, SetScrollInfo, ShowScrollBar,
 };
@@ -99,9 +104,9 @@ use crate::chrome::{
     menu_height, search_height, sidebar_width,
 };
 use crate::image_interaction::{
-    ID_IMAGE_ALT, ID_IMAGE_DESTINATION, ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE,
-    ImageInspector, ImageInteractionState, ImagePropertyDraft, ImageScalePreset,
-    edit_image_properties, is_inspector_control,
+    ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE, ID_IMAGE_SOURCE, ImageInspector,
+    ImageInteractionState, ImagePropertyDraft, ImageScalePreset, edit_image_properties,
+    is_inspector_control,
 };
 use crate::resources::ResourceHost;
 use crate::text_input::{
@@ -135,6 +140,7 @@ const ID_IMAGE_CONTEXT_COPY: u16 = 3004;
 const ID_IMAGE_CONTEXT_COPY_ADDRESS: u16 = 3005;
 const ID_IMAGE_CONTEXT_PROPERTIES: u16 = 3006;
 const ID_IMAGE_CONTEXT_SOURCE: u16 = 3007;
+const ID_IMAGE_CONTEXT_EXPORT: u16 = 3008;
 const ID_IMAGE_SCALE_25: u16 = 3025;
 const ID_IMAGE_SCALE_33: u16 = 3033;
 const ID_IMAGE_SCALE_50: u16 = 3050;
@@ -632,7 +638,7 @@ impl AppWindow {
         self.create_children()
             .map_err(|error| startup_error("create child windows", error))?;
         self.image_inspector = Some(
-            ImageInspector::new(self.hwnd, self.state.strings())
+            ImageInspector::new(self.hwnd, self.state.locale())
                 .map_err(|error| startup_error("create image inspector", error))?,
         );
         self.accessibility = Some(AccessibilityHost::new(self.surface));
@@ -2003,7 +2009,23 @@ impl AppWindow {
             return;
         }
         if let Some(inspector) = self.image_inspector.as_mut() {
-            inspector.present(&selected, image, viewport_rect, self.state.metrics());
+            let metrics = self.state.metrics();
+            let inspector_bounds = RECT {
+                left: viewport_rect.left,
+                right: viewport_rect.right,
+                top: menu_height(metrics)
+                    + search_height(metrics, self.state.search_visible())
+                    + metrics.px(4.0),
+                bottom: viewport_rect.bottom,
+            };
+            inspector.present(
+                &selected,
+                image,
+                viewport_rect,
+                inspector_bounds,
+                metrics,
+                (self.state.appearance(), self.contrast),
+            );
         }
     }
 
@@ -2053,22 +2075,50 @@ impl AppWindow {
         Ok(())
     }
 
-    fn commit_image_inspector_fields(&mut self) -> Result<(), ShellError> {
+    fn commit_image_source(&mut self) -> Result<(), ShellError> {
         let Some(selected) = self.selected_image.clone() else {
             return Ok(());
         };
-        let Some(inspector) = self.image_inspector.as_ref() else {
+        let Some(source_text) = self
+            .image_inspector
+            .as_ref()
+            .and_then(ImageInspector::source_text)
+        else {
             return Ok(());
         };
-        let destination = inspector.destination();
-        let alternative = inspector.alternative();
-        if destination.trim().is_empty() {
+        if source_text == selected.source_text {
             return Ok(());
         }
-        let mut desired = selected.properties;
-        desired.alternative = alternative;
-        desired.destination = canonical_image_destination(&destination)?;
-        self.apply_image_properties(desired)
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let result = self
+            .state
+            .document_mut()
+            .session_mut()
+            .document_mut()
+            .editor_mut()
+            .update_image_source(&selected.properties, &source_text)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.refresh_chrome();
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, result.changed())?;
+        let reference = self
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .image_references()
+            .map_err(|error| ShellError::Platform(error.to_string()))?
+            .into_iter()
+            .find(|image| image.source.start() == selected.source.start());
+        if let Some(reference) = reference
+            && let Some(bounds) = self.image_bounds_for_source(reference.source)
+        {
+            self.selected_image = self.image_interaction_state(reference.source, bounds)?;
+            self.sync_image_inspector();
+        }
+        Ok(())
     }
 
     fn edit_selected_image_properties(&mut self) -> Result<(), ShellError> {
@@ -2077,7 +2127,7 @@ impl AppWindow {
         };
         let draft = edit_image_properties(
             self.hwnd,
-            self.state.strings(),
+            self.state.locale(),
             &selected.properties,
             &selected.displayed_destination,
             selected.intrinsic,
@@ -2106,7 +2156,11 @@ impl AppWindow {
         let Some(selected) = self.selected_image.clone() else {
             return Ok(());
         };
-        let Some(path) = open_image_dialog(self.hwnd)? else {
+        let path = open_image_dialog(self.hwnd)?;
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
+        let Some(path) = path else {
             return Ok(());
         };
         let destination =
@@ -2183,6 +2237,9 @@ impl AppWindow {
             .session_mut()
             .set_selection(selection)?;
         self.dismiss_image_interaction();
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
         self.render_current()?;
         if let Some(tsf) = self.tsf.as_ref() {
             tsf.notify_selection_change();
@@ -2213,15 +2270,52 @@ impl AppWindow {
         Ok(())
     }
 
+    fn export_selected_image(&self) -> Result<(), ShellError> {
+        let Some(source) = self.selected_local_image_path() else {
+            return Ok(());
+        };
+        let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = source.extension().unwrap_or_default().to_string_lossy();
+        let copy_name = source.with_file_name(if extension.is_empty() {
+            format!("{stem}-copy")
+        } else {
+            format!("{stem}-copy.{extension}")
+        });
+        let destination = native_image_file_dialog(self.hwnd, Some(&copy_name))?;
+        unsafe {
+            let _ = SetFocus(self.surface);
+        }
+        let Some(destination) = destination else {
+            return Ok(());
+        };
+        if let Ok(original) = std::fs::canonicalize(&source)
+            && std::fs::canonicalize(&destination).ok().as_ref() == Some(&original)
+        {
+            return Ok(());
+        }
+        std::fs::copy(&source, &destination)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        Ok(())
+    }
+
     fn reveal_selected_image(&self) -> Result<(), ShellError> {
         let Some(path) = self.selected_local_image_path() else {
             return Ok(());
         };
-        std::process::Command::new("explorer.exe")
-            .arg(format!("/select,{}", path.display()))
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| ShellError::Platform(error.to_string()))
+        let path = path.components().collect::<PathBuf>();
+        let path = wide(path.to_string_lossy().as_ref());
+        let item = unsafe { windows::Win32::UI::Shell::ILCreateFromPathW(PCWSTR(path.as_ptr())) };
+        if item.is_null() {
+            return Err(ShellError::Platform(
+                "Windows could not locate the image".into(),
+            ));
+        }
+        let result =
+            unsafe { windows::Win32::UI::Shell::SHOpenFolderAndSelectItems(item, None, 0) };
+        unsafe {
+            CoTaskMemFree(Some(item.cast()));
+        }
+        result.map_err(platform_error)
     }
 
     fn copy_selected_image_address(&self) -> Result<(), ShellError> {
@@ -2249,6 +2343,7 @@ impl AppWindow {
             ID_IMAGE_CONTEXT_OPEN => self.open_selected_image(),
             ID_IMAGE_CONTEXT_REVEAL => self.reveal_selected_image(),
             ID_IMAGE_CONTEXT_COPY => self.copy_selected_image(),
+            ID_IMAGE_CONTEXT_EXPORT => self.export_selected_image(),
             ID_IMAGE_CONTEXT_COPY_ADDRESS => self.copy_selected_image_address(),
             ID_IMAGE_CONTEXT_PROPERTIES => self.edit_selected_image_properties(),
             ID_IMAGE_CONTEXT_SOURCE => self.edit_selected_image_source(),
@@ -2271,6 +2366,11 @@ impl AppWindow {
             .selected_image
             .as_ref()
             .is_some_and(|selected| selected.intrinsic.is_some());
+        let selected_percent = self.selected_image.as_ref().and_then(|selected| {
+            selected.intrinsic.map(|intrinsic| {
+                (selected.document_bounds.width() / intrinsic.width() as f32 * 100.0).round() as u32
+            })
+        });
         for (id, percent) in [
             (ID_IMAGE_SCALE_25, 25),
             (ID_IMAGE_SCALE_33, 33),
@@ -2281,14 +2381,22 @@ impl AppWindow {
             (ID_IMAGE_SCALE_150, 150),
             (ID_IMAGE_SCALE_200, 200),
         ] {
+            if matches!(percent, 100 | 150) {
+                unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
+                    .map_err(platform_error)?;
+            }
             let text = wide(&format!("{percent}%"));
             unsafe {
                 AppendMenuW(
                     menu,
-                    if has_intrinsic {
+                    (if has_intrinsic {
                         MF_STRING
                     } else {
                         MF_STRING | MF_GRAYED
+                    }) | if selected_percent == Some(percent) {
+                        windows::Win32::UI::WindowsAndMessaging::MF_CHECKED
+                    } else {
+                        windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS(0)
                     },
                     usize::from(id),
                     PCWSTR(text.as_ptr()),
@@ -2343,6 +2451,11 @@ impl AppWindow {
                 append_string(menu.0, ID_IMAGE_CONTEXT_OPEN, strings.open_image())?;
                 append_string(menu.0, ID_IMAGE_CONTEXT_REVEAL, strings.show_in_explorer())?;
                 append_string(menu.0, ID_IMAGE_CONTEXT_COPY, strings.copy_image())?;
+                append_string(
+                    menu.0,
+                    ID_IMAGE_CONTEXT_EXPORT,
+                    export_image_label(self.state.locale()),
+                )?;
             }
         }
         unsafe {
@@ -2395,8 +2508,8 @@ impl AppWindow {
         notification: u16,
     ) -> Result<(), ShellError> {
         match command {
-            ID_IMAGE_ALT | ID_IMAGE_DESTINATION if u32::from(notification) == EN_KILLFOCUS => {
-                self.commit_image_inspector_fields()
+            ID_IMAGE_SOURCE if u32::from(notification) == EN_KILLFOCUS => {
+                self.commit_image_source()
             }
             ID_IMAGE_REPLACE => self.replace_selected_image(),
             ID_IMAGE_SIZE | ID_IMAGE_MORE => {
@@ -2607,7 +2720,7 @@ impl AppWindow {
         let surface_y = menu_height(metrics)
             + find_h
             + metrics
-                .px(spec.top)
+                .px(spec.top.max(48.0))
                 .min((content_h - find_h - 1).max(0) / 4);
         let bottom = metrics.px(16.0).min((content_h - 1) / 4);
         let surface_h = (content_h - surface_y - bottom).max(1);
@@ -2650,6 +2763,22 @@ impl AppWindow {
         });
         unsafe {
             let dark_value = BOOL::from(dark);
+            let caption_color = crate::contrast::colorref(self.contrast.map_or_else(
+                || {
+                    if dark {
+                        yu_scene::Rgba8::new(35, 37, 41, 255)
+                    } else {
+                        yu_scene::Rgba8::new(247, 248, 250, 255)
+                    }
+                },
+                |colors| colors.background,
+            ));
+            let _ = DwmSetWindowAttribute(
+                self.hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_CAPTION_COLOR,
+                ptr::from_ref(&caption_color).cast(),
+                size_of_val(&caption_color) as u32,
+            );
             let _ = DwmSetWindowAttribute(
                 self.hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -3002,6 +3131,16 @@ impl AppWindow {
     }
 
     fn save_current(&mut self, force_save_as: bool) -> Result<(), ShellError> {
+        let source_focused = self
+            .image_inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.is_source(unsafe { GetFocus() }));
+        self.commit_image_source()?;
+        if source_focused {
+            unsafe {
+                let _ = SetFocus(self.surface);
+            }
+        }
         if force_save_as {
             if let Some(path) = save_file_dialog(self.hwnd, self.state.document())? {
                 self.state.document_mut().save_as(path, true)?;
@@ -3021,6 +3160,7 @@ impl AppWindow {
     }
 
     fn confirm_replace_current(&mut self) -> Result<bool, ShellError> {
+        self.commit_image_source()?;
         match self.state.document_mut().close_request()? {
             CloseRequest::CloseNow => Ok(true),
             CloseRequest::AlreadyClosed => Ok(true),
@@ -3351,6 +3491,21 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                     true
                 }
                 WM_KEYDOWN
+                    if message.wParam.0 == VK_RETURN.0 as usize
+                        && app
+                            .image_inspector
+                            .as_ref()
+                            .is_some_and(|inspector| inspector.is_source(message.hwnd)) =>
+                {
+                    match app.commit_image_source() {
+                        Ok(()) => unsafe {
+                            let _ = SetFocus(app.surface);
+                        },
+                        Err(error) => show_error(hwnd, &app.state, &error),
+                    }
+                    true
+                }
+                WM_KEYDOWN
                     if app.chrome.as_ref().is_some_and(|chrome| {
                         message.hwnd == chrome.query || message.hwnd == chrome.list
                     }) && message.wParam.0 == VK_RETURN.0 as usize
@@ -3379,8 +3534,13 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                                 as usize
                         && !app.chrome.as_ref().is_some_and(|chrome| {
                             message.hwnd == chrome.query && chrome.query_is_composing()
-                        }) =>
+                        })
+                        && !app
+                            .image_inspector
+                            .as_ref()
+                            .is_some_and(|inspector| inspector.is_composing(message.hwnd)) =>
                 {
+                    app.dismiss_image_interaction();
                     if app.state.search_visible()
                         && let Err(error) = app.handle_chrome_command(ID_SEARCH_CLOSE, 0)
                     {
@@ -3591,6 +3751,14 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                if let Some(result) = app.image_inspector.as_ref().and_then(|inspector| {
+                    inspector.control_color(
+                        windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _),
+                        HWND(lparam.0 as *mut _),
+                    )
+                }) {
+                    return result;
+                }
                 if let Some(result) = app.chrome.as_ref().and_then(|chrome| {
                     chrome.control_color(
                         windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _),
@@ -4005,18 +4173,91 @@ fn open_file_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {
 }
 
 fn open_image_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {
-    let dialog: IFileOpenDialog =
-        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
-            .map_err(platform_error)?;
-    unsafe {
-        let options = dialog.GetOptions().map_err(platform_error)?
-            | FOS_FORCEFILESYSTEM
-            | FOS_FILEMUSTEXIST
-            | FOS_PATHMUSTEXIST;
-        dialog.SetOptions(options).map_err(platform_error)?;
-        set_image_filter(&dialog)?;
+    native_image_file_dialog(owner, None)
+}
+
+fn export_image_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "Save image copy as…",
+        Locale::SimplifiedChinese => "复制图片到…",
+        Locale::TraditionalChinese => "複製圖片到…",
+        Locale::Japanese => "画像のコピーを保存…",
+        Locale::Korean => "이미지 복사본 저장…",
     }
-    show_file_dialog(owner, &dialog)
+}
+
+fn native_image_file_dialog(
+    owner: HWND,
+    save_name: Option<&Path>,
+) -> Result<Option<PathBuf>, ShellError> {
+    let filter = wide("Images\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg\0All files\0*.*\0");
+    let mut buffer = vec![0_u16; 32768];
+    let directory = save_name
+        .and_then(Path::parent)
+        .map(|parent| parent.components().collect::<PathBuf>())
+        .map(|parent| {
+            parent
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        });
+    let extension = save_name
+        .and_then(Path::extension)
+        .map(|extension| extension.encode_wide().chain(Some(0)).collect::<Vec<_>>());
+    if let Some(name) = save_name.and_then(Path::file_name) {
+        for (target, unit) in buffer.iter_mut().take(32767).zip(name.encode_wide()) {
+            *target = unit;
+        }
+    }
+    let mut request = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrInitialDir: directory
+            .as_ref()
+            .map_or(PCWSTR::null(), |directory| PCWSTR(directory.as_ptr())),
+        lpstrDefExt: extension
+            .as_ref()
+            .map_or(PCWSTR::null(), |extension| PCWSTR(extension.as_ptr())),
+        nFilterIndex: 1,
+        lpstrFile: windows::core::PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        Flags: OFN_EXPLORER
+            | OFN_ENABLESIZING
+            | OFN_HIDEREADONLY
+            | OFN_NOCHANGEDIR
+            | OFN_PATHMUSTEXIST
+            | if save_name.is_some() {
+                OFN_OVERWRITEPROMPT
+            } else {
+                OFN_FILEMUSTEXIST
+            },
+        ..Default::default()
+    };
+    let accepted = unsafe {
+        if save_name.is_some() {
+            GetSaveFileNameW(&mut request)
+        } else {
+            GetOpenFileNameW(&mut request)
+        }
+    }
+    .as_bool();
+    if !accepted {
+        let error = unsafe { CommDlgExtendedError() }.0;
+        return if error == 0 {
+            Ok(None)
+        } else {
+            Err(ShellError::Platform(format!(
+                "Native image dialog failed: {error:#x}"
+            )))
+        };
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    Ok(Some(PathBuf::from(OsString::from_wide(&buffer[..length]))))
 }
 
 fn save_file_dialog(owner: HWND, document: &DocumentSlot) -> Result<Option<PathBuf>, ShellError> {
@@ -4060,29 +4301,6 @@ where
     let dialog: IFileDialog = dialog.cast().map_err(platform_error)?;
     let name = wide("Markdown (*.md;*.markdown)");
     let pattern = wide("*.md;*.markdown");
-    let all_name = wide("All files (*.*)");
-    let all_pattern = wide("*.*");
-    let filters = [
-        COMDLG_FILTERSPEC {
-            pszName: PCWSTR(name.as_ptr()),
-            pszSpec: PCWSTR(pattern.as_ptr()),
-        },
-        COMDLG_FILTERSPEC {
-            pszName: PCWSTR(all_name.as_ptr()),
-            pszSpec: PCWSTR(all_pattern.as_ptr()),
-        },
-    ];
-    unsafe { dialog.SetFileTypes(&filters) }.map_err(platform_error)
-}
-
-unsafe fn set_image_filter<D>(dialog: &D) -> Result<(), ShellError>
-where
-    D: windows::core::Interface,
-{
-    use windows::Win32::UI::Shell::IFileDialog;
-    let dialog: IFileDialog = dialog.cast().map_err(platform_error)?;
-    let name = wide("Images (*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg)");
-    let pattern = wide("*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg");
     let all_name = wide("All files (*.*)");
     let all_pattern = wide("*.*");
     let filters = [
