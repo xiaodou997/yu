@@ -51,7 +51,10 @@ if ($Smoke) {
         Invoke-InstallerProcess (Join-Path $app 'Yu.exe') '--window-self-check'
         Invoke-ReleaseTool 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-Mta','-File',(Join-Path $PSScriptRoot 'verify-accessibility.ps1'),'-Executable',(Join-Path $app 'Yu.exe'),'-OutputDirectory',(Join-Path $test 'uia-client')) (Join-Path $test 'uia.log')
         $uia = Get-Content -LiteralPath (Join-Path $test 'uia-client/results.json') -Encoding UTF8 -Raw | ConvertFrom-Json
-        if ($uia.status -ne 'PASS' -or $uia.cases.Count -ne 38) { throw 'Installed UIA smoke failed.' }
+        # The UIA suite grows with native controls. Verify its successful result
+        # and the installed executable identity instead of an obsolete case count.
+        $installedHash = (Get-FileHash -LiteralPath (Join-Path $app 'Yu.exe')).Hash
+        if ($uia.status -ne 'PASS' -or @($uia.cases).Count -eq 0 -or $uia.sha256 -ne $installedHash) { throw 'Installed UIA smoke failed.' }
         $result.uia_cases = $uia.cases.Count
         $result.native_dpi = $uia.native_dpi
         $result.renderer = @(Test-ReleaseRenderer $app)
