@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! CPU resource preparation. COM objects stay on their owning worker thread.
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;

@@ -5264,7 +5264,7 @@ mod tests {
     #[test]
     fn native_sidebar_navigation_reveals_unicode_search_without_editing_source() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            GW_CHILD, GetWindow, LB_GETCOUNT, SendMessageW,
+            GW_HWNDNEXT, GetWindow, LB_GETCOUNT, SendMessageW,
         };
         let _com = ComApartment::initialize().expect("COM");
         register_classes().expect("classes");
@@ -5299,11 +5299,20 @@ mod tests {
         });
         app.initialize(window.0)
             .expect("native chrome / render / TSF");
-        assert_eq!(
-            unsafe { GetWindow(app.hwnd, GW_CHILD) }.expect("top child"),
-            app.surface,
-            "background canvas must not obscure the GPU surface"
-        );
+        // Scrollbars and status controls intentionally sit above the surface.
+        // The full-client canvas must remain below it in sibling Z order.
+        let canvas = app.chrome.as_ref().expect("chrome").canvas;
+        let mut sibling = app.surface;
+        loop {
+            sibling = unsafe { GetWindow(sibling, GW_HWNDNEXT) }.expect("next sibling");
+            assert!(
+                !sibling.is_invalid(),
+                "background canvas must remain below the GPU surface"
+            );
+            if sibling == canvas {
+                break;
+            }
+        }
         let revision = app.state.document().session().revision();
         app.handle_chrome_command(ID_OUTLINE, 0)
             .expect("outline tab");

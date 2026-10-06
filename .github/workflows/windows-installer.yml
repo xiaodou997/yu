@@ -1,0 +1,38 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - run: ./tools/release-windows.ps1 -OutputDirectory artifacts/windows-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yu-windows-x64-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            artifacts/windows-release/*-setup.exe
+            artifacts/windows-release/*.zip
+            artifacts/windows-release/SHA256SUMS.txt
+            artifacts/windows-release/*manifest.json
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-diagnostics
+          if-no-files-found: ignore
+          path: |
+            artifacts/windows-release/*.log
+            artifacts/windows-release/*.json

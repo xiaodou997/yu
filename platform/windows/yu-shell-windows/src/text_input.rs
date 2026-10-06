@@ -452,6 +452,40 @@ mod tests {
         yu_text::TextBuffer::new(text.to_owned()).snapshot()
     }
 
+    #[test]
+    fn canonical_ranges_preserve_emoji_boundaries() {
+        let source = snapshot("a🙂中");
+        let range =
+            canonical_acp_range_to_source(&source, AcpRange::new(1, 3).expect("test range"))
+                .expect("whole emoji");
+        assert_eq!(range.start().get(), 1);
+        assert_eq!(range.end().get(), 5);
+        assert!(
+            canonical_acp_range_to_source(&source, AcpRange::new(1, 2).expect("test range"))
+                .is_err()
+        );
+        assert!(
+            canonical_acp_range_to_source(&source, AcpRange::new(1, 5).expect("test range"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn local_preedit_replacement_keeps_unicode_and_utf16_caret() {
+        let range = AcpRange::new(1, 3).expect("test range");
+        let selection = local_selection_utf16("a🙂中", range).expect("local selection");
+        assert_eq!(selection.start().get(), 1);
+        assert_eq!(selection.end().get(), 3);
+        assert!(local_selection_utf16("a🙂中", AcpRange::new(1, 5).expect("test range")).is_err());
+        let (text, caret) = replace_local_utf16("a🙂中", range, "你好😀").expect("replace emoji");
+        assert_eq!(text, "a你好😀中");
+        assert_eq!(caret.start().get(), 5);
+        assert_eq!(caret.end().get(), 5);
+        assert!(
+            replace_local_utf16("a🙂中", AcpRange::new(1, 2).expect("test range"), "x").is_err()
+        );
+    }
+
     fn selection(snapshot: &TextSnapshot, anchor: u64, focus: u64) -> EditorSelection {
         EditorSelection::range(
             snapshot,

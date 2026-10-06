@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! UIA exposes immutable shared snapshots. Native mutations are marshalled to
 //! the owning HWND; no COM object keeps an AppWindow pointer.
 #![allow(non_snake_case, non_upper_case_globals)]

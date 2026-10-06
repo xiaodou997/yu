@@ -20,6 +20,9 @@ cd "$root"
 
 step() { printf "\n\033[1m▸ %s\033[0m\n" "$1" }
 
+step "Metal toolchain"
+tools/ensure-metal-toolchain.sh
+
 step "cargo fmt"
 cargo fmt --all --check
 
@@ -87,6 +90,7 @@ if [[ "${1:-}" == "--rust-only" ]]; then
 fi
 
 step "Windows 产品壳 self-check"
+printf "Windows 正式打包入口：./tools/release-windows.ps1 -OutputDirectory artifacts/windows-release\n"
 printf "当前主机不是 Windows，跳过执行；Windows CI 执行：./platform/windows/yu-shell-windows/run-self-checks.ps1\n"
 printf "Windows CI 的安装包门禁：./platform/windows/yu-shell-windows/build-package.ps1 -Profile Debug -Smoke -TestPipeline\n"
 printf "Windows CI 的便携 ZIP 门禁：./platform/windows/yu-shell-windows/build-package.ps1 -Channel GitHub -Profile Debug -Candidate -Smoke -TestPipeline -OutputDirectory artifacts/windows-github-ci\n"

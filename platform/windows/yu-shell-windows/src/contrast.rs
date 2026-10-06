@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! Native contrast facts; this module never changes system settings.
 use std::mem::size_of;
 use windows::Win32::Foundation::COLORREF;

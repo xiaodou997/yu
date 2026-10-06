@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! Native navigation chrome. Markdown labels and search ranges come from the
 //! shared editor; GDI here paints only controls, never the document surface.
 use crate::{Locale, ShellError, ShellState, SidebarMode, WindowMetrics};
@@ -250,7 +252,7 @@ impl Palette {
 
 pub(crate) struct Chrome {
     accessibility: IAccPropServices,
-    canvas: HWND,
+    pub(super) canvas: HWND,
     pub(crate) background: HWND,
     pub(crate) status: HWND,
     pub(crate) document_scrollbar: HWND,

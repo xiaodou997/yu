@@ -10,9 +10,8 @@ macOS、Windows 与 Linux 上提供低资源、低延迟的编辑体验。
 macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输入、窗口、Accessibility 等
 能力允许使用 Swift、Objective-C 或其他适合该平台的语言实现。
 
-> **发布状态：** macOS `0.1.2 (3)` 已提交 Mac App Store，正在等待审核，审核通过后手动上架；
-> Windows 版本随后处理，再创建版本标签和双平台 GitHub Release。
-> v1 已在 tag `v1-final` 冻结，完整状态保留在分支 `archive/v1-source-projection`。
+> **发布状态：** 正在准备 macOS 与 Windows 的双平台 GitHub Release。
+> 正式下载以 [GitHub Releases](https://github.com/xiaodou997/yu/releases) 中的附件为准。
 
 ## 支持与隐私
 
@@ -29,7 +28,7 @@ Yu 的技术本质是：
 
 它**不是** WebView Markdown 编辑器、富文本编辑器、HTML 编辑器或 Markdown 格式转换器。
 
-不可破坏的原则（完整表述见[核心不变量](docs/specs/invariants.md)）：
+核心设计原则：
 
 1. Markdown source 永远是唯一真源，不通过富文本模型往返序列化；
 2. 所有永久修改都经过 Transaction；
@@ -45,22 +44,11 @@ Yu 的技术本质是：
 中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民。不依赖 Chromium、DOM
 或常驻 JavaScript runtime。
 
-## 当前阶段
+## 平台状态
 
-v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 必须全绿。
-阶段定义与验收标准见[架构总览 v2 第 8 节](docs/architecture/overview-v2.md)。
-macOS 基础体验的真实窗口验收记录见 [macOS acceptance](docs/macos-acceptance.md)；
-Windows 第二平台的产品壳状态见 [Windows acceptance](docs/windows-acceptance.md)。
-
-| 阶段 | 内容 | 状态 |
-| --- | --- | --- |
-| S1 | 拆炸弹：删除 TextKit fallback 与诊断桥，帧调度移入 Rust，app 转正 | 已完成（Swift 行数目标未达成，见第 8 节） |
-| S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 已完成 |
-| S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 已完成 |
-| S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 已完成 |
-| S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 已完成 |
-| S6 | 语义 extension 化：每种语法收敛为一个 extension | 已完成 |
-| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 已进入发布阶段；Windows 原生壳、DirectWrite/D3D11 与 TSF/IME 编辑输入链已接入，辅助功能与发布收尾继续推进） |
+macOS 使用 Swift 原生产品壳与 Metal 渲染；Windows 使用 Win32 原生产品壳、
+DirectWrite/D3D11 和 TSF/IME 输入。两端共享 Rust 编辑器内核。
+Linux 目前只验证共享内核，尚未提供桌面安装包。
 
 ## 仓库结构
 
@@ -104,7 +92,7 @@ git clone git@github.com:xiaodou997/yu.git
 cd yu
 ```
 
-项目固定使用 Rust 1.97。构建 macOS 产品壳还需要 Xcode/Swift 工具链。
+项目固定使用 Rust 1.98.1。构建 macOS 产品壳还需要 Xcode/Swift 工具链。
 
 ## 本地验证
 
@@ -141,34 +129,35 @@ Swift 产品壳通过 `YuStorageFFI` C module 链接 Rust static library，因�
 > **改动 FFI 边界后请用 `run-self-checks.sh --clean-build`。** SwiftPM 的增量构建
 > 可能不会重编引用已删类型的文件，本地看到「构建通过」而 CI 的干净检出会失败。
 
-## 文档
+## Windows 安装包构建
 
-先读这两份，它们优先于代码和一切历史文档：
+在 Windows x64 电脑上安装 Git、Rust（MSVC 工具链）、Visual Studio Build Tools
+的 C++ 桌面开发组件与 Windows SDK，以及 Inno Setup 6 或 7。使用干净的 Git
+检出，在仓库根目录运行：
 
-- **[架构总览 v2](docs/architecture/overview-v2.md)** — 分层、依赖方向、组件决策、迭代阶段
-- **[核心不变量](docs/specs/invariants.md)** — 任何实现都不得违反的约束
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\release-windows.ps1
+```
 
-其他：
+脚本完成 Rust 检查、原生窗口与辅助功能自检，再生成 Release 构建并验证安装和卸载。
+也可在 GitHub Actions 手动运行 `Windows installer` 工作流，成功后下载
+`Yu-windows-x64-提交号` artifact，无需自备 Windows 构建电脑。
 
-- [坐标与位置](docs/specs/coordinates.md)
-- [ADR 规范](docs/adr/README.md) — 编号从 0001 重新开始
-- [v1 归档](docs/archive-v1/README.md) — 183 篇 v1 ADR 与设计文档，全部 superseded
+本地构建成功后会打印安装包完整路径，产物位于 `artifacts/releases/windows-时间戳/`：
 
-v1 时期的风险实验记录已随其他 v1 文档归档到
-[`docs/archive-v1/experiments/`](docs/archive-v1/experiments/)，其中的命令路径
-反映当时的目录结构。
+- `Yu-版本-windows-x64-setup.exe`：可直接运行的安装包；
+- `Yu-版本-windows-x64.zip`：便携版本；
+- `SHA256SUMS.txt`：文件校验和。
 
-个人笔记、临时调研和未整理草稿请放在本地 `.notes/`，该目录不会提交。
+安装器不需要管理员权限。当前 Windows 分发未签名，可能出现未知发布者提示。
+脚本任一步失败都停止，不会把失败产物标记成可发布版本。
 
 ## 贡献
 
-Yu 正在进行 v2 架构重构，协议和基础数据结构快速演进。提交实现前请先阅读
-[架构总览 v2](docs/architecture/overview-v2.md) 与[核心不变量](docs/specs/invariants.md)。
+欢迎通过 GitHub Issues 报告问题。修改编辑行为时应提供行为测试；修改增量算法时
+应验证结果与完整算法等价。提交前请运行本地验证，并检查对应平台的 CI 结果。
 
-- 新增编辑行为必须同时提供行为测试；
-- 增量算法必须提供与完整算法的等价性验证；
-- 违反不变量的改动会被拒绝，即使功能正确；
-- 不要为「实现了某功能」新增 ADR，规则见 [ADR 规范](docs/adr/README.md)。
+`docs/` 和 `.notes/` 用于本地开发资料，不纳入 Git 跟踪。
 
 ## License
 

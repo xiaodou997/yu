@@ -409,4 +409,4 @@ platform/macos/yu-shell-macos/record-instruments.sh \
 
 ## 正式发行
 
-第六组使用 [6A—6F 发行计划](../../../docs/architecture/mac-group6-release.md) 和 `python3 tools/release-macos.py`（从仓库根目录运行）。普通 `build-app.sh --release` 仍是 ad-hoc 开发构建；正式签名、公证与 DMG 由发行入口独立处理。
+正式发行使用 `python3 tools/release-macos.py`（从仓库根目录运行）。普通 `build-app.sh --release` 仍是 ad-hoc 开发构建；正式签名、公证与 DMG 由发行入口独立处理。

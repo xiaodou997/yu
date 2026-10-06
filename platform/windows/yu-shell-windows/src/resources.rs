@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! Bounded, revision-bound background resources for the native editor surface.
 use crate::ShellError;
 use std::collections::HashMap;
