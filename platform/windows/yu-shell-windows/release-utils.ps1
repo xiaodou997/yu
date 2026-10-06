@@ -128,13 +128,30 @@ function Export-CargoLicenses($Metadata, [string]$OutputDirectory, [string]$Root
     Copy-Item -LiteralPath (Join-Path $Root 'vendor/mermaid-rs-renderer/LICENSE') -Destination (Join-Path $OutputDirectory 'Mermaid-Vendored-MIT.txt')
 }
 
+function Start-ReleaseJsonProcess($Info) {
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    if ($Info.PSObject.Properties['StandardInputEncoding']) {
+        $Info.StandardInputEncoding = $utf8
+        return [Diagnostics.Process]::Start($Info)
+    }
+    # .NET Framework (Windows PowerShell 5) constructs an auto-flushing
+    # StreamWriter inside Process.Start, before callers can access BaseStream.
+    # Its encoding comes from Console.InputEncoding and may emit a BOM then.
+    $previous = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = $utf8
+        return [Diagnostics.Process]::Start($Info)
+    }
+    finally { [Console]::InputEncoding = $previous }
+}
+
 function Test-ReleaseRenderer([string]$Directory) {
     $helperInfo = New-Object Diagnostics.ProcessStartInfo
     $helperInfo.FileName = Join-Path $Directory 'yu-document-renderer.exe'
     $helperInfo.UseShellExecute = $false; $helperInfo.CreateNoWindow = $true
     $helperInfo.RedirectStandardInput = $true; $helperInfo.RedirectStandardOutput = $true
     $helperInfo.StandardOutputEncoding = New-Object Text.UTF8Encoding($false)
-    $helper = [Diagnostics.Process]::Start($helperInfo)
+    $helper = Start-ReleaseJsonProcess $helperInfo
     $rendered = @()
     try {
         foreach ($request in @(@{id=1;document=7;revision=1;kind='math';source='e^{i\pi}+1=0'},@{id=2;document=7;revision=1;kind='mermaid';source="flowchart LR`nA[Image] --> B[Math]"})) {

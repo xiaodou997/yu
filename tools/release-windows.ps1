@@ -1,6 +1,7 @@
 param(
     [string]$OutputDirectory,
-    [string]$CompilerPath = $env:YU_INNO_COMPILER
+    [string]$CompilerPath = $env:YU_INNO_COMPILER,
+    [switch]$PackageOnly
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -17,14 +18,20 @@ Push-Location $root
 try {
     $status = (git status --porcelain --untracked-files=normal | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $status) { throw 'Release requires a clean Git checkout.' }
-    cargo fmt --all --check
-    if ($LASTEXITCODE -ne 0) { throw 'Rust formatting failed.' }
-    cargo clippy --workspace --all-targets --locked -- -D warnings
-    if ($LASTEXITCODE -ne 0) { throw 'Rust clippy failed.' }
-    cargo test --workspace --locked
-    if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $shell 'run-self-checks.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'Windows native self-checks failed.' }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $shell 'test-release-encoding.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell JSON pipe regression failed.' }
+    # CI runs the development checks independently; packaging always exercises
+    # the actual optimized binaries, UIA, renderer, installation and uninstall.
+    if (-not $PackageOnly) {
+        cargo fmt --all --check
+        if ($LASTEXITCODE -ne 0) { throw 'Rust formatting failed.' }
+        cargo clippy --workspace --all-targets --locked -- -D warnings
+        if ($LASTEXITCODE -ne 0) { throw 'Rust clippy failed.' }
+        cargo test --workspace --locked
+        if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $shell 'run-self-checks.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'Windows native self-checks failed.' }
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $shell 'build-package.ps1') -Channel GitHub -Profile Release -Smoke -TestPipeline -OutputDirectory $OutputDirectory
     if ($LASTEXITCODE -ne 0) { throw 'Portable release build or verification failed.' }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $shell 'build-installer.ps1') -ReleaseDirectory $OutputDirectory -CompilerPath $CompilerPath -Smoke
