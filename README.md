@@ -10,8 +10,9 @@ macOS、Windows 与 Linux 上提供低资源、低延迟的编辑体验。
 macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输入、窗口、Accessibility 等
 能力允许使用 Swift、Objective-C 或其他适合该平台的语言实现。
 
-> **发布状态：** 正在准备 macOS 与 Windows 的双平台 GitHub Release。
-> 正式下载以 [GitHub Releases](https://github.com/xiaodou997/yu/releases) 中的附件为准。
+> **发布状态：** [v0.1.3](https://github.com/xiaodou997/yu/releases/tag/v0.1.3) 已发布。
+> 下载：[macOS Apple Silicon](https://github.com/xiaodou997/yu/releases/download/v0.1.3/Yu-0.1.3-4-arm64.dmg) · [Windows x64 安装包](https://github.com/xiaodou997/yu/releases/download/v0.1.3/Yu-0.1.3-windows-x64-setup.exe) · [Windows 便携版](https://github.com/xiaodou997/yu/releases/download/v0.1.3/Yu-0.1.3-windows-x64.zip)。
+> macOS 需要 26 或更新版本，已签名并经 Apple 公证；Windows 需要 Windows 10 2004 或更新版本，当前未签名。
 
 ## 支持与隐私
 
