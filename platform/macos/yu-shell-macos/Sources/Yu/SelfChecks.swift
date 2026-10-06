@@ -2932,7 +2932,7 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
         precondition(saved == Data([0xef, 0xbb, 0xbf]) + Data(changed.utf8))
         let cancelled = ImagePropertiesPanel(properties: restored, document: document,
             apply: { _ in preconditionFailure("cancel applied properties") }, finished: {})
-        let cancel = descendants(cancelled.window!.contentView!).compactMap { $0 as? NSButton }.first { $0.title == "取消" }!
+        let cancel = descendants(cancelled.window!.contentView!).compactMap { $0 as? NSButton }.first { $0.title == L10n.tr("Cancel") }!
         cancel.performClick(nil)
         precondition(reopened.source == changed)
         // Actual ImageIO failures and AppKit target/action, without posting
@@ -2962,7 +2962,7 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
         let failedStatus = try retryBridge.imageResourceStatus(retryProperties)
         precondition(failedStatus == UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED) && !failedFrame.resourceRetryPending)
         let retryItem = retryView.imageResourceMenuItem(at: 0)!
-        precondition(retryItem.title == "图片加载失败，重试" && retryView.validateMenuItem(retryItem))
+        precondition(retryItem.title == L10n.tr("Image failed to load — Retry") && retryView.validateMenuItem(retryItem))
         try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: root.appendingPathComponent("restored.png"))
         let retryMenu = NSMenu()
         retryMenu.addItem(retryItem)

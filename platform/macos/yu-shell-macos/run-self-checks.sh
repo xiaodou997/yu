@@ -107,6 +107,21 @@ for check in ${(ok)checks}; do
     fi
 done
 
+# Interaction tests must use translated labels on every supported language,
+# regardless of the development machine's preferred language.
+for language in en zh-Hans zh-Hant ja ko; do
+    for check in accessibility image-properties; do
+        printf "%-34s " "$check ($language)"
+        if output="$("$binary" "--$check-self-check" "${checks[$check]}" -AppleLanguages "($language)" 2>&1)"; then
+            print -r -- "OK"
+        else
+            print -r -- "FAILED"
+            print -r -- "$output" | sed 's/^/    /'
+            failed+=("$check ($language)")
+        fi
+    done
+done
+
 print -r -- ""
 if (( ${#failed} > 0 )); then
     print -r -- "${#failed} 个 self-check 失败: ${failed[*]}" >&2
