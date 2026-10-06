@@ -2420,13 +2420,25 @@ mod tests {
                 },
             )
             .expect("note render");
+            // Font metrics can wrap a label into separate SVG text nodes.
+            // Check the visible text across nodes, not an OS-specific layout.
+            let svg = roxmltree::Document::parse(&note.svg).expect("valid SVG");
+            let visible = svg
+                .descendants()
+                .filter(|node| {
+                    node.is_text() && node.ancestors().any(|parent| parent.has_tag_name("text"))
+                })
+                .filter_map(|node| node.text())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let visible = visible.split_whitespace().collect::<Vec<_>>().join(" ");
             for text in [
                 "First 中文",
                 "literal arrow",
                 "literal brace",
                 "not a directive",
             ] {
-                assert!(note.svg.contains(text), "missing {text}");
+                assert!(visible.contains(text), "missing {text}: {visible}");
             }
             assert!(
                 render_styled(

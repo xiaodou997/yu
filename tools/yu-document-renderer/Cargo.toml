@@ -22,5 +22,6 @@ serde_json = "1"
 workspace = true
 
 [dev-dependencies]
+roxmltree = "=0.21.1"
 yu-embedded-client = { path = "../../crates/yu-embedded-client" }
 yu-core = { path = "../../crates/yu-core" }

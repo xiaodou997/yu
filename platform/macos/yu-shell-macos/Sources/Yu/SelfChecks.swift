@@ -2340,7 +2340,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         precondition(openedLinkURLs.count == links.count)
         let linkMenus = links.map { textView.linkMenuItems(at: $0.node.labelRange.location) }
         for (link, items) in zip(links, linkMenus) {
-            precondition(items.map(\.title) == ["打开链接", "复制链接地址"])
+            precondition(items.map(\.title) == [L10n.tr("Open Link"), L10n.tr("Copy Link Address")])
             precondition(items.allSatisfy { textView.validateMenuItem($0) })
             precondition(NSApp.sendAction(items[0].action!, to: textView, from: items[0]))
             precondition(openedLinkURLs.last == link.accessibilityURL())
@@ -2879,7 +2879,7 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
             panel.window?.appearance = NSAppearance(named: appearance)
             let content = panel.window!.contentView!
             content.layoutSubtreeIfNeeded()
-            let right = button("应用").convert(button("应用").bounds, to: content).maxX
+            let right = button(L10n.tr("Apply")).convert(button(L10n.tr("Apply")).bounds, to: content).maxX
             precondition(abs(right - (content.bounds.maxX - 24)) < 1, "sheet actions must align to the trailing inset")
             precondition(field("destination").cell?.usesSingleLineMode == true)
         }
@@ -2888,12 +2888,12 @@ func runImagePropertiesSelfCheck(path: String) -> Never {
         try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: root.appendingPathComponent(replacementName))
         change("destination", replacementName)
         change("width", "0")
-        button("应用").performClick(nil)
+        button(L10n.tr("Apply")).performClick(nil)
         precondition(bridge.source == source && !finished)
         change("width", "128")
         precondition(field("height").stringValue == "128")
         change("alternative", "羽 <图>")
-        button("应用").performClick(nil)
+        button(L10n.tr("Apply")).performClick(nil)
         let changed = bridge.source
         precondition(finished && changed.contains("width=\"128\" height=\"128\""))
         precondition(changed.contains("alt=\"羽 &lt;图&gt;\""))

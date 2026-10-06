@@ -8,15 +8,7 @@ $ErrorActionPreference = 'Stop'
 $release = (Resolve-Path -LiteralPath $ReleaseDirectory).Path
 $audit = Get-Content -LiteralPath (Join-Path $release 'release-manifest.json') -Encoding UTF8 -Raw | ConvertFrom-Json
 if ($audit.channel -ne 'GitHub' -or $audit.format -ne 'portable-zip' -or $audit.signed) { throw 'Installer input must be a GitHub unsigned portable release.' }
-if (-not $CompilerPath) {
-    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($command) { $CompilerPath = $command.Source }
-    foreach ($directory in @((Join-Path $env:ProgramFiles 'Inno Setup 7'),(Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6'))) {
-        if (-not $CompilerPath -and (Test-Path -LiteralPath (Join-Path $directory 'ISCC.exe'))) { $CompilerPath = Join-Path $directory 'ISCC.exe' }
-    }
-}
-if (-not $CompilerPath -or -not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) { throw 'Inno Setup compiler not found; provide CompilerPath or YU_INNO_COMPILER.' }
-$compiler = (Resolve-Path -LiteralPath $CompilerPath).Path
+$compiler = Find-InnoCompiler $CompilerPath
 $payload = Join-Path $release 'installer-payload'
 if (Test-Path -LiteralPath $payload) { throw 'Installer output already exists; choose a fresh release directory.' }
 Invoke-ReleaseTool 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'verify-package.ps1'),'-ReleaseDirectory',$release) (Join-Path $release 'installer-input-verification.log')

@@ -8,21 +8,8 @@ $shell = Join-Path $root 'platform/windows/yu-shell-windows'
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $root ('artifacts/releases/windows-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))
 }
-if (-not $CompilerPath) {
-    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($command) { $CompilerPath = $command.Source }
-    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-        if (-not $base) { continue }
-        foreach ($version in @('7', '6')) {
-            $candidate = Join-Path $base "Inno Setup $version/ISCC.exe"
-            if (-not $CompilerPath -and (Test-Path -LiteralPath $candidate)) { $CompilerPath = $candidate }
-        }
-    }
-}
-if (-not $CompilerPath -or -not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) {
-    throw 'Install Inno Setup first, or provide -CompilerPath pointing to ISCC.exe.'
-}
-$CompilerPath = (Resolve-Path -LiteralPath $CompilerPath).Path
+. (Join-Path $shell 'release-utils.ps1')
+$CompilerPath = Find-InnoCompiler $CompilerPath
 if (Test-Path -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Yu.Editor.GitHub_is1') {
     throw 'Installer verification requires a Windows account without an existing Yu installation. Use a clean account or the GitHub Actions workflow.'
 }

@@ -1,4 +1,27 @@
 $ErrorActionPreference = 'Stop'
+function Find-InnoCompiler([string]$Path) {
+    # Prefer the installation over a Chocolatey PATH shim: license.txt and
+    # compiler version metadata must come from the actual Inno Setup directory.
+    $candidates = @()
+    if ($Path) { $candidates += $Path }
+    else {
+        foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not $base) { continue }
+            foreach ($version in @('7', '6')) {
+                $candidates += Join-Path $base "Inno Setup $version/ISCC.exe"
+            }
+        }
+        $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+        if ($command) { $candidates += $command.Source }
+    }
+    foreach ($candidate in $candidates) {
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path (Split-Path $candidate) 'license.txt') -PathType Leaf)) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    throw 'Inno Setup installation not found. Provide CompilerPath to the real ISCC.exe beside license.txt, not a PATH shim.'
+}
 function Read-CargoMetadata([string]$Root) {
     # Read UTF-8 directly; PowerShell 5's native pipeline uses the console code page.
     $info = New-Object Diagnostics.ProcessStartInfo
@@ -115,15 +138,19 @@ function Test-ReleaseRenderer([string]$Directory) {
     $rendered = @()
     try {
         foreach ($request in @(@{id=1;document=7;revision=1;kind='math';source='e^{i\pi}+1=0'},@{id=2;document=7;revision=1;kind='mermaid';source="flowchart LR`nA[Image] --> B[Math]"})) {
-            $helper.StandardInput.WriteLine(($request | ConvertTo-Json -Compress))
-            $helper.StandardInput.Flush()
+            # Write UTF-8 bytes directly: Windows PowerShell 5's redirected
+            # StreamWriter may emit a BOM, which is not JSON protocol data.
+            $requestBytes = [Text.Encoding]::UTF8.GetBytes(($request | ConvertTo-Json -Compress) + "`n")
+            $helper.StandardInput.BaseStream.Write($requestBytes, 0, $requestBytes.Length)
+            $helper.StandardInput.BaseStream.Flush()
             $responseTask = $helper.StandardOutput.ReadLineAsync()
             if (-not $responseTask.Wait(30000)) { throw 'Packaged renderer response timed out.' }
+            if ([string]::IsNullOrWhiteSpace($responseTask.Result)) { throw 'Packaged renderer closed stdout without a JSON response.' }
             $response = $responseTask.Result | ConvertFrom-Json
             if ($response.id -ne $request.id -or $response.document -ne 7 -or $response.revision -ne 1 -or $response.status -ne 'ready' -or $response.vector.width -le 0 -or $response.vector.height -le 0 -or -not $response.vector.svg.Contains('<svg')) { throw "Packaged renderer failed: $($request.kind)" }
             $rendered += @{kind=$request.kind; width=$response.vector.width; height=$response.vector.height; svg_bytes=[Text.Encoding]::UTF8.GetByteCount($response.vector.svg)}
         }
-        $helper.StandardInput.Close()
+        $helper.StandardInput.BaseStream.Close()
         if (-not $helper.WaitForExit(10000) -or $helper.ExitCode -ne 0) { throw 'Packaged renderer did not shut down successfully.' }
     }
     finally { if (-not $helper.HasExited) { $helper.Kill(); $helper.WaitForExit() }; $helper.Dispose() }
