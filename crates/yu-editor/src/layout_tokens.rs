@@ -287,6 +287,18 @@ pub fn code_block_background_rect(
     )?)
 }
 
+/// Height reserved above normal fenced-code content for native language/copy
+/// controls. Indented code and front matter keep their original compact box.
+#[must_use]
+pub fn fenced_code_toolbar_height(kind: BlockKind, config: LayoutConfig) -> f32 {
+    if matches!(kind, BlockKind::FencedCodeBlock { .. }) {
+        let spec = config.theme().spec();
+        22.0 * config.line_height() / spec.body_size
+    } else {
+        0.0
+    }
+}
+
 /// Quote background spans the content column without vertical padding.
 ///
 /// # Errors
@@ -303,7 +315,7 @@ pub fn quote_block_background_rect(
 #[must_use]
 pub fn content_origin_y(kind: BlockKind, config: LayoutConfig) -> f32 {
     if is_code_block(kind) {
-        CodeInsets::new(config).top
+        CodeInsets::new(config).top + fenced_code_toolbar_height(kind, config)
     } else {
         0.0
     }
@@ -459,24 +471,21 @@ mod tests {
 
     #[test]
     fn content_origin_y_insets_code_content() {
-        for code in [
-            BlockKind::FencedCodeBlock {
-                marker: '`',
-                closed: true,
-            },
-            BlockKind::IndentedCode,
-        ] {
-            assert_eq!(content_origin_y(code, LayoutConfig::new(400.0, 16.0)), 9.0);
-        }
+        let config = LayoutConfig::new(400.0, 16.0);
+        let fenced = BlockKind::FencedCodeBlock {
+            marker: '`',
+            closed: true,
+        };
+        assert_eq!(fenced_code_toolbar_height(fenced, config), 22.0);
+        assert_eq!(content_origin_y(fenced, config), 31.0);
         assert_eq!(
-            content_origin_y(BlockKind::Paragraph, LayoutConfig::new(400.0, 16.0)),
+            fenced_code_toolbar_height(BlockKind::IndentedCode, config),
             0.0
         );
+        assert_eq!(content_origin_y(BlockKind::IndentedCode, config), 9.0);
+        assert_eq!(content_origin_y(BlockKind::Paragraph, config), 0.0);
         assert_eq!(
-            content_origin_y(
-                BlockKind::BlockQuote { depth: 1 },
-                LayoutConfig::new(400.0, 16.0)
-            ),
+            content_origin_y(BlockKind::BlockQuote { depth: 1 }, config),
             0.0
         );
     }

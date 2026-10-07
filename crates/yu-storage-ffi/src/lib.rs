@@ -454,6 +454,27 @@ pub struct YuStorageTaskCheckboxHit {
     pub height: f32,
 }
 
+/// One visible fenced-code toolbar from the currently published retained frame.
+/// Source ranges are exact parser-owned UTF-16 ranges; bounds are document-space.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageCodeBlockControl {
+    pub revision: u64,
+    pub block_index: u64,
+    pub info_start_utf16: u64,
+    pub info_end_utf16: u64,
+    pub content_start_utf16: u64,
+    pub content_end_utf16: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub copy_x: f32,
+    pub copy_y: f32,
+    pub copy_width: f32,
+    pub copy_height: f32,
+}
+
 /// Revision-bound hit-test result for an internal visible table divider. The
 /// `kind` field uses `YU_STORAGE_TABLE_RESIZE_COLUMN` or
 /// `YU_STORAGE_TABLE_RESIZE_ROW`; `index` identifies the visible column/row
@@ -6278,6 +6299,112 @@ pub unsafe extern "C" fn yu_storage_session_task_checkbox_hit_test(
                 width: bounds.width(),
                 height: bounds.height(),
             };
+        }
+        YU_STORAGE_OK
+    }
+}
+
+/// Enumerates visible fenced-code controls from the exact published macOS frame.
+/// The call is read-only and supports a two-pass null/zero-capacity count query.
+///
+/// # Safety
+/// `session` must be live; `written` must be writable; `controls` must point to
+/// `capacity` writable values when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_code_block_controls(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    controls: *mut YuStorageCodeBlockControl,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() || (capacity > 0 && controls.is_null()) {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *written = 0 };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, controls, capacity);
+        YU_STORAGE_SHAPER_UNAVAILABLE
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        let raw_controls = {
+            let state = match session.macos_render_host.as_ref() {
+                Some(state) => state,
+                None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            };
+            let publication = match state.builder.last_publication() {
+                Some(publication) => publication,
+                None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            };
+            if publication.revision().get() != expected_revision
+                || state.host.frame_revision() != Some(publication.revision())
+                || state.host.frame_serial() != Some(publication.serial())
+            {
+                return YU_STORAGE_STALE_REVISION;
+            }
+            publication.frame().scene().code_blocks().to_vec()
+        };
+        let source = session.session.snapshot();
+        let mut encoded = Vec::with_capacity(raw_controls.len());
+        for control in raw_controls {
+            let info_start_utf16 = match source.utf16_offset(control.info().start()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let info_end_utf16 = match source.utf16_offset(control.info().end()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let content_start_utf16 = match source.utf16_offset(control.content().start()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let content_end_utf16 = match source.utf16_offset(control.content().end()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let block_index = match u64::try_from(control.block_index()) {
+                Ok(index) => index,
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let bounds = control.bounds();
+            let copy = control.copy_bounds();
+            encoded.push(YuStorageCodeBlockControl {
+                revision: expected_revision,
+                block_index,
+                info_start_utf16,
+                info_end_utf16,
+                content_start_utf16,
+                content_end_utf16,
+                x: bounds.x(),
+                y: bounds.y(),
+                width: bounds.width(),
+                height: bounds.height(),
+                copy_x: copy.x(),
+                copy_y: copy.y(),
+                copy_width: copy.width(),
+                copy_height: copy.height(),
+            });
+        }
+        unsafe { *written = encoded.len() };
+        if capacity == 0 && controls.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), controls, encoded.len()) };
         }
         YU_STORAGE_OK
     }

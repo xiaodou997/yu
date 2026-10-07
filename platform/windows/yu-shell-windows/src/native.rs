@@ -18,8 +18,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetSysColorBrush,
-    PAINTSTRUCT, ScreenToClient,
+    BI_RGB, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetStockObject,
+    GetSysColorBrush, HOLLOW_BRUSH, PAINTSTRUCT, ScreenToClient, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -72,12 +73,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_TOPALIGN,
     TrackPopupMenuEx, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CHAR,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED,
-    WM_DRAWITEM, WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
-    WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_GETDLGCODE, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_VSCROLL,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_assets::{DecodedImage, ImageLocation};
@@ -99,9 +100,10 @@ use crate::accessibility::{
     WM_APP_UIA_ACTION,
 };
 use crate::chrome::{
-    Chrome, ID_FILES, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY,
-    ID_ROWS, ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction,
-    menu_height, search_height, sidebar_width,
+    CODE_COPY_FEEDBACK_MS, CODE_COPY_FEEDBACK_TIMER_ID, Chrome, CodeBlockControls, ID_FILES,
+    ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY, ID_ROWS,
+    ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height,
+    search_height, sidebar_width,
 };
 use crate::image_interaction::{
     ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE, ID_IMAGE_SOURCE, ImageInspector,
@@ -591,6 +593,7 @@ pub(crate) struct AppWindow {
     surface: HWND,
     status: HWND,
     chrome: Option<Chrome>,
+    code_block_controls: Option<CodeBlockControls>,
     image_inspector: Option<ImageInspector>,
     selected_image: Option<ImageInteractionState>,
     menu: Option<Menu>,
@@ -615,6 +618,7 @@ impl AppWindow {
             surface: HWND::default(),
             status: HWND::default(),
             chrome: None,
+            code_block_controls: None,
             image_inspector: None,
             selected_image: None,
             menu: None,
@@ -637,6 +641,7 @@ impl AppWindow {
             .map_err(|error| startup_error("install menu", error))?;
         self.create_children()
             .map_err(|error| startup_error("create child windows", error))?;
+        self.code_block_controls = Some(CodeBlockControls::new(self.surface));
         self.image_inspector = Some(
             ImageInspector::new(self.hwnd, self.state.locale())
                 .map_err(|error| startup_error("create image inspector", error))?,
@@ -685,10 +690,67 @@ impl AppWindow {
         }
         self.render = Some(render);
         result?;
+        self.sync_code_block_controls()?;
         self.sync_document_scrollbar()?;
         self.publish_accessibility()?;
         self.sync_image_inspector();
         Ok(())
+    }
+
+    fn sync_code_block_controls(&mut self) -> Result<(), ShellError> {
+        let Some(render) = self.render.as_ref() else {
+            return Ok(());
+        };
+        let Some(publication) = render.builder.last_publication() else {
+            return Ok(());
+        };
+        let revision = publication.revision();
+        let controls = publication.frame().scene().code_blocks().to_vec();
+        let viewport = render.builder.config().viewport();
+        let scale = render.renderer.surface().scale() as f32;
+        let source = self
+            .state
+            .document()
+            .session()
+            .snapshot()
+            .as_str()
+            .to_owned();
+        let copy_label = self.state.strings().copy_code();
+        if let Some(code_blocks) = self.code_block_controls.as_mut() {
+            code_blocks.sync(
+                revision,
+                viewport.scroll_y(),
+                scale,
+                &controls,
+                &source,
+                copy_label,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn copy_code_block(&mut self, command: u16) -> Result<bool, ShellError> {
+        let revision = self.state.document().session().revision();
+        let Some(code) = self
+            .code_block_controls
+            .as_ref()
+            .and_then(|controls| controls.code_for_command(command, revision))
+        else {
+            return Ok(false);
+        };
+        write_unicode_clipboard(self.surface, &code)?;
+        if let Some(controls) = self.code_block_controls.as_mut() {
+            controls.mark_copied(command);
+        }
+        unsafe {
+            SetTimer(
+                self.surface,
+                CODE_COPY_FEEDBACK_TIMER_ID,
+                CODE_COPY_FEEDBACK_MS,
+                None,
+            );
+        }
+        Ok(true)
     }
 
     fn sync_document_scrollbar(&self) -> Result<(), ShellError> {
@@ -2651,7 +2713,7 @@ impl AppWindow {
                 WINDOW_EX_STYLE::default(),
                 SURFACE_CLASS,
                 PCWSTR::null(),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                 0,
                 0,
                 1,
@@ -3787,6 +3849,49 @@ unsafe extern "system" fn surface_proc(
     if !app_ptr.is_null() {
         let app = unsafe { &mut *app_ptr };
         match message {
+            WM_COMMAND => {
+                let command = (wparam.0 & 0xffff) as u16;
+                let notification = (wparam.0 >> 16) as u16;
+                if notification == 0 && CodeBlockControls::is_copy_command(command) {
+                    match app.copy_code_block(command) {
+                        Ok(true) => return LRESULT(0),
+                        Ok(false) => {}
+                        Err(error) => {
+                            show_error(app.hwnd, &app.state, &error);
+                            return LRESULT(0);
+                        }
+                    }
+                }
+            }
+            WM_TIMER if wparam.0 == CODE_COPY_FEEDBACK_TIMER_ID => {
+                unsafe {
+                    let _ = KillTimer(hwnd, CODE_COPY_FEEDBACK_TIMER_ID);
+                }
+                if let Some(controls) = app.code_block_controls.as_mut() {
+                    controls.reset_feedback();
+                }
+                return LRESULT(0);
+            }
+            WM_CTLCOLORSTATIC => {
+                let control = HWND(lparam.0 as *mut _);
+                if app
+                    .code_block_controls
+                    .as_ref()
+                    .is_some_and(|controls| controls.is_language_label(control))
+                {
+                    let dc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+                    let color = app.contrast.map_or_else(
+                        || app.state.appearance().text(),
+                        |contrast| contrast.foreground,
+                    );
+                    unsafe {
+                        let _ = SetBkMode(dc, TRANSPARENT);
+                        let _ = SetTextColor(dc, crate::contrast::colorref(color));
+                        let brush = GetStockObject(HOLLOW_BRUSH);
+                        return LRESULT(brush.0 as isize);
+                    }
+                }
+            }
             WM_GETOBJECT => {
                 if let Some(host) = app.accessibility.as_ref() {
                     return unsafe {

@@ -62,6 +62,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     @objc fileprivate func editImagePropertiesFromMenu(_ sender: NSMenuItem?) { textView.editImagePropertiesFromMenu(sender) }
     private let surfaceHostView = MacosSurfaceHostView()
     private let imageInteractionOverlay = ImageInteractionOverlay()
+    private let codeBlockControlsOverlay = CodeBlockControlsOverlay()
     private var imageInteractionState: NativeImageInteractionState?
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
@@ -122,6 +123,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             self?.textView.refreshTableResizeAccessibility()
             self?.syncSourceGlyphVisibility()
             DispatchQueue.main.async { [weak self] in self?.textView.refreshSelectedImageInteraction() }
+            self?.syncCodeBlockControlsOverlay()
         }
         surfaceCoordinator.onPresentationStorageError = { [weak self] error in
             self?.show(error)
@@ -231,6 +233,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         imageInteractionOverlay.translatesAutoresizingMaskIntoConstraints = true
         imageInteractionOverlay.autoresizingMask = []
         imageInteractionOverlay.setAccessibilityElement(false)
+        codeBlockControlsOverlay.translatesAutoresizingMaskIntoConstraints = true
+        codeBlockControlsOverlay.autoresizingMask = []
+        codeBlockControlsOverlay.setAccessibilityElement(false)
+        codeBlockControlsOverlay.onCopy = { [weak self] control in
+            self?.copyCodeBlock(control) ?? false
+        }
         documentScrollView = scrollView
 
         do { try bridge.setFocusMode(NativeWritingPreferences.shared.focusMode) } catch { show(error) }
@@ -569,10 +577,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // remain owned by the input view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
         root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitHost)
-        // Image selection chrome is the only native layer above the Rust
-        // surface. Its hitTest accepts the compact inspector card only; the
-        // rest of this viewport-sized overlay remains click-through.
-        root.addSubview(imageInteractionOverlay, positioned: .above, relativeTo: surfaceHostView)
+        // Code-block chrome is click-through except for its native copy buttons.
+        root.addSubview(codeBlockControlsOverlay, positioned: .above, relativeTo: surfaceHostView)
+        // Image selection chrome remains the topmost native layer. Its hitTest
+        // accepts the compact inspector card only; the rest stays click-through.
+        root.addSubview(imageInteractionOverlay, positioned: .above, relativeTo: codeBlockControlsOverlay)
         let chromeTop = splitHost.topAnchor.constraint(equalTo: root.topAnchor, constant: 0)
         chromeTopConstraint = chromeTop
         NSLayoutConstraint.activate([
@@ -788,10 +797,67 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
+        if codeBlockControlsOverlay.frame != viewportFrame {
+            codeBlockControlsOverlay.frame = viewportFrame
+        }
         if imageInteractionOverlay.frame != viewportFrame {
             imageInteractionOverlay.frame = viewportFrame
         }
+        syncCodeBlockControlsOverlay()
         syncImageInteractionOverlay()
+    }
+
+    private func syncCodeBlockControlsOverlay() {
+        guard surfaceCoordinator.hasCurrentFrame(),
+              codeBlockControlsOverlay.bounds.width > 0,
+              codeBlockControlsOverlay.bounds.height > 0 else {
+            codeBlockControlsOverlay.dismiss()
+            return
+        }
+        let revision = bridge.revision
+        guard let controls = try? bridge.codeBlockControls(revision: revision) else {
+            codeBlockControlsOverlay.dismiss()
+            return
+        }
+        let source = bridge.source as NSString
+        let sourceLength = source.length
+        let items = controls.compactMap { control -> CodeBlockControlsOverlay.Item? in
+            guard control.revision == revision,
+                  control.infoRange.location >= 0,
+                  control.contentRange.location >= 0,
+                  NSMaxRange(control.infoRange) <= sourceLength,
+                  NSMaxRange(control.contentRange) <= sourceLength else { return nil }
+            let info = source.substring(with: control.infoRange)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let documentBounds = control.bounds.offsetBy(
+                dx: textView.contentOrigin.x,
+                dy: textView.contentOrigin.y
+            )
+            let documentCopy = control.copyBounds.offsetBy(
+                dx: textView.contentOrigin.x,
+                dy: textView.contentOrigin.y
+            )
+            let blockFrame = textView.convert(documentBounds, to: codeBlockControlsOverlay)
+            let copyFrame = textView.convert(documentCopy, to: codeBlockControlsOverlay)
+            return CodeBlockControlsOverlay.Item(
+                control: control,
+                language: info.isEmpty ? "text" : info,
+                blockFrame: blockFrame,
+                copyFrame: copyFrame
+            )
+        }
+        codeBlockControlsOverlay.present(items)
+    }
+
+    private func copyCodeBlock(_ control: NativeCodeBlockControl) -> Bool {
+        guard control.revision == bridge.revision else { return false }
+        let source = bridge.source as NSString
+        guard control.contentRange.location >= 0,
+              NSMaxRange(control.contentRange) <= source.length else { return false }
+        let code = source.substring(with: control.contentRange)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.setString(code, forType: .string)
     }
 
     private func syncImageInteractionOverlay() {

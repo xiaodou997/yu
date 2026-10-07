@@ -388,6 +388,25 @@ typedef struct YuStorageTaskCheckboxHit {
     float height;
 } YuStorageTaskCheckboxHit;
 
+/* One visible fenced-code toolbar from the currently published retained frame.
+ * Source ranges are exact parser-owned UTF-16 ranges; bounds are document-space. */
+typedef struct YuStorageCodeBlockControl {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t info_start_utf16;
+    uint64_t info_end_utf16;
+    uint64_t content_start_utf16;
+    uint64_t content_end_utf16;
+    float x;
+    float y;
+    float width;
+    float height;
+    float copy_x;
+    float copy_y;
+    float copy_width;
+    float copy_height;
+} YuStorageCodeBlockControl;
+
 /* Revision-bound hit-test result for an internal visible table divider. kind
  * is YU_STORAGE_TABLE_RESIZE_COLUMN or YU_STORAGE_TABLE_RESIZE_ROW; index is
  * the column/row immediately before the divider and position is local x/y. */
@@ -792,6 +811,11 @@ int32_t yu_storage_session_table_resize_at_point(
 int32_t yu_storage_session_task_checkbox_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, YuStorageTaskCheckboxHit *output);
+/* Enumerates visible normal fenced-code toolbars from the exact published frame.
+ * Null output with zero capacity queries the required count. */
+int32_t yu_storage_session_code_block_controls(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageCodeBlockControl *controls, size_t capacity, size_t *written);
 /* Resolves a source caret's shaped geometry without the caller naming a
  * block. The platform needs this for IME candidate-window placement: only the
  * shared layout snapshot supplies the document-space caret. The native view

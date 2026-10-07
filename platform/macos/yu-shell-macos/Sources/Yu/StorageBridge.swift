@@ -256,6 +256,36 @@ struct NativeTaskCheckboxHit: Equatable {
         )
     }
 }
+
+struct NativeCodeBlockControl: Equatable {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let infoRange: NSRange
+    let contentRange: NSRange
+    let bounds: CGRect
+    let copyBounds: CGRect
+
+    init(_ value: YuStorageCodeBlockControl) {
+        revision = value.revision
+        blockIndex = value.block_index
+        infoRange = NSRange(
+            location: Int(value.info_start_utf16),
+            length: Int(value.info_end_utf16 - value.info_start_utf16)
+        )
+        contentRange = NSRange(
+            location: Int(value.content_start_utf16),
+            length: Int(value.content_end_utf16 - value.content_start_utf16)
+        )
+        bounds = CGRect(
+            x: CGFloat(value.x), y: CGFloat(value.y),
+            width: CGFloat(value.width), height: CGFloat(value.height)
+        )
+        copyBounds = CGRect(
+            x: CGFloat(value.copy_x), y: CGFloat(value.copy_y),
+            width: CGFloat(value.copy_width), height: CGFloat(value.copy_height)
+        )
+    }
+}
 struct NativeTableResizeCommit: Equatable {
     let revision: UInt64
     let blockIndex: UInt64
@@ -1120,6 +1150,28 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeTaskCheckboxHit(value)
+    }
+
+    func codeBlockControls(revision: UInt64) throws -> [NativeCodeBlockControl] {
+        var required = 0
+        let sizeStatus = yu_storage_session_code_block_controls(
+            handle, revision, nil, 0, &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        if required == 0 { return [] }
+        var values = Array(repeating: YuStorageCodeBlockControl(), count: required)
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_code_block_controls(
+                handle, revision, buffer.baseAddress, buffer.count, &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return values.map(NativeCodeBlockControl.init)
     }
 
     /// 推进一次分隔线拖动。`pointerPosition` 只对 `.update` 有意义。

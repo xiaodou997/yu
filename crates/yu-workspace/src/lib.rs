@@ -17,10 +17,14 @@ use yu_assets::{
 };
 use yu_core::{Revision, TextRange, TextRole, VisualRange};
 use yu_editor::{
-    Bias, BlockCluster, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement,
-    EditorDocumentError, ImageSpan, LayoutContext, LayoutError, LayoutSnapshot, Selections,
-    ShapingProvider, TableLayout, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
-    layout_tokens::{code_block_background_rect, is_code_block, quote_block_background_rect},
+    Bias, BlockCluster, BlockKind, BlockOrnament, BlockView, BlockWidget, CaretAffinity,
+    CheckboxPlacement, EditorDocumentError, ImageSpan, LayoutContext, LayoutError, LayoutSnapshot,
+    Selections, ShapingProvider, TableLayout, TableResizeCommit, TableResizeTarget, TaskState,
+    ViewportSpan,
+    layout_tokens::{
+        code_block_background_rect, fenced_code_toolbar_height, is_code_block,
+        quote_block_background_rect,
+    },
 };
 #[cfg(test)]
 use yu_editor::{EditorDocument, layout_tokens::content_origin_y};
@@ -62,6 +66,48 @@ pub struct ViewportSceneFrame {
     scene: Scene,
     background: Rgba8,
     tables: Vec<ViewportTableGeometry>,
+    code_blocks: Vec<ViewportCodeBlockControl>,
+}
+
+/// Revision-bound semantics and geometry for one ordinary fenced code block.
+///
+/// The parser owns the info and content ranges; the native shells only render
+/// controls and copy the exact content range, so fences and language text can
+/// never leak into the clipboard payload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportCodeBlockControl {
+    block_index: usize,
+    info: TextRange,
+    content: TextRange,
+    bounds: Rect,
+    copy_bounds: Rect,
+}
+
+impl ViewportCodeBlockControl {
+    #[must_use]
+    pub const fn block_index(&self) -> usize {
+        self.block_index
+    }
+
+    #[must_use]
+    pub const fn info(&self) -> TextRange {
+        self.info
+    }
+
+    #[must_use]
+    pub const fn content(&self) -> TextRange {
+        self.content
+    }
+
+    #[must_use]
+    pub const fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn copy_bounds(&self) -> Rect {
+        self.copy_bounds
+    }
 }
 
 /// Immutable table geometry from the exact layouts used to draw a frame.
@@ -1418,7 +1464,7 @@ fn append_block_background(
     let background = if is_code_block(kind) {
         code_block_background_rect(
             (column_width - layout.container_left()).max(1.0),
-            layout.height(),
+            layout.height() + fenced_code_toolbar_height(kind, layout.config()),
             layout.config(),
         )
     } else {
@@ -1464,6 +1510,58 @@ fn append_block_background(
         builder.rounded_fill_rect(bounds, radius, color, None)?;
     }
     Ok(())
+}
+
+fn fenced_code_control(
+    block_index: usize,
+    kind: BlockKind,
+    layout: &BlockView,
+    column_width: f32,
+    origin: Point,
+) -> Result<Option<ViewportCodeBlockControl>, ViewportSceneError> {
+    if !matches!(kind, BlockKind::FencedCodeBlock { .. }) || !layout.embedded().is_empty() {
+        return Ok(None);
+    }
+    let Some((info, content)) =
+        layout
+            .decorations()
+            .line_ornaments()
+            .iter()
+            .find_map(|(_, ornament)| match ornament {
+                BlockOrnament::FencedCode { info, content } => Some((*info, *content)),
+                _ => None,
+            })
+    else {
+        return Ok(None);
+    };
+    let background = code_block_background_rect(
+        (column_width - layout.container_left()).max(1.0),
+        layout.height() + fenced_code_toolbar_height(kind, layout.config()),
+        layout.config(),
+    )
+    .map_err(EditorDocumentError::from)?;
+    let bounds = translate_block_rect(
+        background,
+        Point::new(origin.x() + layout.container_left(), origin.y()),
+    )?;
+    let spec = layout.config().theme().spec();
+    let zoom = layout.config().line_height() / spec.body_size;
+    let copy_width = 48.0 * zoom;
+    let copy_height = 20.0 * zoom;
+    let inset = 5.0 * zoom;
+    let copy_bounds = Rect::new(
+        (bounds.right() - inset - copy_width).max(bounds.x()),
+        bounds.y() + inset,
+        copy_width.min(bounds.width()),
+        copy_height,
+    )?;
+    Ok(Some(ViewportCodeBlockControl {
+        block_index,
+        info,
+        content,
+        bounds,
+        copy_bounds,
+    }))
 }
 
 /// 搜索命中的底色。
@@ -1868,6 +1966,11 @@ fn append_editor_decorations(
 }
 
 impl ViewportSceneFrame {
+    #[must_use]
+    pub fn code_blocks(&self) -> &[ViewportCodeBlockControl] {
+        &self.code_blocks
+    }
+
     #[must_use]
     pub fn tables(&self) -> &[ViewportTableGeometry] {
         &self.tables
@@ -2952,6 +3055,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     let mut images = Vec::with_capacity(layouts.len());
     let mut glyphs = Vec::with_capacity(layouts.len());
     let mut tables = Vec::new();
+    let mut code_blocks = Vec::new();
     for ((block, layout), content_origin) in viewport_snapshot
         .blocks()
         .iter()
@@ -2970,6 +3074,15 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             origin,
             appearance,
         )?;
+        if let Some(control) = fenced_code_control(
+            block.index(),
+            block.kind(),
+            layout,
+            config.max_width(),
+            origin,
+        )? {
+            code_blocks.push(control);
+        }
         for marker in layout.ornaments().markers() {
             let Some(shape) = marker.shape() else {
                 continue;
@@ -3326,6 +3439,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         scene: builder.finish(),
         background,
         tables,
+        code_blocks,
     })
 }
 

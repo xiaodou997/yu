@@ -22,19 +22,19 @@ use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BS_OWNERDRAW, CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetCursorPos,
+    BS_OWNERDRAW, CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetCursorPos,
     GetWindowTextLengthW, GetWindowTextW, HMENU, HWND_BOTTOM, HWND_TOP, LB_ADDSTRING, LB_GETCURSEL,
     LB_GETTOPINDEX, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LBS_OWNERDRAWFIXED, MoveWindow,
     NONCLIENTMETRICSW, SBS_VERT, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETFONT, WM_SETREDRAW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_SETFONT,
+    WM_SETREDRAW, WS_CHILD, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 use yu_core::{Revision, TextRange};
 use yu_editor::OutlineTree;
-use yu_workspace::Appearance;
+use yu_workspace::{Appearance, ViewportCodeBlockControl};
 
 pub(crate) const ID_FILES: u16 = 2001;
 pub(crate) const ID_OUTLINE: u16 = 2002;
@@ -49,6 +49,10 @@ pub(crate) const ID_MENU_FILE: u16 = 2101;
 pub(crate) const ID_MENU_EDIT: u16 = 2102;
 pub(crate) const ID_MENU_VIEW: u16 = 2103;
 pub(crate) const ID_MENU_HELP: u16 = 2104;
+pub(crate) const ID_CODE_COPY_BASE: u16 = 18_000;
+pub(crate) const MAX_CODE_BLOCK_CONTROLS: usize = 64;
+pub(crate) const CODE_COPY_FEEDBACK_TIMER_ID: usize = 3;
+pub(crate) const CODE_COPY_FEEDBACK_MS: u32 = 1_200;
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -247,6 +251,188 @@ impl Palette {
                 rgb(41, 100, 185)
             },
         }
+    }
+}
+
+struct CodeBlockRow {
+    label: HWND,
+    button: HWND,
+    command: u16,
+    revision: Revision,
+    code: String,
+    copy_label: String,
+    copied: bool,
+}
+
+pub(crate) struct CodeBlockControls {
+    surface: HWND,
+    rows: Vec<CodeBlockRow>,
+}
+
+impl CodeBlockControls {
+    pub(crate) fn new(surface: HWND) -> Self {
+        Self {
+            surface,
+            rows: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_copy_command(command: u16) -> bool {
+        let end = ID_CODE_COPY_BASE.saturating_add(MAX_CODE_BLOCK_CONTROLS as u16);
+        (ID_CODE_COPY_BASE..end).contains(&command)
+    }
+
+    pub(crate) fn is_language_label(&self, hwnd: HWND) -> bool {
+        self.rows.iter().any(|row| row.label == hwnd)
+    }
+
+    pub(crate) fn sync(
+        &mut self,
+        revision: Revision,
+        scroll_y: f32,
+        scale: f32,
+        controls: &[ViewportCodeBlockControl],
+        source: &str,
+        copy_label: &str,
+    ) -> Result<(), ShellError> {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let visible = controls.len().min(MAX_CODE_BLOCK_CONTROLS);
+        while self.rows.len() < visible {
+            let index = self.rows.len();
+            let command = ID_CODE_COPY_BASE + index as u16;
+            let label = child(self.surface, w!("STATIC"), "", 0, command + 100, false)?;
+            let button = child(self.surface, w!("BUTTON"), copy_label, 0, command, true)?;
+            self.rows.push(CodeBlockRow {
+                label,
+                button,
+                command,
+                revision,
+                code: String::new(),
+                copy_label: copy_label.to_owned(),
+                copied: false,
+            });
+        }
+
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.surface, &mut client) }.map_err(error)?;
+        let client_width = (client.right - client.left).max(1);
+        let client_height = (client.bottom - client.top).max(1);
+
+        for (index, control) in controls.iter().take(visible).enumerate() {
+            let info = source_text(source, control.info())
+                .unwrap_or_default()
+                .trim();
+            let language = if info.is_empty() { "text" } else { info };
+            let code = source_text(source, control.content()).ok_or_else(|| {
+                ShellError::Platform("invalid fenced-code source range".to_owned())
+            })?;
+            let row = &mut self.rows[index];
+            let changed =
+                row.revision != revision || row.code != code || row.copy_label != copy_label;
+            row.revision = revision;
+            row.code.clear();
+            row.code.push_str(code);
+            row.copy_label.clear();
+            row.copy_label.push_str(copy_label);
+            if changed {
+                row.copied = false;
+            }
+
+            set_control_text(row.label, language);
+            set_control_text(row.button, if row.copied { "✓" } else { copy_label });
+
+            let bounds = control.bounds();
+            let copy = control.copy_bounds();
+            let button_x = logical_px(copy.x(), scale);
+            let button_y = logical_px(copy.y() - scroll_y, scale);
+            let button_w = logical_px(copy.width(), scale).max(1);
+            let button_h = logical_px(copy.height(), scale).max(1);
+            let label_x = logical_px(bounds.x() + 12.0, scale);
+            let label_y = button_y;
+            let label_w = logical_px((copy.x() - bounds.x() - 20.0).max(1.0), scale).max(1);
+            let label_h = button_h;
+            let block_top = logical_px(bounds.y() - scroll_y, scale);
+            let block_bottom = logical_px(bounds.bottom() - scroll_y, scale);
+            let on_screen = block_bottom > 0
+                && block_top < client_height
+                && button_x < client_width
+                && button_x + button_w > 0;
+
+            unsafe {
+                let _ = MoveWindow(row.label, label_x, label_y, label_w, label_h, true);
+                let _ = MoveWindow(row.button, button_x, button_y, button_w, button_h, true);
+                let visibility = if on_screen { SW_SHOW } else { SW_HIDE };
+                let _ = ShowWindow(row.label, visibility);
+                let _ = ShowWindow(row.button, visibility);
+            }
+        }
+        for row in self.rows.iter().skip(visible) {
+            unsafe {
+                let _ = ShowWindow(row.label, SW_HIDE);
+                let _ = ShowWindow(row.button, SW_HIDE);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn code_for_command(&self, command: u16, revision: Revision) -> Option<String> {
+        let index = usize::from(command.checked_sub(ID_CODE_COPY_BASE)?);
+        let row = self.rows.get(index)?;
+        (row.command == command && row.revision == revision).then(|| row.code.clone())
+    }
+
+    pub(crate) fn mark_copied(&mut self, command: u16) {
+        let Some(index) = command.checked_sub(ID_CODE_COPY_BASE).map(usize::from) else {
+            return;
+        };
+        let Some(row) = self.rows.get_mut(index) else {
+            return;
+        };
+        row.copied = true;
+        set_control_text(row.button, "✓");
+    }
+
+    pub(crate) fn reset_feedback(&mut self) {
+        for row in &mut self.rows {
+            if row.copied {
+                row.copied = false;
+                set_control_text(row.button, &row.copy_label);
+            }
+        }
+    }
+}
+
+impl Drop for CodeBlockControls {
+    fn drop(&mut self) {
+        for row in self.rows.drain(..) {
+            unsafe {
+                let _ = DestroyWindow(row.label);
+                let _ = DestroyWindow(row.button);
+            }
+        }
+    }
+}
+
+fn source_text(source: &str, range: TextRange) -> Option<&str> {
+    let start = usize::try_from(range.start().get()).ok()?;
+    let end = usize::try_from(range.end().get()).ok()?;
+    source.get(start..end)
+}
+
+fn logical_px(value: f32, scale: f32) -> i32 {
+    (value * scale)
+        .round()
+        .clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+fn set_control_text(hwnd: HWND, text: &str) {
+    let text = wide(text);
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
     }
 }
 
