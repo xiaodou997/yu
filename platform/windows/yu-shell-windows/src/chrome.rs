@@ -19,7 +19,9 @@ use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, EM_SETCUEBANNER, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     BS_OWNERDRAW, CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetCursorPos,
@@ -406,10 +408,12 @@ impl CodeBlockControls {
             let label_y = button_y;
             let label_w = logical_px((copy.x() - bounds.x() - 20.0).max(1.0), scale).max(1);
             let label_h = button_h;
-            let block_top = logical_px(bounds.y() - scroll_y, scale);
-            let block_bottom = logical_px(bounds.bottom() - scroll_y, scale);
-            let on_screen = block_bottom > 0
-                && block_top < client_height
+            // A long code block can remain visible after its toolbar has
+            // scrolled above the viewport. Keep those HWNDs hidden so
+            // IsDialogMessageW does not include an invisible WS_TABSTOP in
+            // keyboard navigation.
+            let on_screen = button_y + button_h > 0
+                && button_y < client_height
                 && button_x < client_width
                 && button_x + button_w > 0;
 
@@ -417,6 +421,9 @@ impl CodeBlockControls {
                 let _ = MoveWindow(row.label, label_x, label_y, label_w, label_h, true);
                 let _ = MoveWindow(row.button, button_x, button_y, button_w, button_h, true);
                 let visibility = if on_screen { SW_SHOW } else { SW_HIDE };
+                if !on_screen && GetFocus() == row.button {
+                    let _ = SetFocus(self.surface);
+                }
                 let _ = ShowWindow(row.label, visibility);
                 let _ = ShowWindow(row.button, visibility);
             }
