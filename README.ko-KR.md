@@ -24,9 +24,6 @@
   <a href="https://github.com/xiaodou997/yu/releases/latest">
     <img src="https://img.shields.io/github/v/release/xiaodou997/yu?style=flat-square&color=blue" alt="Latest release" />
   </a>
-  <a href="https://github.com/xiaodou997/yu/actions/workflows/ci.yml">
-    <img src="https://github.com/xiaodou997/yu/actions/workflows/ci.yml/badge.svg" alt="CI" />
-  </a>
   <a href="https://github.com/xiaodou997/yu/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-Apache--2.0-green?style=flat-square" alt="Apache-2.0" />
   </a>
