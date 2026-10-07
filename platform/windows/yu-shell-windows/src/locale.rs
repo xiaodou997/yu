@@ -438,6 +438,17 @@ impl Strings {
     }
 
     #[must_use]
+    pub const fn copied_code(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Copied",
+            Locale::SimplifiedChinese => "已复制",
+            Locale::TraditionalChinese => "已複製",
+            Locale::Japanese => "完了",
+            Locale::Korean => "완료",
+        }
+    }
+
+    #[must_use]
     pub const fn copy_image(self) -> &'static str {
         match self.locale {
             Locale::English => "Copy Image",

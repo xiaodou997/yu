@@ -6464,10 +6464,16 @@ mod tests {
                 _ => None,
             })
             .expect("caret decoration");
-        // 块 y（0）+ 内容原点（5）+ 行内偏移（0）。
+        // 块 y（0）+ fenced toolbar + 代码上内边距 + 行内偏移（0）。
         assert_eq!(
             caret.bounds().y(),
-            content_origin_y(BlockKind::IndentedCode, document.viewport_config().layout())
+            content_origin_y(
+                BlockKind::FencedCodeBlock {
+                    marker: '`',
+                    closed: true,
+                },
+                document.viewport_config().layout()
+            )
         );
     }
 

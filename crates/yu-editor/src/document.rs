@@ -6192,7 +6192,7 @@ prefix **羽🙂** suffix
             BlockKind::FencedCodeBlock { .. }
         ));
         let origin = content_origin_y(blocks[0].kind(), LayoutConfig::new(80.0, 1.0));
-        assert_eq!(origin, 9.0 / 16.0);
+        assert_eq!(origin, (9.0 + 22.0) / 16.0);
         // The 15pt code margin wins over the 12.8pt paragraph margin.
         let gap = 15.0 / 16.0;
         assert_eq!(
@@ -6203,7 +6203,7 @@ prefix **羽🙂** suffix
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
 
         // 内容原点折进 caret 的文档坐标：光标落在代码第一个字符上时，y = 前缀
-        // （0）+ 上内边距 + 行内偏移（0）。漏掉原点光标整体上移 5pt，不报错。
+        // （0）+ 工具栏预留 + 上内边距 + 行内偏移（0）。
         set_caret(&mut document, 4);
         let request = document
             .caret_scroll_request(ViewportSpan::new(0.0, 100.0), 0.0)

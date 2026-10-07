@@ -11715,9 +11715,21 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        let (_, metrics, _) =
+        let (shaper, metrics, _) =
             core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
         let code_line = metrics.line_height() * yu_editor::layout_tokens::LINE_HEIGHT_CODE;
+        // Establish the same measured geometry a real surface has before a click.
+        // The toolbar increases the first block's height, so a point-only query
+        // must start from the updated height index rather than its initial estimate.
+        let content_origin = {
+            let session = unsafe { &mut *raw };
+            macos_publish_viewport_config(session, 500.0, metrics, yu_core::ThemeId::Github)
+                .expect("config");
+            let geometry =
+                macos_query_layout_snapshot(session, ViewportSpan::new(0.0, 200.0), &shaper)
+                    .expect("code geometry");
+            geometry.block(0).expect("fenced code").content_y()
+        };
         // x 点在 'o' 上（内容内第二个字符）：行首的第一个字符带隐藏围栏的
         // 边界 bias，点它会映射到源码 0——那不是这一刀要测的东西。
         let probe = |y: f32| {
@@ -11730,13 +11742,13 @@ mod tests {
             );
             hit
         };
-        let upper = probe(7.875 + 2.0);
-        let lower = probe(7.875 + code_line - 3.0);
+        let upper = probe(content_origin + 2.0);
+        let lower = probe(content_origin + code_line - 3.0);
         assert_eq!(upper.source_utf16, 5, "靠上的点击落在 body 行内");
         assert_eq!(lower.source_utf16, 5, "贴行下沿的点击仍在 body 行内");
         assert_eq!(upper.line, 0);
         assert_eq!(lower.line, 0, "漏内容原点时这个点会落进块尾空行盒");
-        // 同一 caret 的返回 y 一致，且含内容原点：块局部 caret 顶 0 + 原点 7.875。
+        // 同一 caret 的返回 y 一致，且含 fenced toolbar + 代码上内边距。
         assert!(
             (upper.y - lower.y).abs() < 0.01,
             "同一 caret 的返回 y 必须一致：upper={} lower={}",
@@ -11744,8 +11756,8 @@ mod tests {
             lower.y
         );
         assert!(
-            (upper.y - 7.875).abs() < 0.01,
-            "返回的 caret y 必须含内容原点（(8 + 1) × 14/16 = 7.875pt）：{}",
+            (upper.y - content_origin).abs() < 0.01,
+            "返回的 caret y 必须含 fenced toolbar 与代码上内边距：{}",
             upper.y
         );
 

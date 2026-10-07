@@ -18,9 +18,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetStockObject,
-    GetSysColorBrush, HOLLOW_BRUSH, PAINTSTRUCT, ScreenToClient, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    BI_RGB, BITMAPINFOHEADER, BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetSysColorBrush,
+    OPAQUE, PAINTSTRUCT, ScreenToClient, SetBkColor, SetBkMode, SetTextColor,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -78,7 +77,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_MOVE, WM_NCCREATE, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
     WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_VSCROLL,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::core::{Error as WindowsError, PCWSTR, Result as WindowsResult, w};
 use yu_assets::{DecodedImage, ImageLocation};
@@ -708,6 +708,7 @@ impl AppWindow {
         let controls = publication.frame().scene().code_blocks().to_vec();
         let viewport = render.builder.config().viewport();
         let scale = render.renderer.surface().scale() as f32;
+        let dpi = unsafe { GetDpiForWindow(self.surface) }.max(96);
         let source = self
             .state
             .document()
@@ -716,14 +717,36 @@ impl AppWindow {
             .as_str()
             .to_owned();
         let copy_label = self.state.strings().copy_code();
+        let copied_label = self.state.strings().copied_code();
+        let (background, foreground) = self.contrast.map_or_else(
+            || {
+                (
+                    crate::contrast::colorref(
+                        self.state.appearance().theme().code_block_background(),
+                    ),
+                    crate::contrast::colorref(self.state.appearance().text()),
+                )
+            },
+            |contrast| {
+                (
+                    crate::contrast::colorref(contrast.background),
+                    crate::contrast::colorref(contrast.foreground),
+                )
+            },
+        );
         if let Some(code_blocks) = self.code_block_controls.as_mut() {
             code_blocks.sync(
                 revision,
                 viewport.scroll_y(),
                 scale,
+                dpi,
+                self.state.locale(),
                 &controls,
                 &source,
                 copy_label,
+                copied_label,
+                background,
+                foreground,
             )?;
         }
         Ok(())
@@ -2710,7 +2733,7 @@ impl AppWindow {
         self.chrome = Some(chrome);
         unsafe {
             self.surface = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                WS_EX_CONTROLPARENT,
                 SURFACE_CLASS,
                 PCWSTR::null(),
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
@@ -3590,6 +3613,25 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                     true
                 }
                 WM_KEYDOWN
+                    if message.wParam.0 == VK_RETURN.0 as usize
+                        && app
+                            .code_block_controls
+                            .as_ref()
+                            .and_then(|controls| controls.command_for_button(message.hwnd))
+                            .is_some() =>
+                {
+                    let command = app
+                        .code_block_controls
+                        .as_ref()
+                        .and_then(|controls| controls.command_for_button(message.hwnd))
+                        .expect("copy button command");
+                    match app.copy_code_block(command) {
+                        Ok(true) | Ok(false) => {}
+                        Err(error) => show_error(hwnd, &app.state, &error),
+                    }
+                    true
+                }
+                WM_KEYDOWN
                     if message.hwnd != app.surface
                         && message.wParam.0
                             == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0
@@ -3874,20 +3916,17 @@ unsafe extern "system" fn surface_proc(
             }
             WM_CTLCOLORSTATIC => {
                 let control = HWND(lparam.0 as *mut _);
-                if app
+                if let Some((foreground, background, brush)) = app
                     .code_block_controls
                     .as_ref()
-                    .is_some_and(|controls| controls.is_language_label(control))
+                    .filter(|controls| controls.is_language_label(control))
+                    .and_then(CodeBlockControls::language_palette)
                 {
                     let dc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-                    let color = app.contrast.map_or_else(
-                        || app.state.appearance().text(),
-                        |contrast| contrast.foreground,
-                    );
                     unsafe {
-                        let _ = SetBkMode(dc, TRANSPARENT);
-                        let _ = SetTextColor(dc, crate::contrast::colorref(color));
-                        let brush = GetStockObject(HOLLOW_BRUSH);
+                        let _ = SetBkMode(dc, OPAQUE);
+                        let _ = SetBkColor(dc, background);
+                        let _ = SetTextColor(dc, foreground);
                         return LRESULT(brush.0 as isize);
                     }
                 }

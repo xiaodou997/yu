@@ -261,12 +261,19 @@ struct CodeBlockRow {
     revision: Revision,
     code: String,
     copy_label: String,
+    copied_label: String,
     copied: bool,
 }
 
 pub(crate) struct CodeBlockControls {
     surface: HWND,
     rows: Vec<CodeBlockRow>,
+    dpi: u32,
+    language_font: Option<Font>,
+    button_font: Option<Font>,
+    background: Option<Brush>,
+    background_color: COLORREF,
+    foreground_color: COLORREF,
 }
 
 impl CodeBlockControls {
@@ -274,6 +281,12 @@ impl CodeBlockControls {
         Self {
             surface,
             rows: Vec::new(),
+            dpi: 0,
+            language_font: None,
+            button_font: None,
+            background: None,
+            background_color: COLORREF(u32::MAX),
+            foreground_color: COLORREF(u32::MAX),
         }
     }
 
@@ -286,26 +299,56 @@ impl CodeBlockControls {
         self.rows.iter().any(|row| row.label == hwnd)
     }
 
+    pub(crate) fn command_for_button(&self, hwnd: HWND) -> Option<u16> {
+        self.rows
+            .iter()
+            .find(|row| row.button == hwnd)
+            .map(|row| row.command)
+    }
+
+    pub(crate) fn language_palette(&self) -> Option<(COLORREF, COLORREF, HBRUSH)> {
+        self.background
+            .as_ref()
+            .map(|brush| (self.foreground_color, self.background_color, brush.0))
+    }
+
     pub(crate) fn sync(
         &mut self,
         revision: Revision,
         scroll_y: f32,
         scale: f32,
+        dpi: u32,
+        locale: Locale,
         controls: &[ViewportCodeBlockControl],
         source: &str,
         copy_label: &str,
+        copied_label: &str,
+        background: COLORREF,
+        foreground: COLORREF,
     ) -> Result<(), ShellError> {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
             1.0
         };
+        self.ensure_fonts(dpi.max(96), locale)?;
+        self.ensure_palette(background, foreground);
         let visible = controls.len().min(MAX_CODE_BLOCK_CONTROLS);
         while self.rows.len() < visible {
             let index = self.rows.len();
             let command = ID_CODE_COPY_BASE + index as u16;
             let label = child(self.surface, w!("STATIC"), "", 0, command + 100, false)?;
             let button = child(self.surface, w!("BUTTON"), copy_label, 0, command, true)?;
+            if let Some(font) = self.language_font.as_ref() {
+                unsafe {
+                    SendMessageW(label, WM_SETFONT, WPARAM(font.0.0 as usize), LPARAM(1));
+                }
+            }
+            if let Some(font) = self.button_font.as_ref() {
+                unsafe {
+                    SendMessageW(button, WM_SETFONT, WPARAM(font.0.0 as usize), LPARAM(1));
+                }
+            }
             self.rows.push(CodeBlockRow {
                 label,
                 button,
@@ -313,6 +356,7 @@ impl CodeBlockControls {
                 revision,
                 code: String::new(),
                 copy_label: copy_label.to_owned(),
+                copied_label: copied_label.to_owned(),
                 copied: false,
             });
         }
@@ -331,19 +375,26 @@ impl CodeBlockControls {
                 ShellError::Platform("invalid fenced-code source range".to_owned())
             })?;
             let row = &mut self.rows[index];
-            let changed =
-                row.revision != revision || row.code != code || row.copy_label != copy_label;
+            let changed = row.revision != revision
+                || row.code != code
+                || row.copy_label != copy_label
+                || row.copied_label != copied_label;
             row.revision = revision;
             row.code.clear();
             row.code.push_str(code);
             row.copy_label.clear();
             row.copy_label.push_str(copy_label);
+            row.copied_label.clear();
+            row.copied_label.push_str(copied_label);
             if changed {
                 row.copied = false;
             }
 
             set_control_text(row.label, language);
-            set_control_text(row.button, if row.copied { "✓" } else { copy_label });
+            set_control_text(
+                row.button,
+                if row.copied { copied_label } else { copy_label },
+            );
 
             let bounds = control.bounds();
             let copy = control.copy_bounds();
@@ -379,6 +430,48 @@ impl CodeBlockControls {
         Ok(())
     }
 
+    fn ensure_fonts(&mut self, dpi: u32, locale: Locale) -> Result<(), ShellError> {
+        if self.dpi == dpi {
+            return Ok(());
+        }
+        let language_font = Font::monospace(dpi, 11.0)?;
+        let button_font = Font::for_dpi(dpi, 11.0, false, locale)?;
+        for row in &self.rows {
+            unsafe {
+                SendMessageW(
+                    row.label,
+                    WM_SETFONT,
+                    WPARAM(language_font.0.0 as usize),
+                    LPARAM(1),
+                );
+                SendMessageW(
+                    row.button,
+                    WM_SETFONT,
+                    WPARAM(button_font.0.0 as usize),
+                    LPARAM(1),
+                );
+            }
+        }
+        self.language_font = Some(language_font);
+        self.button_font = Some(button_font);
+        self.dpi = dpi;
+        Ok(())
+    }
+
+    fn ensure_palette(&mut self, background: COLORREF, foreground: COLORREF) {
+        if self.background_color.0 == background.0 && self.foreground_color.0 == foreground.0 {
+            return;
+        }
+        self.background = Some(Brush::new(background));
+        self.background_color = background;
+        self.foreground_color = foreground;
+        for row in &self.rows {
+            unsafe {
+                let _ = InvalidateRect(row.label, None, true);
+            }
+        }
+    }
+
     pub(crate) fn code_for_command(&self, command: u16, revision: Revision) -> Option<String> {
         let index = usize::from(command.checked_sub(ID_CODE_COPY_BASE)?);
         let row = self.rows.get(index)?;
@@ -393,7 +486,7 @@ impl CodeBlockControls {
             return;
         };
         row.copied = true;
-        set_control_text(row.button, "✓");
+        set_control_text(row.button, &row.copied_label);
     }
 
     pub(crate) fn reset_feedback(&mut self) {
