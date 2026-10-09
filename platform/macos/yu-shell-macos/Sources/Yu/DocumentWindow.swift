@@ -709,6 +709,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         setSearchPanelHidden(false)
     }
 
+    @objc fileprivate func useSelectionForFindFromMenu(_ sender: Any?) {
+        guard view.window?.firstResponder === textView, !bridge.composition.active, !searchPanel.isComposing else { return }
+        do {
+            guard let query = try bridge.searchQueryFromSelection() else { return }
+            searchPanel.setQuery(query)
+            setSearchPanelHidden(false)
+            focusDocument()
+        } catch { show(error) }
+    }
+
     @objc fileprivate func findAndReplaceFromMenu(_ sender: Any?) {
         findFromMenu(sender)
         searchPanel.setReplaceVisible(true)
@@ -718,18 +728,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     private func replaceFromSearch(_ replacement: String, all: Bool) {
         guard !bridge.composition.active else { return }
         do {
-            let selection = bridge.selection.range
-            let hadCurrentMatch = (bridge.searchMatchesIfAvailable ?? []).contains { $0.range == selection }
             let changed = try textView.replaceSearch(with: replacement, all: all)
             refreshSearch(force: true)
-            if !all, let matches = bridge.searchMatchesIfAvailable, !matches.isEmpty {
-                let cursor = bridge.selection.range
-                let next = changed
-                    ? (matches.first { $0.range.location >= NSMaxRange(cursor) } ?? matches.first)
-                    : (hadCurrentMatch
-                        ? SearchResults.next(after: cursor, in: matches, forward: true)
-                        : (matches.first { $0.range.location >= cursor.location } ?? matches.first))
-                if let next { textView.navigateToSearchMatch(next) }
+            if !all {
+                let next: NSRange?
+                if changed, let matches = bridge.searchMatchesIfAvailable {
+                    next = (matches.first { $0.range.location >= NSMaxRange(bridge.selection.range) } ?? matches.first)?.range
+                } else {
+                    next = try bridge.nextSearchRange(forward: true)
+                }
+                if let next { textView.navigate(toSource: next) }
             }
             scheduleVisualSubmit()
         } catch { show(error) }
@@ -748,13 +756,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     /// **走的是同一个导航入口**（`DocumentTextView.navigate(toSource:)`）：
     /// 选中那一段，滚动由随之而来的 `onCaretChange` 交给 viewport 那条路。
     private func advanceSearch(forward: Bool) {
-        guard let matches = bridge.searchMatchesIfAvailable, !matches.isEmpty else { return }
-        guard let next = SearchResults.next(
-            after: bridge.selection.range,
-            in: matches,
-            forward: forward
-        ) else { return }
-        textView.navigateToSearchMatch(next)
+        guard !bridge.composition.active, !searchPanel.isComposing else { return }
+        if searchPanel.view.isHidden {
+            guard !searchPanel.query.isEmpty else { findFromMenu(nil); return }
+            let responder = view.window?.firstResponder
+            setSearchPanelHidden(false)
+            if let responder { view.window?.makeFirstResponder(responder) }
+        }
+        do {
+            if let range = try bridge.nextSearchRange(forward: forward) { textView.navigate(toSource: range) }
+        } catch { show(error) }
     }
 
     /// 把当前查询的**每一处**匹配都选中，一处一根光标。
@@ -1276,12 +1287,19 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(root, writing: false,
                 message: L10n.tr("Choose a folder to browse local Markdown files.")) else { return }
             let picker = QuickOpenPanel(root: root)
+            let responder = window.firstResponder
+            let searchFields: [NSView] = [searchPanel.focusTarget, searchPanel.replacementFocusTarget]
+            let returnTarget: NSView = searchFields.first(where: { candidate in
+                (candidate as? NSControl)?.currentEditor() === responder || candidate === responder
+            }) ?? (responder as? NSView) ?? textView
             quickOpenPanel = picker
             picker.begin(on: window) { [weak self] url in
                 guard let self else { return }
                 self.quickOpenPanel = nil
                 if let url { self.onOpenDocument?(url) }
-                else { self.focusDocument() }
+                else if returnTarget.window !== window || returnTarget.isHiddenOrHasHiddenAncestor || !window.makeFirstResponder(returnTarget) {
+                    self.focusDocument()
+                }
             }
         } catch { show(error) }
     }
@@ -2753,6 +2771,27 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // Do not leave unattended self-check shutdown blocked on Save/Discard.
         closeAlertDecision = { _ in .alertSecondButtonReturn }
 
+        let navigationRevision = bridge.revision
+        textView.navigate(toSource: replacementFirst.range)
+        focusDocument()
+        useSelectionForFindFromMenu(nil)
+        try require(searchPanel.query == replacementQuery && bridge.selection.range == replacementFirst.range,
+                    "Use Selection for Find must preserve the canonical selection")
+        textView.navigate(toSource: NSRange(location: replacementFirst.range.location, length: 0))
+        setSearchPanelHidden(true)
+        findNextFromMenu(nil)
+        try require(bridge.selection.range == replacementFirst.range && view.window?.firstResponder === textView,
+                    "Find Next must restore a closed query and include the caret-start match without stealing focus")
+        try require(searchPanel.countTextForSelfCheck == "1 / \(replacementHits.count)", "Current-match counter is stale")
+        findNextFromMenu(nil)
+        try require(bridge.selection.range == replacementHits[1 % replacementHits.count].range, "Find Next did not advance")
+        findPreviousFromMenu(nil)
+        try require(bridge.selection.range == replacementFirst.range, "Find Previous did not wrap/return")
+        try require(bridge.revision == navigationRevision && bridge.source == replacementSource, "Search navigation changed source")
+        setSearchPanelHidden(true)
+        _ = try await submit(force: true)
+        print("Yu search navigation window self-check: selection query, caret-start match, closed-bar navigation, match counter and editor focus passed")
+
         let workspaceSource = bridge.source
         let workspaceRevision = bridge.revision
         try await QuickOpenPanel.runWindowSelfCheck(on: try require(view.window, "Missing quick-open owner"))
@@ -3304,9 +3343,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             menuItem.state = bridge.sourceMode ? .on : .off
             return !textView.hasMarkedText()
         }
-        if menuItem.action == #selector(findNextFromMenu(_:)) ||
-            menuItem.action == #selector(findPreviousFromMenu(_:)) ||
-            menuItem.action == #selector(selectAllMatchesFromMenu(_:)) {
+        if menuItem.action == #selector(useSelectionForFindFromMenu(_:)) {
+            return view.window?.firstResponder === textView && !searchPanel.isComposing
+                && (try? bridge.searchQueryFromSelection()) != nil
+        }
+        if menuItem.action == #selector(findNextFromMenu(_:)) || menuItem.action == #selector(findPreviousFromMenu(_:)) {
+            return !searchPanel.query.isEmpty && !bridge.composition.active && !searchPanel.isComposing
+        }
+        if menuItem.action == #selector(selectAllMatchesFromMenu(_:)) {
             // 没有查询就没有「下一个」，也没有「全部匹配」。灰掉比按下去什么
             // 也不发生要诚实。
             return !(bridge.searchMatchesIfAvailable ?? []).isEmpty
@@ -4286,6 +4330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         editMenu.addItem(.separator())
         let findItems: [(String, Selector, String, NSEvent.ModifierFlags)] = [
+            (L10n.tr("Use Selection for Find"), #selector(DocumentViewController.useSelectionForFindFromMenu(_:)), "e", [.command]),
             (L10n.tr("Find"), #selector(DocumentViewController.findFromMenu(_:)), "f", [.command]),
             (L10n.tr("Find and Replace"), #selector(DocumentViewController.findAndReplaceFromMenu(_:)), "f", [.command, .option]),
             (L10n.tr("Find Next"), #selector(DocumentViewController.findNextFromMenu(_:)), "g", [.command]),

@@ -1189,11 +1189,29 @@ impl Chrome {
             && editor.composition().is_none();
         unsafe {
             use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
-            if !can_replace && [self.replace_current, self.replace_all].contains(&GetFocus()) {
-                let _ = SetFocus(self.replacement);
+            if !can_replace
+                && [
+                    self.replace_current,
+                    self.replace_all,
+                    self.search_previous,
+                    self.search_next,
+                ]
+                .contains(&GetFocus())
+            {
+                let _ = SetFocus(if state.replace_visible() {
+                    self.replacement
+                } else {
+                    self.query
+                });
             }
-            let _ = EnableWindow(self.replace_current, can_replace);
-            let _ = EnableWindow(self.replace_all, can_replace);
+            for button in [
+                self.replace_current,
+                self.replace_all,
+                self.search_previous,
+                self.search_next,
+            ] {
+                let _ = EnableWindow(button, can_replace);
+            }
         }
         if self.search_caption_text != caption {
             self.search_caption_text = caption;

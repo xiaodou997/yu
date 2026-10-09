@@ -174,9 +174,10 @@ final class QuickOpenPanel: NSObject, NSSearchFieldDelegate, NSTableViewDataSour
     }
     @objc private func refresh(_ sender: Any?) {
         timer?.invalidate()
+        index = nil
         files = []
         table.reloadData()
-        openButton.isEnabled = false
+        setOpenEnabled(false)
         status.stringValue = L10n.tr("Scanning folder…")
         do { index = try NativeWorkspaceIndex(root: root) }
         catch { showFailure(); return }
@@ -190,9 +191,16 @@ final class QuickOpenPanel: NSObject, NSSearchFieldDelegate, NSTableViewDataSour
         if panel.firstResponder === openButton { panel.makeFirstResponder(field) }
         timer?.invalidate(); timer = nil
         status.stringValue = L10n.tr("Folder unavailable. Choose another folder or refresh.")
-        openButton.isEnabled = false
+        setOpenEnabled(false)
+    }
+    private func setOpenEnabled(_ enabled: Bool) {
+        if !enabled, panel.firstResponder === openButton || panel.firstResponder === table {
+            panel.makeFirstResponder(field)
+        }
+        openButton.isEnabled = enabled
     }
     private func reload() {
+        guard (field.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
         do {
             guard let snapshot = try index?.query(field.stringValue) else { return }
             timer?.invalidate(); timer = nil
@@ -201,8 +209,10 @@ final class QuickOpenPanel: NSObject, NSSearchFieldDelegate, NSTableViewDataSour
             table.reloadData()
             let row = files.firstIndex(where: { $0.path == selected }) ?? 0
             if !files.isEmpty { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
-            openButton.isEnabled = !files.isEmpty
-            status.stringValue = files.isEmpty ? L10n.tr("No matching files") : L10n.format("%d files shown · %d indexed", files.count, snapshot.total)
+            setOpenEnabled(!files.isEmpty)
+            status.stringValue = files.isEmpty
+                ? L10n.tr(snapshot.total == 0 ? "No supported files in this folder" : "No matching files")
+                : L10n.format("%d files shown · %d indexed", files.count, snapshot.total)
             if snapshot.truncated || snapshot.skipped > 0 { status.stringValue += " · " + L10n.tr("Partial index; choose a smaller folder") }
         } catch { showFailure() }
     }
@@ -234,7 +244,7 @@ final class QuickOpenPanel: NSObject, NSSearchFieldDelegate, NSTableViewDataSour
             close(nil)
         } catch {
             status.stringValue = L10n.tr("File unavailable. Refresh the file list.")
-            openButton.isEnabled = false
+            setOpenEnabled(false)
         }
     }
     @objc private func close(_ sender: Any?) {
@@ -258,13 +268,32 @@ final class QuickOpenPanel: NSObject, NSSearchFieldDelegate, NSTableViewDataSour
         while picker.files.isEmpty && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         guard picker.files.count == 2, owner.attachedSheet === picker.panel,
               picker.panel.firstResponder === picker.field.currentEditor() else { throw CocoaError(.coderInvalidValue) }
+        picker.panel.makeFirstResponder(picker.table)
+        picker.field.stringValue = "missing-file"
+        picker.reload()
+        guard picker.files.isEmpty, !picker.openButton.isEnabled,
+              picker.panel.firstResponder === picker.field.currentEditor() else { throw CocoaError(.coderInvalidValue) }
+        picker.field.stringValue = "other"
+        picker.reload()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("other.md"))
+        picker.panel.makeFirstResponder(picker.openButton)
+        picker.openSelected(nil)
+        guard !completed, !picker.openButton.isEnabled,
+              picker.panel.firstResponder === picker.field.currentEditor() else { throw CocoaError(.coderInvalidValue) }
         picker.field.stringValue = "notes 羽🙂"
         picker.reload()
         guard picker.files.count == 1, picker.files[0].relative == "notes/羽🙂.md" else { throw CocoaError(.coderInvalidValue) }
         picker.openSelected(nil)
         while !completed && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         guard completed, selected?.resolvingSymlinksInPath() == target.resolvingSymlinksInPath() else { throw CocoaError(.coderInvalidValue) }
-        print("Yu quick-open window self-check: native sheet, query focus, Unicode path ranking, selection and teardown passed")
+        let cancelled = QuickOpenPanel(root: root)
+        var didCancel = false
+        cancelled.begin(on: owner) { didCancel = $0 == nil }
+        cancelled.close(nil)
+        let cancelDeadline = Date().addingTimeInterval(5)
+        while !didCancel && Date() < cancelDeadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        guard didCancel, cancelled.timer == nil, cancelled.index == nil, owner.attachedSheet == nil else { throw CocoaError(.coderInvalidValue) }
+        print("Yu quick-open window self-check: native sheet, query focus, empty/stale result focus, Unicode ranking, selection and scan cancellation passed")
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { files.count }

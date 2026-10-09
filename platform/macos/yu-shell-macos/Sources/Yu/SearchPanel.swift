@@ -25,31 +25,6 @@ import YuStorageFFI
 //      挪的就是它。壳里两个面板各写一份的时候，分叉的表现是同一段文字在两个
 //      面板上不一样。
 
-enum SearchResults {
-    /// 「跳到下一个/上一个」：以**选区**为游标，环回。
-    ///
-    /// 游标是选区而不是一个存下来的下标：存下标就有两个可以对不上的答案，
-    /// 而选区是导航必然会更新的那一份，Rust 侧的「当前命中」也从它推出来。
-    /// 于是在文档里点一下再按下一个，走的是点的位置——那正是该有的行为。
-    ///
-    /// 比的是起点：光标停在某处命中的起点上时，「下一个」是它后面那一处。
-    ///
-    /// **这一个留在壳里，是登记过的。** 它是这一列数组上的算术，一个字节都
-    /// 不问文档要，把它挪进 Rust 需要新开一个入口——而这一刀挪的三样各自
-    /// **减掉**了一个入口。触发条件写在 overview 的刀 c 第三块那一节：第二端
-    /// 真要写第二份的时候挪，判据现成。
-    static func next(
-        after selection: NSRange,
-        in matches: [NativeSearchMatch],
-        forward: Bool
-    ) -> NativeSearchMatch? {
-        guard !matches.isEmpty else { return nil }
-        if forward {
-            return matches.first { $0.range.location > selection.location } ?? matches.first
-        }
-        return matches.last { $0.range.location < selection.location } ?? matches.last
-    }
-}
 
 /// 面板本体。持有查询框、计数标签与结果列表，暴露两个回调；它不认识
 /// StorageBridge，也不认识窗口。
@@ -93,6 +68,14 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     private let replaceAllButton = NSButton()
     private var heightConstraint: NSLayoutConstraint?
     private let countLabel = NSTextField(labelWithString: "")
+    private let previousButton = NSButton()
+    private let nextButton = NSButton()
+    private var resultQuery = ""
+    var isComposing: Bool {
+        ((field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false)
+            || ((replacementField.currentEditor() as? NSTextView)?.hasMarkedText() ?? false)
+    }
+
     private let scrollView = NSScrollView()
     private let tableView = NSTableView()
     private var rows: [NativeSearchMatch] = []
@@ -146,8 +129,13 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         view.translatesAutoresizingMaskIntoConstraints = false
-        let previous = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: L10n.tr("Previous"))!, target: self, action: #selector(previousMatch(_:)))
-        let next = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: L10n.tr("Next"))!, target: self, action: #selector(nextMatch(_:)))
+        let previous = previousButton
+        previous.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: L10n.tr("Previous"))
+        previous.target = self; previous.action = #selector(previousMatch(_:))
+        let next = nextButton
+        next.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: L10n.tr("Next"))
+        next.target = self; next.action = #selector(nextMatch(_:))
+        previous.isEnabled = false; next.isEnabled = false
         let close = NSButton(title: L10n.tr("Done"), target: self, action: #selector(closeFind(_:)))
         for button in [previous, next, close] { button.bezelStyle = .rounded; button.controlSize = .small }
         replacementToggle.target = self
@@ -290,15 +278,22 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     /// 结果是照某一份查询算出来的，而查询框里的字随时可能已经是下一个了。
     func reload(rows: [NativeSearchMatch], query: String) {
         self.rows = rows
+        resultQuery = query
         tableView.reloadData()
-        if rows.isEmpty, view.window?.firstResponder === replaceButton || view.window?.firstResponder === replaceAllButton {
-            view.window?.makeFirstResponder(replacementField)
+        if rows.isEmpty, let responder = view.window?.firstResponder,
+           [replaceButton, replaceAllButton, previousButton, nextButton].contains(where: { $0 === responder }) {
+            view.window?.makeFirstResponder(replacementRow.isHidden ? field : replacementField)
         }
-        replaceButton.isEnabled = !rows.isEmpty
-        replaceAllButton.isEnabled = !rows.isEmpty
+        for button in [replaceButton, replaceAllButton, previousButton, nextButton] { button.isEnabled = !rows.isEmpty }
+        updateMatchCount(selection: nil)
+    }
+
+    private func updateMatchCount(selection: NSRange?) {
+        let current = selection.flatMap { selected in rows.firstIndex { $0.range == selected } }.map { $0 + 1 } ?? 0
         countLabel.stringValue = rows.isEmpty
-            ? (query.isEmpty ? "" : L10n.tr("No matches"))
-            : L10n.format(rows.count == 1 ? "%d match" : "%d matches", rows.count)
+            ? (resultQuery.isEmpty ? "" : L10n.tr("No matches"))
+            : "\(current) / \(rows.count)"
+        countLabel.setAccessibilityValue(countLabel.stringValue)
     }
 
     /// 把「当前命中」那一行选中，不触发导航回调。
@@ -306,6 +301,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     /// 当前命中由选区决定（Rust 侧那份定义），所以这里收的是选区，不是一个
     /// 面板自己维护的下标——存下标就会有第二个可以对不上的答案。
     func highlightRow(matching selection: NSRange) {
+        updateMatchCount(selection: selection)
         restoringSelection = true
         defer { restoringSelection = false }
         guard let row = rows.firstIndex(where: { $0.range == selection }) else {

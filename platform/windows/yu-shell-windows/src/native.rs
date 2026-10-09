@@ -126,6 +126,13 @@ use crate::text_input::{
 use crate::tsf::{TsfHost, WM_APP_TSF_LOCK};
 use crate::{DocumentSlot, Locale, SaveAction, ShellError, ShellState, SidebarMode, WindowMetrics};
 
+const ID_SEARCH_SELECTION: u16 = 2213;
+const _: () = assert!(
+    ID_SEARCH_SELECTION != ID_SEARCH_OPTIONS
+        && ID_SEARCH_SELECTION != ID_SEARCH_CASE
+        && ID_SEARCH_SELECTION != ID_SEARCH_WORD
+);
+
 const MAIN_CLASS: PCWSTR = w!("YuEditorWindow");
 const SURFACE_CLASS: PCWSTR = w!("YuEditorSurface");
 
@@ -2798,6 +2805,21 @@ impl AppWindow {
             append_string(edit.0, ID_SEARCH, &format!("{}\tCtrl+F", strings.search()))?;
             append_string(
                 edit.0,
+                ID_SEARCH_NEXT,
+                &format!("{}\tF3", strings.find_action(0)),
+            )?;
+            append_string(
+                edit.0,
+                ID_SEARCH_PREVIOUS,
+                &format!("{}\tShift+F3", strings.find_action(1)),
+            )?;
+            append_string(
+                edit.0,
+                ID_SEARCH_SELECTION,
+                &format!("{}\tCtrl+E", strings.find_action(2)),
+            )?;
+            append_string(
+                edit.0,
                 ID_FIND_REPLACE,
                 &format!("{}\tCtrl+H", strings.find_and_replace()),
             )?;
@@ -3236,14 +3258,8 @@ impl AppWindow {
             }
             ID_FILE_OPEN => {
                 if let Some(path) = open_file_dialog(self.hwnd)? {
-                    let candidate = DocumentSlot::open(path)?;
-                    if self.confirm_replace_current()? {
-                        self.state.replace_document(candidate);
-                        if let Some(chrome) = self.chrome.as_mut() {
-                            chrome.invalidate_content();
-                        }
-                        self.refresh_chrome();
-                    }
+                    // Use the same identity/unsaved-content/viewport path as Quick Open.
+                    self.activate_panel_action(Some(PanelAction::File(path)), true)?;
                 }
             }
             ID_FILE_SAVE => {
@@ -3293,6 +3309,33 @@ impl AppWindow {
                 self.update_layout();
                 unsafe {
                     let _ = SetFocus(self.surface);
+                }
+            }
+            ID_SEARCH_NEXT | ID_SEARCH_PREVIOUS => {
+                self.advance_search(command == ID_SEARCH_NEXT)?;
+            }
+            ID_SEARCH_SELECTION => {
+                if unsafe { GetFocus() } != self.surface || self.search_input_is_composing() {
+                    return Ok(());
+                }
+                let Some(query) = self
+                    .state
+                    .document()
+                    .session()
+                    .document()
+                    .editor()
+                    .search_query_from_selection()
+                else {
+                    return Ok(());
+                };
+                let Some(field) = self.chrome.as_ref().map(|chrome| chrome.query) else {
+                    return Ok(());
+                };
+                set_window_text(field, &query);
+                self.state.set_search_visible(true);
+                self.update_layout();
+                if let Some(tsf) = self.tsf.as_ref() {
+                    tsf.notify_layout_change();
                 }
             }
             ID_SEARCH_OPTIONS => {
@@ -3459,11 +3502,33 @@ impl AppWindow {
         Ok(())
     }
 
+    fn search_input_is_composing(&self) -> bool {
+        self.state.document().session().composition().is_some()
+            || self.chrome.as_ref().is_some_and(|chrome| {
+                chrome.query_is_composing() || chrome.replacement_is_composing()
+            })
+    }
+
     fn advance_search(&mut self, forward: bool) -> Result<(), ShellError> {
-        if !self.state.search_visible() {
+        if self.search_input_is_composing() {
             return Ok(());
         }
-        self.refresh_chrome();
+        if !self.state.search_visible() {
+            if self
+                .chrome
+                .as_ref()
+                .is_none_or(|chrome| chrome.query_text().is_empty())
+            {
+                return self.handle_chrome_command(ID_SEARCH, 0);
+            }
+            // Restore the retained query without moving focus away from the document.
+            self.state.set_search_visible(true);
+            self.update_layout();
+            if let Some(tsf) = self.tsf.as_ref() {
+                tsf.notify_layout_change();
+            }
+        }
+        self.render_current()?;
         let selection = self.state.document().session().selection().ordered_range();
         let action = self
             .state
@@ -3472,23 +3537,8 @@ impl AppWindow {
             .document()
             .editor()
             .search()
-            .and_then(|search| {
-                let matches = search.matches();
-                if forward {
-                    matches
-                        .iter()
-                        .find(|hit| hit.start() > selection.start())
-                        .or_else(|| matches.first())
-                } else {
-                    matches
-                        .iter()
-                        .rev()
-                        .find(|hit| hit.start() < selection.start())
-                        .or_else(|| matches.last())
-                }
-                .copied()
-                .map(PanelAction::Select)
-            });
+            .and_then(|search| search.next_match(selection, forward))
+            .map(PanelAction::Select);
         self.activate_panel_action(action, false)
     }
 
@@ -3885,6 +3935,31 @@ fn register_classes_once() -> Result<(), ShellError> {
 
 fn create_accelerators() -> Result<HACCEL, ShellError> {
     let entries = [
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F3.0,
+            cmd: ID_SEARCH_NEXT,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FSHIFT,
+            key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F3.0,
+            cmd: ID_SEARCH_PREVIOUS,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'G' as u16,
+            cmd: ID_SEARCH_NEXT,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL | FSHIFT,
+            key: b'G' as u16,
+            cmd: ID_SEARCH_PREVIOUS,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'E' as u16,
+            cmd: ID_SEARCH_SELECTION,
+        },
         ACCEL {
             fVirt: FVIRTKEY,
             key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F10.0,
@@ -6236,6 +6311,76 @@ mod tests {
                 .len(),
             2
         );
+        let first = app
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .search()
+            .expect("search")
+            .matches()[0];
+        app.activate_panel_action(
+            Some(PanelAction::Select(TextRange::empty(first.start()))),
+            true,
+        )
+        .expect("caret at match start");
+        app.handle_chrome_command(ID_SEARCH_CLOSE, 0)
+            .expect("close query");
+        let revision = app.state.document().session().revision();
+        app.handle_command(ID_SEARCH_NEXT)
+            .expect("global Find Next restores query");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            first
+        );
+        assert_eq!(
+            unsafe { GetFocus() },
+            app.surface,
+            "navigation must retain document focus"
+        );
+        app.handle_command(ID_SEARCH_SELECTION)
+            .expect("use selection");
+        assert_eq!(app.chrome.as_ref().expect("chrome").query_text(), "中文😀");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            first
+        );
+        app.handle_command(ID_SEARCH_NEXT).expect("next command");
+        assert_ne!(
+            app.state.document().session().selection().ordered_range(),
+            first
+        );
+        app.handle_command(ID_SEARCH_PREVIOUS)
+            .expect("previous command");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            first
+        );
+        unsafe {
+            SendMessageW(
+                query,
+                windows::Win32::UI::WindowsAndMessaging::WM_IME_STARTCOMPOSITION,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        app.handle_command(ID_SEARCH_NEXT)
+            .expect("query composition guard");
+        assert_eq!(
+            app.state.document().session().selection().ordered_range(),
+            first
+        );
+        unsafe {
+            SendMessageW(
+                query,
+                windows::Win32::UI::WindowsAndMessaging::WM_IME_ENDCOMPOSITION,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        assert_eq!(app.state.document().session().revision(), revision);
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
         drop(window);
     }
 }

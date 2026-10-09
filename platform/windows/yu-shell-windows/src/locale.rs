@@ -87,6 +87,42 @@ pub struct Strings {
 }
 
 impl Strings {
+    pub fn find_action(self, index: usize) -> &'static str {
+        let values = match self.locale {
+            Locale::English => [
+                "Find Next",
+                "Find Previous",
+                "Use Selection for Find",
+                "No supported files in this folder",
+            ],
+            Locale::SimplifiedChinese => [
+                "查找下一个",
+                "查找上一个",
+                "用选中文本查找",
+                "此文件夹中没有支持的文件",
+            ],
+            Locale::TraditionalChinese => [
+                "尋找下一個",
+                "尋找上一個",
+                "使用選取文字尋找",
+                "此資料夾中沒有支援的檔案",
+            ],
+            Locale::Japanese => [
+                "次を検索",
+                "前を検索",
+                "選択したテキストを検索",
+                "このフォルダに対応するファイルはありません",
+            ],
+            Locale::Korean => [
+                "다음 찾기",
+                "이전 찾기",
+                "선택한 텍스트로 찾기",
+                "이 폴더에 지원되는 파일이 없습니다",
+            ],
+        };
+        values[index]
+    }
+
     pub fn navigation(self, text: NavigationText) -> &'static str {
         let values = match self.locale {
             Locale::English => [

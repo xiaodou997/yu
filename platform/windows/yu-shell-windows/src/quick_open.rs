@@ -95,7 +95,7 @@ impl Picker {
     }
     fn enable_open(&self, enabled: bool) {
         unsafe {
-            if !enabled && GetFocus() == self.controls[6] {
+            if !enabled && [self.controls[6], self.controls[2]].contains(&GetFocus()) {
                 let _ = SetFocus(self.controls[1]);
             }
             let _ = EnableWindow(self.controls[6], enabled);
@@ -133,7 +133,12 @@ impl Picker {
             .map(|file| file.path.clone());
         self.rows = index.search(&query, 100).into_iter().cloned().collect();
         let status = if self.rows.is_empty() {
-            self.strings.workspace(Text::NoMatches).to_owned()
+            if index.files.is_empty() {
+                self.strings.find_action(3)
+            } else {
+                self.strings.workspace(Text::NoMatches)
+            }
+            .to_owned()
         } else {
             format!(
                 "{} / {} — {}",

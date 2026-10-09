@@ -3,6 +3,28 @@ use super::*;
 use yu_text::Edit;
 
 impl EditorDocument {
+    /// Bounded canonical text for the explicit Use Selection for Find action.
+    /// Multi-cursor/grid selections and active composition are not query seeds.
+    #[must_use]
+    pub fn search_query_from_selection(&self) -> Option<String> {
+        if self.composition().is_some()
+            || self.selections().is_multiple()
+            || self.selections().table_columns().is_some()
+        {
+            return None;
+        }
+        let range = self.selection().ordered_range();
+        let length = range.end().get() - range.start().get();
+        if length == 0 || length > 4096 {
+            return None;
+        }
+        let snapshot = self.snapshot();
+        let text = snapshot
+            .as_str()
+            .get(range.start().get() as usize..range.end().get() as usize)?;
+        (!text.contains(['\r', '\n', '\0'])).then(|| text.to_owned())
+    }
+
     /// Replace the exact current match, or all non-overlapping matches.
     ///
     /// An unrelated selection is never a replacement target. All replacements
@@ -91,6 +113,37 @@ mod tests {
         )
         .expect("valid selection");
         document.set_selection(selection).expect("select");
+    }
+
+    #[test]
+    fn selected_query_is_bounded_unicode_source_and_never_an_edit() {
+        let mut document = EditorDocument::new("**羽🙂**\nnext");
+        assert_eq!(document.search_query_from_selection(), None);
+        select(&mut document, 0, 11);
+        let revision = document.revision();
+        assert_eq!(
+            document.search_query_from_selection().as_deref(),
+            Some("**羽🙂**")
+        );
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.history_stats().undo_entries(), 0);
+        select(&mut document, 0, 12);
+        assert_eq!(document.search_query_from_selection(), None);
+        let mut long = EditorDocument::new("x".repeat(4097));
+        select(&mut long, 0, 4096);
+        assert_eq!(
+            long.search_query_from_selection().expect("bounded").len(),
+            4096
+        );
+        select(&mut long, 0, 4097);
+        assert_eq!(long.search_query_from_selection(), None);
+        long.begin_composition(
+            TextRange::empty(ByteOffset::ZERO),
+            "候选",
+            yu_core::Utf16Range::empty(yu_core::Utf16Offset::ZERO),
+        )
+        .expect("composition");
+        assert_eq!(long.search_query_from_selection(), None);
     }
 
     #[test]

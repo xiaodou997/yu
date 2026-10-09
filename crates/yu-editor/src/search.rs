@@ -124,6 +124,31 @@ impl SearchState {
         self.matches.is_empty()
     }
 
+    /// Resolve navigation without changing selection or keeping a second cursor.
+    /// A caret at a match start includes that match; an exact selected match
+    /// advances past it. Both directions wrap, and empty results stay empty.
+    #[must_use]
+    pub fn next_match(&self, selection: TextRange, forward: bool) -> Option<TextRange> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let index = if forward {
+            self.current(selection).map_or_else(
+                || {
+                    self.matches
+                        .partition_point(|hit| hit.start() < selection.start())
+                },
+                |current| current + 1,
+            ) % self.matches.len()
+        } else {
+            self.matches
+                .partition_point(|hit| hit.start() < selection.start())
+                .checked_sub(1)
+                .unwrap_or(self.matches.len() - 1)
+        };
+        Some(self.matches[index])
+    }
+
     /// 「当前匹配」：选区**恰好**落在哪一个匹配上。
     ///
     /// 恰好相等，不是相交——相交会让一次「全选」把每个匹配都变成当前。跳到
@@ -311,6 +336,24 @@ mod tests {
         document.set_search_query_with_options("yu", SearchOptions::default());
         assert_ne!(document.search_generation(), generation);
         assert_eq!(document.search().expect("search").matches().len(), 1);
+    }
+
+    #[test]
+    fn navigation_includes_caret_start_but_advances_selected_matches() {
+        let state = SearchState::new(&snapshot("Yu🙂Yu Yu"), "Yu");
+        assert_eq!(state.next_match(range(0, 0), true), Some(range(0, 2)));
+        assert_eq!(state.next_match(range(0, 2), true), Some(range(6, 8)));
+        assert_eq!(state.next_match(range(6, 6), true), Some(range(6, 8)));
+        assert_eq!(state.next_match(range(6, 9), true), Some(range(6, 8)));
+        assert_eq!(state.next_match(range(9, 11), true), Some(range(0, 2)));
+        assert_eq!(state.next_match(range(0, 2), false), Some(range(9, 11)));
+        assert_eq!(state.next_match(range(6, 8), false), Some(range(0, 2)));
+        assert_eq!(state.next_match(range(7, 7), false), Some(range(6, 8)));
+        assert_eq!(state.next_match(range(11, 11), false), Some(range(9, 11)));
+        assert_eq!(
+            SearchState::new(&snapshot(""), "Yu").next_match(range(0, 0), true),
+            None
+        );
     }
 
     #[test]

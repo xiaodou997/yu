@@ -991,6 +991,14 @@ int32_t yu_storage_session_set_search_query(
  * Other bits are invalid. NULL/0 clears; non-NULL/0 keeps an empty query. */
 int32_t yu_storage_session_set_search_query_options(
     YuStorageSession *session, const uint8_t *text, size_t text_length, uint8_t flags);
+/* Read-only shared navigation, forward=0/1. found=0 means no matches. */
+int32_t yu_storage_session_next_search_match(
+    const YuStorageSession *session, uint64_t expected_revision, uint8_t forward,
+    YuStorageAccessibilityRange *output, uint8_t *found);
+/* Two-pass UTF-8 selection query, <=4096 bytes; empty means ineligible. */
+int32_t yu_storage_session_copy_search_selection(
+    const YuStorageSession *session, uint64_t expected_revision,
+    uint8_t *output, size_t capacity, size_t *length);
 /* Revision-bound literal source replacement. all=0 replaces only an exact
  * current match; all!=0 replaces the snapshot's matches in one undo step.
  * Empty replacement deletes; empty query/no match is a no-op. */

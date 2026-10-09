@@ -9785,6 +9785,87 @@ pub unsafe extern "C" fn yu_storage_session_set_search_query_options(
     YU_STORAGE_OK
 }
 
+/// Resolve a search navigation target through the shared selection-based policy.
+/// Does not change source, selection, history, or composition.
+/// # Safety
+/// Session must be live; output and found must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_next_search_match(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    forward: u8,
+    output: *mut YuStorageAccessibilityRange,
+    found: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() || found.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if forward > 1 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let editor = session.session.document().editor();
+    if editor.composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+    let target = editor
+        .search()
+        .and_then(|search| search.next_match(editor.selection().ordered_range(), forward != 0));
+    let mut result = YuStorageAccessibilityRange {
+        revision: expected_revision,
+        start_utf16: 0,
+        end_utf16: 0,
+    };
+    if let Some(range) = target {
+        let snapshot = editor.snapshot();
+        let (Ok(start), Ok(end)) = (
+            snapshot.utf16_offset(range.start()),
+            snapshot.utf16_offset(range.end()),
+        ) else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        result.start_utf16 = start.get();
+        result.end_utf16 = end.get();
+    }
+    unsafe {
+        output.write(result);
+        found.write(u8::from(target.is_some()));
+    }
+    YU_STORAGE_OK
+}
+
+/// Copy at most 4096 bytes of a single-line canonical selection for Find.
+/// Zero length means no eligible selection. Standard two-pass byte protocol.
+/// # Safety
+/// Session must be live; length writable; output writable for capacity bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_search_selection(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let query = session
+        .session
+        .document()
+        .editor()
+        .search_query_from_selection()
+        .unwrap_or_default();
+    write_bytes(query.as_bytes(), output, capacity, length)
+}
+
 /// Replace an exact current search match, or all matches, as one undo step.
 /// Unlike changing a query, a replacement must reject a stale source revision.
 /// # Safety
@@ -17032,6 +17113,112 @@ mod tests {
     /// 「匹配找得对不对」在 `yu-editor::search` 的用例里，「那一行剥干净没有」
     /// 在 `yu-editor` 的 `panel` 用例里；这里压的是 ABI 那一层：位置换算与
     /// 两个缓冲区的对齐。
+    #[test]
+    fn ffi_search_navigation_and_selection_query_are_read_only_and_revision_bound() {
+        let path = std::env::temp_dir().join(format!("yu-search-navigation-{}.md", temp_id()));
+        fs::write(&path, "Yu🙂Yu").expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, b"Yu".as_ptr(), 2) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_selection_endpoints(raw, 0, 0, 0, 1) },
+            YU_STORAGE_OK
+        );
+        let mut output = YuStorageAccessibilityRange::default();
+        let mut found = 99;
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 0, 1, &mut output, &mut found) },
+            YU_STORAGE_OK
+        );
+        assert_eq!((found, output.start_utf16, output.end_utf16), (1, 0, 2));
+        assert!(
+            unsafe { &*raw }
+                .session
+                .selection()
+                .ordered_range()
+                .is_empty()
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_selection_endpoints(raw, 0, 0, 2, 1) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 0, 1, &mut output, &mut found) },
+            YU_STORAGE_OK
+        );
+        assert_eq!((found, output.start_utf16, output.end_utf16), (1, 4, 6));
+        let mut length = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_search_selection(raw, 0, ptr::null_mut(), 0, &mut length)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(length, 2);
+        let mut data = [0; 2];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_search_selection(raw, 0, data.as_mut_ptr(), 1, &mut length)
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_search_selection(raw, 0, data.as_mut_ptr(), 2, &mut length)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(&data, b"Yu");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_search_selection(raw, 1, data.as_mut_ptr(), 2, &mut length)
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 1, 1, &mut output, &mut found) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 0, 2, &mut output, &mut found) },
+            YU_STORAGE_INVALID_COMMAND
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 0, 1, ptr::null_mut(), &mut found) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "Yu🙂Yu");
+        assert_eq!(
+            unsafe { &*raw }
+                .session
+                .document()
+                .editor()
+                .history_stats()
+                .undo_entries(),
+            0
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, ptr::null(), 0) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_next_search_match(raw, 0, 1, &mut output, &mut found) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(found, 0);
+        unsafe {
+            yu_storage_session_destroy(raw);
+        }
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[test]
     fn ffi_search_options_validate_flags_and_share_replacement_offsets() {
         let path = std::env::temp_dir().join(format!("yu-search-options-{}.md", temp_id()));

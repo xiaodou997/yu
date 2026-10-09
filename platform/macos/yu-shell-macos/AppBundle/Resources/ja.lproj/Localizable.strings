@@ -1,3 +1,5 @@
+"Use Selection for Find" = "選択したテキストを検索";
+"No supported files in this folder" = "このフォルダに対応するファイルはありません";
 "Search in Markdown source" = "Markdownソースを検索";
 "Match Case" = "大文字と小文字を区別";
 "Whole Words" = "単語単位";

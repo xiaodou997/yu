@@ -1661,6 +1661,33 @@ final class StorageBridge {
         } == StorageStatus.ok
     }
 
+    func nextSearchRange(forward: Bool) throws -> NSRange? {
+        var output = YuStorageAccessibilityRange()
+        var found: UInt8 = 0
+        let status = yu_storage_session_next_search_match(handle, revision, forward ? 1 : 0, &output, &found)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        guard found != 0 else { return nil }
+        guard let start = Int(exactly: output.start_utf16), let end = Int(exactly: output.end_utf16), end >= start else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    func searchQueryFromSelection() throws -> String? {
+        let expectedRevision = revision
+        var length = 0
+        let status = yu_storage_session_copy_search_selection(handle, expectedRevision, nil, 0, &length)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        guard length > 0 else { return nil }
+        guard length <= 4096 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var bytes = [UInt8](repeating: 0, count: length)
+        let copied = bytes.withUnsafeMutableBufferPointer {
+            yu_storage_session_copy_search_selection(handle, expectedRevision, $0.baseAddress, $0.count, &length)
+        }
+        guard copied == StorageStatus.ok, length == bytes.count else { throw BridgeError.operation(copied) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     func replaceSearch(with text: String, all: Bool) throws -> NativeCommandResult {
         let expectedRevision = revision
         let bytes = Array(text.utf8)

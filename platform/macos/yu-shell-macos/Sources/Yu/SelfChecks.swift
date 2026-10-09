@@ -2069,7 +2069,7 @@ func runSearchPanelSelfCheck(path: String) -> Never {
             "两行结果指向了同一处命中"
         )
         precondition(
-            panel.countTextForSelfCheck == L10n.format("%d matches", 6),
+            panel.countTextForSelfCheck == "0 / 6",
             panel.countTextForSelfCheck
         )
 
@@ -2086,6 +2086,7 @@ func runSearchPanelSelfCheck(path: String) -> Never {
             )
             // 3. 「当前命中」由选区推出来，所以列表上高亮的必须是同一行。
             panel.highlightRow(matching: bridge.selection.range)
+            precondition(panel.countTextForSelfCheck == "\(row + 1) / \(rows.count)", "Current-match count must follow source selection")
             precondition(
                 panel.selectedRowForSelfCheck == row,
                 "选区落在第 \(row) 处命中，列表上高亮的却是第 "
@@ -2099,15 +2100,15 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         let last = try unwrapSelfCheck(matches.last)
         textView.navigateToSearchMatch(last)
         let wrapped = try unwrapSelfCheck(
-            SearchResults.next(after: bridge.selection.range, in: matches, forward: true)
+            try bridge.nextSearchRange(forward: true)
         )
-        precondition(wrapped.range == matches[0].range, "最后一处的下一个应当环回到第一处")
+        precondition(wrapped == matches[0].range, "最后一处的下一个应当环回到第一处")
         // 反向从第一处环回到最后一处。
         textView.navigateToSearchMatch(matches[0])
         let wrappedBack = try unwrapSelfCheck(
-            SearchResults.next(after: bridge.selection.range, in: matches, forward: false)
+            try bridge.nextSearchRange(forward: false)
         )
-        precondition(wrappedBack.range == last.range, "第一处的上一个应当环回到最后一处")
+        precondition(wrappedBack == last.range, "第一处的上一个应当环回到最后一处")
 
         // 5. 选区离开任何命中之后，列表上不该还有高亮。
         try bridge.setSelection(NSRange(location: 0, length: 0))

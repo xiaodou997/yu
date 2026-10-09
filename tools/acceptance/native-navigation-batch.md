@@ -8,6 +8,8 @@ These features share the canonical Markdown editor and existing safe document-sw
 | Action | macOS | Windows |
 | --- | --- | --- |
 | Find | Command+F | Ctrl+F |
+| Next / previous match | Command+G / Shift+Command+G | F3 / Shift+F3; Ctrl+G / Ctrl+Shift+G |
+| Use selection for Find | Command+E | Ctrl+E |
 | Find and replace | Option+Command+F | Ctrl+H |
 | Quick open | Shift+Command+O | Ctrl+Shift+O |
 | Open folder | Option+Command+O | Ctrl+Alt+O |
@@ -23,6 +25,13 @@ Print keeps its existing Command+P shortcut. Folder selection does not modify or
 4. Keep unsaved edits, use quick open, cancel the existing Save/Discard prompt, and verify exact source, selection and undo remain intact. Repeat with Save and Discard. Folder-only navigation must not prompt to close the document. Check external-save conflicts and already-open-file deduplication on macOS.
 5. Find/replace: literal search with Match Case and Whole Words options; test Straße/STRASSE, Greek sigma, dotted I, combining marks, underscore and CJK boundaries; check option changes refresh highlights without editing source; single/all/empty replacements; adjacent deletions; replacement containing the query; no-op replacement; single-step undo/redo; source/visual mode and long-file navigation. Do not let IME Return/Escape accidentally execute commands.
 6. Run the entire batch in light/dark/high-contrast appearance where supported, five UI languages, and Windows 100/125/150/200% scaling. Check long-label layout, accessible field names, keyboard focus visibility, multi-monitor DPI changes, and disabled controls.
+
+## Keyboard and focus completion
+
+- Use Selection for Find copies a single-line source selection up to 4096 UTF-8 bytes without changing it; multiline, empty, grid, multi-cursor and active preedit selections are not seeds. It applies only with document focus so native text fields retain their editing shortcuts.
+- Starting Find Next at a match's first character selects that match. Repeating advances and wraps. The policy is shared Rust code, including macOS through the read-only revision-bound ABI. With the bar closed, Next/Previous restores the retained query while preserving editor focus.
+- Check the current/total match counter, unavailable navigation/replace buttons, and focus when their last match disappears. Quick Open distinguishes an empty supported-file index from a query with zero matches; disappearing results and stale-file failure return keyboard focus to the query. Cancel during scanning must dispose the index and timers.
+- Windows ordinary Open, Quick Open, recent files and file-sidebar actions use the same same-file/Save/Discard/Cancel path. Opening the currently edited file again must not reload its disk version.
 
 ## Automation included
 
