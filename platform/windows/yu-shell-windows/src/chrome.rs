@@ -51,6 +51,9 @@ pub(crate) const ID_REPLACEMENT: u16 = 2202;
 pub(crate) const ID_REPLACE_CURRENT: u16 = 2203;
 pub(crate) const ID_REPLACE_ALL: u16 = 2204;
 pub(crate) const ID_FIND_REPLACE: u16 = 2205;
+pub(crate) const ID_SEARCH_OPTIONS: u16 = 2210;
+pub(crate) const ID_SEARCH_CASE: u16 = 2211;
+pub(crate) const ID_SEARCH_WORD: u16 = 2212;
 pub(crate) const ID_DOCUMENT_SCROLLBAR: u16 = 2009;
 pub(crate) const ID_MENU_FILE: u16 = 2101;
 pub(crate) const ID_MENU_EDIT: u16 = 2102;
@@ -551,6 +554,8 @@ pub(crate) struct Chrome {
     pub(crate) query: HWND,
     pub(crate) replacement: HWND,
     replace_toggle: HWND,
+    pub(crate) search_options_button: HWND,
+    pub(crate) search_options: yu_editor::SearchOptions,
     replace_current: HWND,
     replace_all: HWND,
     replacement_frame: HWND,
@@ -576,7 +581,7 @@ pub(crate) struct Chrome {
     appearance: Appearance,
     mode: SidebarMode,
     rows: Vec<Row>,
-    search_cache: Option<(PathBuf, Revision, String, bool)>,
+    search_cache: Option<(u64, Revision, String, bool, yu_editor::SearchOptions)>,
     search_caption_text: String,
     cache: Option<(PathBuf, Revision, SidebarMode)>,
     empty_text: String,
@@ -610,6 +615,7 @@ impl Chrome {
             .chain([
                 self.list,
                 self.query,
+                self.search_options_button,
                 self.replace_toggle,
                 self.replacement,
                 self.replace_current,
@@ -718,6 +724,14 @@ impl Chrome {
         if !unsafe { SetWindowSubclass(replacement, Some(query_subclass), 1, 0) }.as_bool() {
             return Err(error(windows::core::Error::from_win32()));
         }
+        let search_options_button = child(
+            parent,
+            w!("BUTTON"),
+            strings.navigation(crate::locale::NavigationText::SearchOptions),
+            BS_OWNERDRAW as u32,
+            ID_SEARCH_OPTIONS,
+            true,
+        )?;
         let replace_toggle = child(
             parent,
             w!("BUTTON"),
@@ -742,7 +756,12 @@ impl Chrome {
             ID_REPLACE_ALL,
             true,
         )?;
-        for button in [replace_toggle, replace_current, replace_all] {
+        for button in [
+            replace_toggle,
+            replace_current,
+            replace_all,
+            search_options_button,
+        ] {
             if !unsafe { SetWindowSubclass(button, Some(tab_subclass), 1, 0) }.as_bool() {
                 return Err(error(windows::core::Error::from_win32()));
             }
@@ -920,6 +939,8 @@ impl Chrome {
             replacement_frame,
             replace_toggle,
             replace_current,
+            search_options_button,
+            search_options: yu_editor::SearchOptions::default(),
             replace_all,
             list,
             menu_buttons,
@@ -1134,10 +1155,11 @@ impl Chrome {
             String::new()
         };
         let key = (
-            state.document().session().path().to_owned(),
+            state.document().identity(),
             state.document().session().revision(),
             query.clone(),
             visible,
+            self.search_options,
         );
         let selection = state.document().session().selection().ordered_range();
         let editor = state
@@ -1148,7 +1170,7 @@ impl Chrome {
         let changed = self.search_cache.as_ref() != Some(&key);
         if changed {
             if visible {
-                editor.set_search_query(&query);
+                editor.set_search_query_with_options(&query, self.search_options);
             } else {
                 editor.clear_search();
             }
@@ -1386,7 +1408,7 @@ impl Chrome {
             let close_w = metrics.px(60.0);
             let count_w = metrics.px(56.0);
             let query_w =
-                (search_w - padding * 2 - gap * 5 - toggle_w - count_w - button_w * 2 - close_w)
+                (search_w - padding * 2 - gap * 6 - toggle_w - count_w - button_w * 3 - close_w)
                     .max(1);
             let top = header_h + metrics.px(12.0);
             let control_h = metrics.px(32.0);
@@ -1469,6 +1491,7 @@ impl Chrome {
             );
             let mut left = search_left + query_w + gap;
             for (hwnd, control_w) in [
+                (self.search_options_button, button_w),
                 (self.search_caption, count_w),
                 (self.search_previous, button_w),
                 (self.search_next, button_w),
@@ -1481,6 +1504,7 @@ impl Chrome {
                 self.search_background,
                 self.query_frame,
                 self.replace_toggle,
+                self.search_options_button,
                 self.query,
                 self.search_close,
                 self.search_caption,
@@ -1502,7 +1526,7 @@ impl Chrome {
         Ok(())
     }
 
-    fn controls(&self) -> [HWND; 25] {
+    fn controls(&self) -> [HWND; 26] {
         [
             self.canvas,
             self.background,
@@ -1520,6 +1544,7 @@ impl Chrome {
             self.replacement,
             self.replacement_frame,
             self.replace_toggle,
+            self.search_options_button,
             self.replace_current,
             self.replace_all,
             self.empty,
@@ -1648,6 +1673,7 @@ impl Chrome {
                 self.search_previous,
                 self.search_next,
                 self.replace_toggle,
+                self.search_options_button,
                 self.replace_current,
                 self.replace_all,
             ]
@@ -1663,7 +1689,11 @@ impl Chrome {
                 if !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool() {
                     text_color = self.palette.muted;
                 }
-                if [self.replace_toggle, self.replace_current, self.replace_all].contains(&hwnd) {
+                if hwnd == self.search_options_button {
+                    "⋯".into()
+                } else if [self.replace_toggle, self.replace_current, self.replace_all]
+                    .contains(&hwnd)
+                {
                     window_text(hwnd)
                 } else if hwnd == self.search_close {
                     search_done(self.locale).into()

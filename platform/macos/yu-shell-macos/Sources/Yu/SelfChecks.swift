@@ -2170,6 +2170,34 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         precondition(!noOp && bridge.revision == noOpRevision, "Empty search must not dirty the document")
         panel.setReplaceVisible(false)
 
+        try NavigationHistory.checkForSelfCheck()
+        let optionsURL = fileManager.temporaryDirectory.appendingPathComponent("yu-options-\(UUID().uuidString).md")
+        try "🙂 Straße STRASSE Yu Yule".write(to: optionsURL, atomically: true, encoding: .utf8)
+        defer { try? fileManager.removeItem(at: optionsURL) }
+        let optionsBridge = try StorageBridge(path: optionsURL.path)
+        let optionsView = DocumentTextView(bridge: optionsBridge)
+        let optionsPanel = SearchPanel()
+        optionsPanel.onQueryChange = { [weak optionsPanel] query in
+            guard let panel = optionsPanel else { return }
+            precondition(optionsBridge.setSearchQuery(query, matchCase: panel.matchCase, wholeWords: panel.wholeWords))
+        }
+        optionsPanel.setQuery("strasse")
+        optionsPanel.setOptions(matchCase: false, wholeWords: true)
+        let folded = try unwrapSelfCheck(optionsBridge.searchMatchesIfAvailable)
+        precondition(folded.count == 2 && folded[0].range == NSRange(location: 3, length: 6), "Case folding lost native UTF-16 source offsets")
+        let changedOptions = try optionsView.replaceSearch(with: "羽", all: true)
+        precondition(changedOptions && optionsBridge.source == "🙂 羽 羽 Yu Yule")
+        optionsView.performUndo()
+        precondition(optionsBridge.searchMatchesIfAvailable?.count == 2, "Undo lost search options")
+        optionsPanel.setQuery("yu")
+        optionsPanel.setOptions(matchCase: false, wholeWords: true)
+        precondition(optionsBridge.searchMatchesIfAvailable?.count == 1)
+        optionsPanel.setOptions(matchCase: false, wholeWords: false)
+        precondition(optionsBridge.searchMatchesIfAvailable?.count == 2)
+        optionsPanel.setOptions(matchCase: true, wholeWords: false)
+        precondition(optionsBridge.searchMatchesIfAvailable?.isEmpty == true)
+        print("Yu search options self-check: native controls, full folding, UTF-16 mapping, whole words and undo passed")
+
         // The workspace bridge owns a separate background index; querying it
         // cannot alter this document's source, revision, or undo history.
         let workspace = fileManager.temporaryDirectory.appendingPathComponent("yu-workspace-ffi-\(UUID().uuidString)")

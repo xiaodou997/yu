@@ -1649,20 +1649,15 @@ final class StorageBridge {
     ///
     /// 不带 Revision：查询与源码正交，一次外部重载不该把用户刚敲的字丢掉。
     @discardableResult
-    func setSearchQuery(_ query: String?) -> Bool {
+    func setSearchQuery(_ query: String?, matchCase: Bool = true, wholeWords: Bool = false) -> Bool {
+        let flags: UInt8 = (matchCase ? 1 : 0) | (wholeWords ? 2 : 0)
         guard let query else {
-            return yu_storage_session_set_search_query(handle, nil, 0) == StorageStatus.ok
+            return yu_storage_session_set_search_query_options(handle, nil, 0, flags) == StorageStatus.ok
         }
-        var bytes = Array(query.utf8)
-        if bytes.isEmpty {
-            // 空串与「收掉」是两件事，所以不能走上面那一支。给一个非 null 的
-            // 指针加 0 长度。
-            return bytes.withUnsafeBufferPointer { buffer in
-                yu_storage_session_set_search_query(handle, buffer.baseAddress, 0)
-            } == StorageStatus.ok
-        }
-        return bytes.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_set_search_query(handle, buffer.baseAddress, buffer.count)
+        // A non-null sentinel distinguishes an empty query from clearing search.
+        let bytes = Array(query.utf8) + [0]
+        return bytes.withUnsafeBufferPointer { buffer in
+            yu_storage_session_set_search_query_options(handle, buffer.baseAddress, buffer.count - 1, flags)
         } == StorageStatus.ok
     }
 

@@ -106,6 +106,13 @@ use crate::chrome::{
     ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height, search_height,
     sidebar_width,
 };
+use crate::chrome::{ID_SEARCH_CASE, ID_SEARCH_OPTIONS, ID_SEARCH_WORD};
+use crate::locale::NavigationText;
+use crate::navigation_history::NavigationHistory;
+const ID_RECENT_FILE_BASE: u16 = 15_000;
+const ID_RECENT_FOLDER_BASE: u16 = 15_100;
+const ID_CLEAR_RECENT_FILES: u16 = 15_200;
+const ID_CLEAR_RECENT_FOLDERS: u16 = 15_201;
 use crate::image_interaction::{
     ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE, ID_IMAGE_SOURCE, ImageInspector,
     ImageInteractionState, ImagePropertyDraft, ImageScalePreset, edit_image_properties,
@@ -603,6 +610,9 @@ pub(crate) struct AppWindow {
     selected_image: Option<ImageInteractionState>,
     menu: Option<Menu>,
     state: ShellState,
+    history: Option<NavigationHistory>,
+    observed_file: Option<PathBuf>,
+    observed_root: Option<PathBuf>,
     render: Option<RenderHost>,
     tsf: Option<TsfHost>,
     accessibility: Option<AccessibilityHost>,
@@ -629,6 +639,9 @@ impl AppWindow {
             menu: None,
             state,
             render: None,
+            history: None,
+            observed_file: None,
+            observed_root: None,
             tsf: None,
             accessibility: None,
             drag_anchor: None,
@@ -636,6 +649,38 @@ impl AppWindow {
             last_double_click: None,
             semantic_click: false,
             pending_high_surrogate: None,
+        }
+    }
+
+    fn observe_navigation(&mut self) {
+        let file = (!self.state.document().is_untitled())
+            .then(|| self.state.document().session().path().to_owned());
+        let root = self
+            .state
+            .has_workspace()
+            .then(|| self.state.workspace_root());
+        let Some(history) = self.history.as_mut() else {
+            return;
+        };
+        let before = history.clone();
+        if self.observed_file != file {
+            if let Some(path) = &file {
+                history.note_file(path);
+            }
+            self.observed_file = file;
+        }
+        if self.observed_root != root {
+            if let Some(path) = &root {
+                history.note_folder(path);
+            } else {
+                history.last_folder = None;
+            }
+            self.observed_root = root;
+        }
+        if *history != before
+            && let Err(error) = history.save()
+        {
+            eprintln!("Yu navigation history could not be saved: {error}");
         }
     }
 
@@ -2666,6 +2711,61 @@ impl AppWindow {
             let file = Menu(CreatePopupMenu().map_err(platform_error)?);
             append_string(file.0, ID_FILE_NEW, strings.new_document())?;
             append_string(file.0, ID_FILE_OPEN, strings.open())?;
+            for (label, base, clear, folders) in [
+                (
+                    NavigationText::RecentFiles,
+                    ID_RECENT_FILE_BASE,
+                    ID_CLEAR_RECENT_FILES,
+                    false,
+                ),
+                (
+                    NavigationText::RecentFolders,
+                    ID_RECENT_FOLDER_BASE,
+                    ID_CLEAR_RECENT_FOLDERS,
+                    true,
+                ),
+            ] {
+                let recent = Menu(CreatePopupMenu().map_err(platform_error)?);
+                if let Some(history) = &self.history {
+                    let paths = if folders {
+                        &history.folders
+                    } else {
+                        &history.files
+                    };
+                    for (index, path) in paths.iter().enumerate() {
+                        let title = format!(
+                            "{} — {}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            path.parent().unwrap_or(Path::new("")).display()
+                        )
+                        .replace('&', "&&");
+                        append_string(recent.0, base + index as u16, &title)?;
+                        if !(if folders {
+                            path.is_dir()
+                        } else {
+                            path.is_file()
+                        }) {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::EnableMenuItem(
+                                recent.0,
+                                u32::from(base + index as u16),
+                                windows::Win32::UI::WindowsAndMessaging::MF_GRAYED,
+                            );
+                        }
+                    }
+                }
+                AppendMenuW(recent.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
+                append_string(
+                    recent.0,
+                    clear,
+                    strings.navigation(if folders {
+                        NavigationText::ClearFolders
+                    } else {
+                        NavigationText::ClearFiles
+                    }),
+                )?;
+                append_popup(file.0, recent.0, strings.navigation(label))?;
+                std::mem::forget(recent);
+            }
             use crate::locale::WorkspaceText as Text;
             append_string(
                 file.0,
@@ -2722,7 +2822,64 @@ impl AppWindow {
         Ok(())
     }
 
+    fn show_search_options(&mut self) -> Result<(), ShellError> {
+        let Some(chrome) = self.chrome.as_ref() else {
+            return Ok(());
+        };
+        if chrome.query_is_composing() || chrome.replacement_is_composing() {
+            return Ok(());
+        }
+        let button = chrome.search_options_button;
+        let options = chrome.search_options;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(button, &mut rect) }.map_err(platform_error)?;
+        let menu = Menu(unsafe { CreatePopupMenu() }.map_err(platform_error)?);
+        for (command, label, checked) in [
+            (
+                ID_SEARCH_CASE,
+                NavigationText::MatchCase,
+                options.match_case,
+            ),
+            (
+                ID_SEARCH_WORD,
+                NavigationText::WholeWords,
+                options.whole_words,
+            ),
+        ] {
+            unsafe {
+                append_string(menu.0, command, self.state.strings().navigation(label))?;
+            }
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::CheckMenuItem(
+                    menu.0,
+                    u32::from(command),
+                    if checked { 8 } else { 0 },
+                );
+            }
+        }
+        let selected = unsafe {
+            TrackPopupMenuEx(
+                menu.0,
+                (TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY).0,
+                rect.left,
+                rect.bottom,
+                self.hwnd,
+                None,
+            )
+        }
+        .0;
+        if selected != 0 {
+            self.handle_command(selected as u16)?;
+        }
+        unsafe {
+            let _ = SetFocus(button);
+        }
+        Ok(())
+    }
+
     fn show_menu(&mut self, index: usize) -> Result<(), ShellError> {
+        // Rebuild before tracking, so IDs refer to the same current history snapshot.
+        self.install_menu()?;
         let Some(root) = self.menu.as_ref() else {
             return Ok(());
         };
@@ -2970,6 +3127,50 @@ impl AppWindow {
                     let _ = SetFocus(targets[next]);
                 }
             }
+            id if (ID_RECENT_FILE_BASE
+                ..ID_RECENT_FILE_BASE + crate::navigation_history::LIMIT as u16)
+                .contains(&id) =>
+            {
+                if let Some(path) = self
+                    .history
+                    .as_ref()
+                    .and_then(|h| h.files.get((id - ID_RECENT_FILE_BASE) as usize))
+                    .cloned()
+                {
+                    self.activate_panel_action(Some(PanelAction::File(path)), true)?;
+                }
+            }
+            id if (ID_RECENT_FOLDER_BASE
+                ..ID_RECENT_FOLDER_BASE + crate::navigation_history::LIMIT as u16)
+                .contains(&id) =>
+            {
+                if let Some(path) = self
+                    .history
+                    .as_ref()
+                    .and_then(|h| h.folders.get((id - ID_RECENT_FOLDER_BASE) as usize))
+                    .cloned()
+                {
+                    self.state
+                        .set_workspace_root(path)
+                        .map_err(|e| ShellError::Platform(e.to_string()))?;
+                    if let Some(chrome) = self.chrome.as_mut() {
+                        chrome.invalidate_content();
+                    }
+                    self.update_layout();
+                }
+            }
+            ID_CLEAR_RECENT_FILES | ID_CLEAR_RECENT_FOLDERS => {
+                if let Some(history) = self.history.as_mut() {
+                    if command == ID_CLEAR_RECENT_FILES {
+                        history.clear_files();
+                    } else {
+                        history.clear_folders();
+                    }
+                    history
+                        .save()
+                        .map_err(|e| ShellError::Platform(e.to_string()))?;
+                }
+            }
             ID_FILE_FOLDER => {
                 if let Some(root) = open_folder_dialog(self.hwnd)? {
                     self.state
@@ -3012,6 +3213,12 @@ impl AppWindow {
             ID_FILE_REFRESH | ID_FILE_DOCUMENT_FOLDER => {
                 if command == ID_FILE_DOCUMENT_FOLDER {
                     self.state.use_document_folder();
+                    if let Some(history) = self.history.as_mut() {
+                        history.last_folder = None;
+                        if let Err(error) = history.save() {
+                            eprintln!("Yu navigation history: {error}");
+                        }
+                    }
                 }
                 if let Some(chrome) = self.chrome.as_mut() {
                     chrome.invalidate_content();
@@ -3088,11 +3295,27 @@ impl AppWindow {
                     let _ = SetFocus(self.surface);
                 }
             }
+            ID_SEARCH_OPTIONS => {
+                self.show_search_options()?;
+            }
+            ID_SEARCH_CASE | ID_SEARCH_WORD => {
+                if let Some(chrome) = self.chrome.as_mut() {
+                    if chrome.query_is_composing() || chrome.replacement_is_composing() {
+                        return Ok(());
+                    }
+                    if command == ID_SEARCH_CASE {
+                        chrome.search_options.match_case = !chrome.search_options.match_case;
+                    } else {
+                        chrome.search_options.whole_words = !chrome.search_options.whole_words;
+                    }
+                }
+            }
             ID_SEARCH | ID_FIND_REPLACE => {
                 self.handle_chrome_command(command, 0)?;
             }
             _ => {}
         }
+        self.observe_navigation();
         if command != ID_FILE_EXIT {
             self.render_current()?;
         }
@@ -3340,6 +3563,7 @@ impl AppWindow {
         }
         self.refresh_chrome();
         self.render_current()?;
+        self.observe_navigation();
         self.notify_tsf_after_command(before.end_acp(), before_selection, document_changed)?;
         if let Some(tsf) = self.tsf.as_ref() {
             tsf.notify_layout_change();
@@ -3521,9 +3745,34 @@ pub fn run() -> Result<(), ShellError> {
     result
 }
 
-fn run_window(state: ShellState, auto_close: bool) -> Result<(), ShellError> {
+fn run_window(mut state: ShellState, auto_close: bool) -> Result<(), ShellError> {
+    let history = if auto_close {
+        None
+    } else {
+        match NavigationHistory::load() {
+            Ok(history) => Some(history),
+            Err(error) => {
+                // Preserve corrupt/future-version metadata instead of silently
+                // replacing it with an empty history on the next document open.
+                eprintln!("Yu navigation history could not be loaded: {error}");
+                None
+            }
+        }
+    };
+    // Reopen the folder only; never auto-open a file or bypass recovery/close checks.
+    // An explicit file launch keeps that document's own folder instead.
+    if state.document().is_untitled()
+        && let Some(root) = history.as_ref().and_then(|h| h.last_folder.clone())
+        && let Err(error) = state.set_workspace_root(root)
+    {
+        eprintln!("Yu previous folder is unavailable: {error}");
+    }
     let title = wide(&state.window_title());
-    let app = Box::new(AppWindow::new(state));
+    let observed_root = state.has_workspace().then(|| state.workspace_root());
+    let mut app = Box::new(AppWindow::new(state));
+    app.history = history;
+    app.observed_root = observed_root;
+    app.observe_navigation();
     let app_ptr = Box::into_raw(app);
 
     let instance = unsafe { GetModuleHandleW(None) }.map_err(platform_error)?;

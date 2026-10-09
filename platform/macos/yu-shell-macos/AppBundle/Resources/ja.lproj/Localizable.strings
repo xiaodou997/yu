@@ -1,3 +1,8 @@
+"Search in Markdown source" = "Markdownソースを検索";
+"Match Case" = "大文字と小文字を区別";
+"Whole Words" = "単語単位";
+"Recent Folders" = "最近のフォルダ";
+"Clear Recent Folders" = "最近のフォルダを消去";
 "Quick Open" = "クイックオープン";
 "Quick Open…" = "クイックオープン…";
 "Open Folder…" = "フォルダを開く…";

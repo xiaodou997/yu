@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+caseless.workspace = true
 yu-core = { path = "../yu-core" }
 yu-decoration = { path = "../yu-decoration" }
 yu-export = { path = "../yu-export" }

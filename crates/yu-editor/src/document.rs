@@ -396,9 +396,10 @@ impl EditorDocument {
         // 装饰与布局是增量的，这一个不是，因为一次编辑可以让任意远处的匹配
         // 出现或消失（`ab` 中间插一个字符）。
         if let Some(state) = self.presentation.search.as_ref() {
-            self.presentation.search = Some(Arc::new(SearchState::new(
+            self.presentation.search = Some(Arc::new(SearchState::with_options(
                 applied.result_snapshot(),
                 state.query(),
+                state.options(),
             )));
         }
         self.state.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
@@ -552,7 +553,11 @@ impl EditorDocument {
         self.state.last_source_change = None;
         let snapshot = self.snapshot();
         if let Some(search) = self.presentation.search.as_ref() {
-            self.presentation.search = Some(Arc::new(SearchState::new(&snapshot, search.query())));
+            self.presentation.search = Some(Arc::new(SearchState::with_options(
+                &snapshot,
+                search.query(),
+                search.options(),
+            )));
         }
         self.set_single_selection(
             EditorSelection::cursor(

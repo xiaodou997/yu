@@ -987,6 +987,10 @@ int32_t yu_storage_session_outline_items(
  * 传 0 表示收掉搜索。不校验 Revision：查询与源码正交。 */
 int32_t yu_storage_session_set_search_query(
     YuStorageSession *session, const uint8_t *text, size_t text_length);
+/* flags: bit 0 match case; bit 1 UAX #29 whole-word boundaries.
+ * Other bits are invalid. NULL/0 clears; non-NULL/0 keeps an empty query. */
+int32_t yu_storage_session_set_search_query_options(
+    YuStorageSession *session, const uint8_t *text, size_t text_length, uint8_t flags);
 /* Revision-bound literal source replacement. all=0 replaces only an exact
  * current match; all!=0 replaces the snapshot's matches in one undo step.
  * Empty replacement deletes; empty query/no match is a no-op. */

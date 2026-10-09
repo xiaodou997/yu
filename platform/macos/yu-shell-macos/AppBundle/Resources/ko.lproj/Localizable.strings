@@ -1,3 +1,8 @@
+"Search in Markdown source" = "Markdown 소스에서 검색";
+"Match Case" = "대소문자 구분";
+"Whole Words" = "단어 단위";
+"Recent Folders" = "최근 폴더";
+"Clear Recent Folders" = "최근 폴더 지우기";
 "Quick Open" = "빠른 열기";
 "Quick Open…" = "빠른 열기…";
 "Open Folder…" = "폴더 열기…";

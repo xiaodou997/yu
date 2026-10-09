@@ -9746,6 +9746,45 @@ pub unsafe extern "C" fn yu_storage_session_set_search_query(
     YU_STORAGE_OK
 }
 
+/// Set a query with bit 0 = match case and bit 1 = whole words.
+/// Unknown flags are rejected before any search state changes.
+/// # Safety
+/// Session must be live; text must be readable for text_length bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_search_query_options(
+    session: *mut YuStorageSession,
+    text: *const u8,
+    text_length: usize,
+    flags: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if flags & !3 != 0 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if text.is_null() && text_length == 0 {
+        session.session.document_mut().editor_mut().clear_search();
+        return YU_STORAGE_OK;
+    }
+    let query = match read_utf8(text, text_length) {
+        Ok(query) => query,
+        Err(status) => return status,
+    };
+    session
+        .session
+        .document_mut()
+        .editor_mut()
+        .set_search_query_with_options(
+            query,
+            yu_editor::SearchOptions {
+                match_case: flags & 1 != 0,
+                whole_words: flags & 2 != 0,
+            },
+        );
+    YU_STORAGE_OK
+}
+
 /// Replace an exact current search match, or all matches, as one undo step.
 /// Unlike changing a query, a replacement must reject a stale source revision.
 /// # Safety
@@ -16993,6 +17032,97 @@ mod tests {
     /// 「匹配找得对不对」在 `yu-editor::search` 的用例里，「那一行剥干净没有」
     /// 在 `yu-editor` 的 `panel` 用例里；这里压的是 ABI 那一层：位置换算与
     /// 两个缓冲区的对齐。
+    #[test]
+    fn ffi_search_options_validate_flags_and_share_replacement_offsets() {
+        let path = std::env::temp_dir().join(format!("yu-search-options-{}.md", temp_id()));
+        let source = "🙂 Straße STRASSE strassen";
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let query = b"strasse";
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_search_query_options(raw, query.as_ptr(), query.len(), 2)
+            },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { &*raw };
+        assert_eq!(
+            session
+                .session
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .matches()
+                .len(),
+            2
+        );
+        let generation = session.session.document().editor().search_generation();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_search_query_options(raw, query.as_ptr(), query.len(), 4)
+            },
+            YU_STORAGE_INVALID_COMMAND
+        );
+        assert_eq!(
+            unsafe { &*raw }
+                .session
+                .document()
+                .editor()
+                .search_generation(),
+            generation
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query_options(raw, ptr::null(), 2, 2) },
+            YU_STORAGE_NULL_POINTER
+        );
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_replace_search(raw, 0, b"Yu".as_ptr(), 2, 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "🙂 Yu Yu strassen"
+        );
+        unsafe { &mut *raw }
+            .session
+            .execute(EditorCommand::Undo)
+            .expect("undo");
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+        assert_eq!(
+            unsafe { &*raw }
+                .session
+                .document()
+                .editor()
+                .search()
+                .expect("search")
+                .matches()
+                .len(),
+            2
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query_options(raw, query.as_ptr(), 0, 2) },
+            YU_STORAGE_OK
+        );
+        assert!(
+            unsafe { &*raw }
+                .session
+                .document()
+                .editor()
+                .search()
+                .expect("empty query retained")
+                .is_empty()
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[test]
     fn ffi_search_replace_rejects_stale_and_null_output_and_undoes_unicode() {
         let path = std::env::temp_dir().join(format!("yu-search-replace-{}.md", temp_id()));

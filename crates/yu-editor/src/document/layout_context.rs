@@ -482,8 +482,21 @@ impl LayoutContext {
     /// 空查询也留下一份状态（0 个匹配），面板要靠它显示「没有结果」；要连
     /// 高亮一起收掉用 [`Self::clear_search`]。
     pub fn set_search_query(&mut self, query: &str) {
+        self.set_search_query_with_options(query, crate::SearchOptions::default());
+    }
+
+    pub fn set_search_query_with_options(&mut self, query: &str, options: crate::SearchOptions) {
+        if self.search().is_some_and(|search| {
+            search.query() == query
+                && search.options() == options
+                && search.revision() == self.revision()
+        }) {
+            return;
+        }
         let snapshot = self.snapshot();
-        self.search = Some(Arc::new(SearchState::new(&snapshot, query)));
+        self.search = Some(Arc::new(SearchState::with_options(
+            &snapshot, query, options,
+        )));
         self.search_generation = self.search_generation.wrapping_add(1);
     }
 

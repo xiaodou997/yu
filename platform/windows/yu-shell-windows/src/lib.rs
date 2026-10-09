@@ -11,6 +11,8 @@
 pub mod locale;
 pub mod model;
 #[cfg(any(target_os = "windows", test))]
+mod navigation_history;
+#[cfg(any(target_os = "windows", test))]
 mod text_input;
 
 #[cfg(target_os = "windows")]

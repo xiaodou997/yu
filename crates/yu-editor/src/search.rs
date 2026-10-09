@@ -35,26 +35,32 @@
 //!
 //! 顺带白拿一件事：帧身份已经把选区算在内，所以「当前匹配换了一个」自动让
 //! 帧失效，不用再加一项。
+//! # Matching options
 //!
-//! # 区分大小写
-//!
-//! 这一版是**字面、区分大小写**的子串匹配。不区分大小写要么改变偏移
-//! （`to_lowercase` 会让某些字符变长，`İ` → `i̇`），要么逐字符折叠。
-//!
-//! **这条登记以前挂在 F3 上（「等 F3 接外部依赖时一起做」），S7 第六刀查下来
-//! 那个挂法是错的。** F3 关掉了，依赖也接进来了（`caseless`），而这一条一步
-//! 都没走近：两者只是碰巧都需要一份 case folding，另一半是反的——
-//!
-//! | | F3 的引用标签 | 这里 |
-//! | --- | --- | --- |
-//! | 折出来的东西要不要映射回源码偏移 | **不要**，它只是一个查表键 | **要**，命中要回报 `TextRange` |
-//! | 缺的是什么 | 一个依赖 | 一个**给得出对齐信息**的匹配算法 |
-//!
-//! `caseless::default_case_fold_str` 给不出「折叠后第 k 个字符落在源码第几
-//! 个字节」。**新的触发条件就是这件事本身**：有人要不区分大小写的搜索时，
-//! 要做的是那个匹配算法，不是再接一个 crate。
+//! Literal matching defaults to case-sensitive substring search for compatibility.
+//! Caseless search uses Unicode default case folding with an explicit source-byte
+//! boundary map: expansions such as ß → ss must never report half a source scalar.
+//! Whole-word matching requires both source endpoints to be UAX #29 boundaries.
+//! This is not dictionary-based CJK segmentation or accent/width normalization.
 
+use caseless::Caseless;
+use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{Revision, TextRange};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub match_case: bool,
+    pub whole_words: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            match_case: true,
+            whole_words: false,
+        }
+    }
+}
 use yu_text::TextSnapshot;
 
 /// 一份查询在一版源码上的全部匹配。
@@ -65,6 +71,7 @@ use yu_text::TextSnapshot;
 pub struct SearchState {
     revision: Revision,
     query: String,
+    options: SearchOptions,
     matches: Vec<TextRange>,
 }
 
@@ -72,26 +79,28 @@ impl SearchState {
     /// 扫一遍源码。空查询没有匹配。
     #[must_use]
     pub fn new(snapshot: &TextSnapshot, query: impl Into<String>) -> Self {
+        Self::with_options(snapshot, query, SearchOptions::default())
+    }
+
+    #[must_use]
+    pub fn with_options(
+        snapshot: &TextSnapshot,
+        query: impl Into<String>,
+        options: SearchOptions,
+    ) -> Self {
         let query = query.into();
-        let revision = snapshot.revision();
-        let matches = if query.is_empty() {
-            Vec::new()
-        } else {
-            snapshot
-                .as_str()
-                .match_indices(query.as_str())
-                .filter_map(|(start, hit)| {
-                    let start = yu_core::ByteOffset::new(start as u64);
-                    let end = yu_core::ByteOffset::new(start.get() + hit.len() as u64);
-                    TextRange::new(start, end)
-                })
-                .collect()
-        };
+        let matches = find_matches(snapshot.as_str(), &query, options);
         Self {
-            revision,
+            revision: snapshot.revision(),
             query,
+            options,
             matches,
         }
+    }
+
+    #[must_use]
+    pub const fn options(&self) -> SearchOptions {
+        self.options
     }
 
     #[must_use]
@@ -131,6 +140,79 @@ impl SearchState {
     }
 }
 
+fn find_matches(source: &str, query: &str, options: SearchOptions) -> Vec<TextRange> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let words = options.whole_words.then(|| {
+        source
+            .split_word_bound_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(source.len()))
+            .collect::<Vec<_>>()
+    });
+    let mut folded = String::new();
+    let mut boundaries = Vec::new();
+    let wanted;
+    let (text, needle) = if options.match_case {
+        (source, query)
+    } else {
+        for (offset, scalar) in source.char_indices() {
+            boundaries.push((folded.len(), offset));
+            folded.extend(std::iter::once(scalar).default_case_fold());
+        }
+        boundaries.push((folded.len(), source.len()));
+        wanted = query.chars().default_case_fold().collect::<String>();
+        (folded.as_str(), wanted.as_str())
+    };
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let source_offset = |offset| {
+        if options.match_case {
+            Some(offset)
+        } else {
+            boundaries
+                .binary_search_by_key(&offset, |&(index, _)| index)
+                .ok()
+                .map(|index| boundaries[index].1)
+        }
+    };
+    let mut matches = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find(needle) {
+        let start = cursor + relative;
+        let end = start + needle.len();
+        let mapped = source_offset(start)
+            .zip(source_offset(end))
+            .filter(|&(from, to)| {
+                words.as_ref().is_none_or(|bounds| {
+                    bounds.binary_search(&from).is_ok() && bounds.binary_search(&to).is_ok()
+                })
+            });
+        if let Some((from, to)) = mapped {
+            matches.push(
+                TextRange::new(
+                    yu_core::ByteOffset::new(from as u64),
+                    yu_core::ByteOffset::new(to as u64),
+                )
+                .expect("ordered match"),
+            );
+            cursor = end;
+        } else {
+            // Rejected candidates may overlap a later valid match (sß / ss).
+            // Advancing to `end` here would silently lose that valid match.
+            cursor = start
+                + text[start..]
+                    .chars()
+                    .next()
+                    .expect("nonempty needle")
+                    .len_utf8();
+        }
+    }
+    matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +225,92 @@ mod tests {
 
     fn range(start: u64, end: u64) -> TextRange {
         TextRange::new(ByteOffset::new(start), ByteOffset::new(end)).expect("ordered")
+    }
+
+    #[test]
+    fn unicode_folding_preserves_source_boundaries_and_expansions() {
+        let options = SearchOptions {
+            match_case: false,
+            whole_words: false,
+        };
+        let text = snapshot("🙂Straße STRASSE σςΣ İ sß");
+        let hits = SearchState::with_options(&text, "strasse", options);
+        assert_eq!(hits.matches(), &[range(4, 11), range(12, 19)]);
+        assert_eq!(
+            SearchState::with_options(&snapshot("σςΣ"), "Σ", options)
+                .matches()
+                .len(),
+            3
+        );
+        assert!(SearchState::with_options(&snapshot("İ"), "i", options).is_empty());
+        assert!(SearchState::with_options(&snapshot("ß"), "s", options).is_empty());
+        assert_eq!(
+            SearchState::with_options(&snapshot("sß"), "ss", options).matches(),
+            &[range(1, 3)]
+        );
+        assert_eq!(
+            SearchState::with_options(&snapshot("İ"), "i\u{307}", options).matches(),
+            &[range(0, 2)]
+        );
+    }
+
+    #[test]
+    fn whole_words_observe_unicode_boundaries_not_ascii_neighbors() {
+        let options = SearchOptions {
+            match_case: false,
+            whole_words: true,
+        };
+        let source = "Yu Yule _Yu Yu_ (YU) don't don e\u{301} e";
+        assert_eq!(
+            SearchState::with_options(&snapshot(source), "yu", options).matches(),
+            &[range(0, 2), range(17, 19)]
+        );
+        assert_eq!(
+            SearchState::with_options(&snapshot(source), "don", options)
+                .matches()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SearchState::with_options(&snapshot("e\u{301} e"), "e", options).matches(),
+            &[range(4, 5)]
+        );
+        assert_eq!(
+            SearchState::with_options(&snapshot("xa a a"), "a a", options).matches(),
+            &[range(3, 6)]
+        );
+        assert_eq!(
+            SearchState::with_options(&snapshot("中文中文"), "中文", options)
+                .matches()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn options_survive_replace_undo_redo_and_source_reset() {
+        let mut document = crate::EditorDocument::new("Yu YU Yule");
+        let options = SearchOptions {
+            match_case: false,
+            whole_words: true,
+        };
+        let revision = document.revision();
+        document.set_search_query_with_options("yu", options);
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.search().expect("search").matches().len(), 2);
+        document.replace_search("羽", true).expect("replace");
+        assert_eq!(document.snapshot().as_str(), "羽 羽 Yule");
+        document.undo().expect("undo");
+        assert_eq!(document.search().expect("search").options(), options);
+        assert_eq!(document.search().expect("search").matches().len(), 2);
+        document.redo().expect("redo");
+        assert!(document.search().expect("search").is_empty());
+        document.reset_source("yu Yu Yule").expect("reset");
+        assert_eq!(document.search().expect("search").matches().len(), 2);
+        let generation = document.search_generation();
+        document.set_search_query_with_options("yu", SearchOptions::default());
+        assert_ne!(document.search_generation(), generation);
+        assert_eq!(document.search().expect("search").matches().len(), 1);
     }
 
     #[test]

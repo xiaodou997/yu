@@ -41,9 +41,10 @@ private struct DocumentWindowPresentation {
     let readingZoom: CGFloat
     let sourceMode: Bool
     let fileRoot: URL
+    let workspaceRoot: URL?
 }
 
-final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate {
+final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate, NSMenuDelegate {
     private let bridge: StorageBridge
     private var htmlExport: NativeHTMLExportController?
     private var printing: NativePrintController?
@@ -77,9 +78,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     private var searchQuery = ""
     private weak var sidebarStack: NSStackView?
     private weak var sidebarContainer: NSView?
-    private lazy var filePanel = FilePanel(directory: persistence.isUntitled
+    private var workspaceRoot: URL? = NavigationHistory.shared.restoreFolder()
+    private lazy var filePanel = FilePanel(directory: workspaceRoot ?? (persistence.isUntitled
         ? (FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser)
-        : documentURL.deletingLastPathComponent())
+        : documentURL.deletingLastPathComponent()))
     private let sidebarTabs = NSSegmentedControl()
     private let splitController = NSSplitViewController()
     private var sidebarItem: NSSplitViewItem?
@@ -161,7 +163,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             sidebarWidth: preferredSidebarWidth,
             readingZoom: readingZoom,
             sourceMode: bridge.sourceMode,
-            fileRoot: filePanel.directoryURL
+            fileRoot: filePanel.directoryURL,
+            workspaceRoot: workspaceRoot
         )
     }
 
@@ -178,6 +181,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         sidebarHidden = state.sidebarHidden
         sidebarTabs.selectedSegment = min(1, max(0, state.sidebarPanel))
         filePanel.setDirectory(state.fileRoot)
+        workspaceRoot = state.workspaceRoot
         setReadingZoom(state.readingZoom)
         if bridge.sourceMode != state.sourceMode {
             do { try setSourceMode(state.sourceMode) }
@@ -667,7 +671,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     /// 高亮不用平台做任何事——它是场景里的图元，而帧身份带着
     /// `search_generation`，所以一次重提交就够了。
     private func applySearchQuery(_ query: String) {
-        guard bridge.setSearchQuery(query) else { return }
+        guard bridge.setSearchQuery(query, matchCase: searchPanel.matchCase, wholeWords: searchPanel.wholeWords) else { return }
         searchQuery = query
         searchRevision = nil
         refreshSearch()
@@ -1288,10 +1292,52 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     @objc fileprivate func useDocumentFolderFromMenu(_ sender: Any?) {
         guard !persistence.isUntitled else { return }
+        workspaceRoot = nil
+        NavigationHistory.shared.useDocumentFolder()
         filePanel.setDirectory(documentURL.deletingLastPathComponent())
         sidebarTabs.selectedSegment = 0
         sidebarHidden = false
         updateSidebarVisibility()
+    }
+
+    fileprivate func activateWorkspace(_ url: URL) {
+        workspaceRoot = url.standardizedFileURL.resolvingSymlinksInPath()
+        filePanel.setDirectory(url)
+        NavigationHistory.shared.noteFolder(url)
+        sidebarTabs.selectedSegment = 0
+        sidebarHidden = false
+        updateSidebarVisibility()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu.title == L10n.tr("Recent Folders") else { return }
+        menu.removeAllItems()
+        for url in NavigationHistory.shared.folders {
+            let item = NSMenuItem(title: url.lastPathComponent + " — " + url.deletingLastPathComponent().path,
+                action: #selector(openRecentFolder(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url
+            item.toolTip = url.path
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: L10n.tr("Clear Recent Folders"), action: #selector(clearRecentFolders(_:)), keyEquivalent: "").target = self
+    }
+
+    @objc private func openRecentFolder(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        do {
+            let root = try SandboxDocumentAccess.shared.accessibleURL(url)
+            guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(root, writing: false,
+                message: L10n.tr("Choose a folder to browse local Markdown files.")) else { return }
+            guard (try? root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { throw CocoaError(.fileReadNoSuchFile) }
+            activateWorkspace(root)
+        } catch { show(error) }
+    }
+
+    @objc private func clearRecentFolders(_ sender: Any?) {
+        // Clearing history never closes the current workspace or touches files.
+        NavigationHistory.shared.clearFolders()
     }
 
     @objc fileprivate func chooseFilePanelFolderFromMenu(_ sender: Any?) {
@@ -1304,10 +1350,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try SandboxDocumentAccess.shared.rememberSelection(url)
-            filePanel.setDirectory(url)
-            sidebarTabs.selectedSegment = 0
-            sidebarHidden = false
-            updateSidebarVisibility()
+            activateWorkspace(url)
         } catch { show(error) }
     }
 
@@ -1447,7 +1490,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         view.window?.identifier = NSUserInterfaceItemIdentifier(bridge.path)
         view.window?.invalidateRestorableState()
         fileWatcher = nil
-        filePanel.setDirectory(documentURL.deletingLastPathComponent())
+        if workspaceRoot == nil { filePanel.setDirectory(documentURL.deletingLastPathComponent()) }
         startFileWatcher()
         refreshFromRust()
         onDocumentURLChange?()
@@ -3229,6 +3272,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(openRecentFolder(_:)) {
+            guard let url = menuItem.representedObject as? URL else { return false }
+            return (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        }
+        if menuItem.action == #selector(clearRecentFolders(_:)) { return !NavigationHistory.shared.folders.isEmpty }
         if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
         if menuItem.action == #selector(printFromMenu(_:)) { return !NativePrintController.busy && htmlExport?.isRunning != true }
         if menuItem.action == #selector(exportHTMLFromMenu(_:)) || menuItem.action == #selector(exportPDFFromMenu(_:)) || menuItem.action == #selector(exportPNGFromMenu(_:)) { return htmlExport?.isRunning != true && printing?.isRunning != true }
@@ -4139,6 +4187,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         chooseFolder.target = controller
         chooseFolder.isEnabled = controller != nil
         fileMenu.addItem(chooseFolder)
+        let recentFolders = NSMenu(title: L10n.tr("Recent Folders"))
+        recentFolders.delegate = controller
+        let recentFoldersItem = NSMenuItem(title: L10n.tr("Recent Folders"), action: nil, keyEquivalent: "")
+        recentFoldersItem.submenu = recentFolders
+        recentFoldersItem.isEnabled = controller != nil
+        fileMenu.addItem(recentFoldersItem)
         let quickOpen = NSMenuItem(title: L10n.tr("Quick Open…"), action: #selector(DocumentViewController.quickOpenFromMenu(_:)), keyEquivalent: "o")
         quickOpen.keyEquivalentModifierMask = [.command, .shift]
         quickOpen.target = controller
@@ -4395,6 +4449,8 @@ extension AppDelegate {
         let testWindow = presentDocument(bridge: try StorageBridge(path: firstURL.path))
         guard let first = documents[testWindow] else { throw CocoaError(.coderInvalidValue) }
         first.selectFilesForSelfCheck()
+        first.activateWorkspace(directory)
+        try require(first.documentSwitchPresentation().workspaceRoot != nil, "Workspace must be pinned before switching")
         let frame = testWindow.frame
         let presentation = first.documentSwitchPresentation()
         let windowCount = documents.count

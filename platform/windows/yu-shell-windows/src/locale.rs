@@ -71,11 +71,73 @@ pub enum WorkspaceText {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum NavigationText {
+    SearchOptions,
+    MatchCase,
+    WholeWords,
+    RecentFiles,
+    RecentFolders,
+    ClearFiles,
+    ClearFolders,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Strings {
     locale: Locale,
 }
 
 impl Strings {
+    pub fn navigation(self, text: NavigationText) -> &'static str {
+        let values = match self.locale {
+            Locale::English => [
+                "Search Options",
+                "Match Case",
+                "Whole Words",
+                "Open Recent",
+                "Recent Folders",
+                "Clear Recent Files",
+                "Clear Recent Folders",
+            ],
+            Locale::SimplifiedChinese => [
+                "查找选项",
+                "区分大小写",
+                "全词匹配",
+                "最近打开的文件",
+                "最近的文件夹",
+                "清除最近文件",
+                "清除最近文件夹",
+            ],
+            Locale::TraditionalChinese => [
+                "尋找選項",
+                "區分大小寫",
+                "全字匹配",
+                "最近開啟的檔案",
+                "最近的資料夾",
+                "清除最近檔案",
+                "清除最近資料夾",
+            ],
+            Locale::Japanese => [
+                "検索オプション",
+                "大文字と小文字を区別",
+                "単語単位",
+                "最近開いたファイル",
+                "最近のフォルダ",
+                "最近のファイルを消去",
+                "最近のフォルダを消去",
+            ],
+            Locale::Korean => [
+                "검색 옵션",
+                "대소문자 구분",
+                "단어 단위",
+                "최근 파일",
+                "최근 폴더",
+                "최근 파일 지우기",
+                "최근 폴더 지우기",
+            ],
+        };
+        values[text as usize]
+    }
+
     pub fn workspace(self, text: WorkspaceText) -> &'static str {
         let values = match self.locale {
             Locale::English => [

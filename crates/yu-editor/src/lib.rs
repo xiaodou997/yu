@@ -60,7 +60,7 @@ pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use outline::{OutlineItem, OutlineSnapshot};
 pub use panel::{OutlineLabelRun, OutlineRow, OutlineTree, PanelError, SearchResults, SearchRow};
-pub use search::SearchState;
+pub use search::{SearchOptions, SearchState};
 pub use table::{
     TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget,

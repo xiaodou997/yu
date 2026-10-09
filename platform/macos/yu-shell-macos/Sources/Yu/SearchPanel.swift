@@ -82,6 +82,10 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }()
 
     private let field = NSSearchField()
+    private let caseButton = NSButton(title: "Aa", target: nil, action: nil)
+    private let wordButton = NSButton(title: "W", target: nil, action: nil)
+    var matchCase: Bool { caseButton.state == .on }
+    var wholeWords: Bool { wordButton.state == .on }
     private let replacementField = NSTextField()
     private let replacementRow = NSStackView()
     private let replacementToggle = NSButton(checkboxWithTitle: L10n.tr("Replace"), target: nil, action: nil)
@@ -151,8 +155,18 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         replacementToggle.controlSize = .small
         replacementToggle.toolTip = L10n.tr("Find and Replace")
         field.setAccessibilityLabel(L10n.tr("Search"))
-        field.toolTip = L10n.tr("Literal, case-sensitive search in Markdown source")
-        let stack = NSStackView(views: [replacementToggle, field, countLabel, previous, next, close])
+        field.toolTip = L10n.tr("Search in Markdown source")
+        for (button, title) in [(caseButton, "Match Case"), (wordButton, "Whole Words")] {
+            button.setButtonType(.pushOnPushOff)
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.target = self
+            button.action = #selector(changeSearchOptions(_:))
+            button.toolTip = L10n.tr(title)
+            button.setAccessibilityLabel(L10n.tr(title))
+        }
+        caseButton.state = .on
+        let stack = NSStackView(views: [replacementToggle, field, caseButton, wordButton, countLabel, previous, next, close])
         stack.orientation = .horizontal
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -196,6 +210,17 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             replacementField.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
 
+    }
+
+    func setOptions(matchCase: Bool, wholeWords: Bool) {
+        caseButton.state = matchCase ? .on : .off
+        wordButton.state = wholeWords ? .on : .off
+        onQueryChange?(field.stringValue)
+    }
+
+    @objc private func changeSearchOptions(_ sender: Any?) {
+        guard (field.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
+        onQueryChange?(field.stringValue)
     }
 
     func setReplaceVisible(_ visible: Bool) {
@@ -294,7 +319,8 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     // MARK: - NSSearchFieldDelegate
 
     func controlTextDidChange(_ notification: Notification) {
-        guard notification.object as? NSControl === field else { return }
+        guard notification.object as? NSControl === field,
+              (field.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
         onQueryChange?(field.stringValue)
     }
 
