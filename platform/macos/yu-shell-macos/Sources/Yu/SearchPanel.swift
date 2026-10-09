@@ -82,6 +82,12 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }()
 
     private let field = NSSearchField()
+    private let replacementField = NSTextField()
+    private let replacementRow = NSStackView()
+    private let replacementToggle = NSButton(checkboxWithTitle: L10n.tr("Replace"), target: nil, action: nil)
+    private let replaceButton = NSButton()
+    private let replaceAllButton = NSButton()
+    private var heightConstraint: NSLayoutConstraint?
     private let countLabel = NSTextField(labelWithString: "")
     private let scrollView = NSScrollView()
     private let tableView = NSTableView()
@@ -91,6 +97,8 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     var onClose: (() -> Void)?
     var onNext: ((Bool) -> Void)?
     var onQueryChange: ((String) -> Void)?
+    var onReplace: ((String, Bool) -> Void)?
+    var onLayoutChange: (() -> Void)?
     /// 点了某一行。程序化恢复选中时不触发。
     var onSelect: ((NativeSearchMatch) -> Void)?
     private var restoringSelection = false
@@ -138,22 +146,82 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         let next = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: L10n.tr("Next"))!, target: self, action: #selector(nextMatch(_:)))
         let close = NSButton(title: L10n.tr("Done"), target: self, action: #selector(closeFind(_:)))
         for button in [previous, next, close] { button.bezelStyle = .rounded; button.controlSize = .small }
-        let stack = NSStackView(views: [field, countLabel, previous, next, close])
+        replacementToggle.target = self
+        replacementToggle.action = #selector(toggleReplacement(_:))
+        replacementToggle.controlSize = .small
+        replacementToggle.toolTip = L10n.tr("Find and Replace")
+        field.setAccessibilityLabel(L10n.tr("Search"))
+        field.toolTip = L10n.tr("Literal, case-sensitive search in Markdown source")
+        let stack = NSStackView(views: [replacementToggle, field, countLabel, previous, next, close])
         stack.orientation = .horizontal
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        replacementField.placeholderString = L10n.tr("Replace with")
+        replacementField.setAccessibilityLabel(L10n.tr("Replace with"))
+        replacementField.delegate = self
+        replacementField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        replaceButton.title = L10n.tr("Replace")
+        replaceButton.target = self
+        replaceButton.action = #selector(replaceCurrent(_:))
+        replaceAllButton.title = L10n.tr("Replace All")
+        replaceAllButton.target = self
+        replaceAllButton.action = #selector(replaceAll(_:))
+        for button in [replaceButton, replaceAllButton] {
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.isEnabled = false
+        }
+        replacementRow.orientation = .horizontal
+        replacementRow.spacing = 8
+        replacementRow.translatesAutoresizingMaskIntoConstraints = false
+        for control in [replacementField, replaceButton, replaceAllButton] as [NSView] {
+            replacementRow.addArrangedSubview(control)
+        }
+        replacementRow.isHidden = true
         view.addSubview(stack)
+        view.addSubview(replacementRow)
+        let height = view.heightAnchor.constraint(equalToConstant: 38)
+        heightConstraint = height
         NSLayoutConstraint.activate([
-            view.heightAnchor.constraint(equalToConstant: 38),
+            height,
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
+            stack.centerYAnchor.constraint(equalTo: view.topAnchor, constant: 19),
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            replacementRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            replacementRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            replacementRow.centerYAnchor.constraint(equalTo: view.topAnchor, constant: 53),
+            replacementField.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
 
     }
+
+    func setReplaceVisible(_ visible: Bool) {
+        replacementToggle.state = visible ? .on : .off
+        if !visible, let editor = replacementField.currentEditor(), view.window?.firstResponder === editor {
+            view.window?.makeFirstResponder(field)
+        }
+        replacementRow.isHidden = !visible
+        heightConstraint?.constant = visible ? 72 : 38
+        onLayoutChange?()
+    }
+
+    @objc private func toggleReplacement(_ sender: Any?) {
+        setReplaceVisible(replacementToggle.state == .on)
+    }
+
+    private func requestReplacement(all: Bool) {
+        guard !rows.isEmpty,
+              !((field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false),
+              !((replacementField.currentEditor() as? NSTextView)?.hasMarkedText() ?? false) else { return }
+        onReplace?(replacementField.stringValue, all)
+    }
+
+    @objc private func replaceCurrent(_ sender: Any?) { requestReplacement(all: false) }
+    @objc private func replaceAll(_ sender: Any?) { requestReplacement(all: true) }
+    var replacementFocusTarget: NSView { replacementField }
 
     @objc private func previousMatch(_ sender: Any?) { onNext?(false) }
     @objc private func nextMatch(_ sender: Any?) { onNext?(true) }
@@ -166,7 +234,11 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             onClose?()
             return true
         case "insertNewline:":
-            onNext?(!(NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false))
+            if control === replacementField {
+                requestReplacement(all: false)
+            } else {
+                onNext?(!(NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false))
+            }
             return true
         default:
             return false
@@ -194,6 +266,11 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     func reload(rows: [NativeSearchMatch], query: String) {
         self.rows = rows
         tableView.reloadData()
+        if rows.isEmpty, view.window?.firstResponder === replaceButton || view.window?.firstResponder === replaceAllButton {
+            view.window?.makeFirstResponder(replacementField)
+        }
+        replaceButton.isEnabled = !rows.isEmpty
+        replaceAllButton.isEnabled = !rows.isEmpty
         countLabel.stringValue = rows.isEmpty
             ? (query.isEmpty ? "" : L10n.tr("No matches"))
             : L10n.format(rows.count == 1 ? "%d match" : "%d matches", rows.count)
@@ -217,6 +294,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     // MARK: - NSSearchFieldDelegate
 
     func controlTextDidChange(_ notification: Notification) {
+        guard notification.object as? NSControl === field else { return }
         onQueryChange?(field.stringValue)
     }
 

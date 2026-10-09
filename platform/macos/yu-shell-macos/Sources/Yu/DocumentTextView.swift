@@ -2174,6 +2174,17 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         navigate(toSource: match.range)
     }
 
+    @discardableResult
+    func replaceSearch(with replacement: String, all: Bool) throws -> Bool {
+        let result = try bridge.replaceSearch(with: replacement, all: all)
+        apply(result)
+        synchronizeProjection()
+        postAccessibilityRefresh()
+        if result.changed { onDocumentChange?() }
+        onCaretChange?()
+        return result.changed
+    }
+
     /// Menu actions use these explicit entry points instead of NSTextView's
     /// undo manager. Rust remains the sole owner of history and revision.
     func performUndo() {

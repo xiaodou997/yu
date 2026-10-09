@@ -976,6 +976,13 @@ int32_t yu_storage_session_outline_items(
  * 传 0 表示收掉搜索。不校验 Revision：查询与源码正交。 */
 int32_t yu_storage_session_set_search_query(
     YuStorageSession *session, const uint8_t *text, size_t text_length);
+/* Revision-bound literal source replacement. all=0 replaces only an exact
+ * current match; all!=0 replaces the snapshot's matches in one undo step.
+ * Empty replacement deletes; empty query/no match is a no-op. */
+int32_t yu_storage_session_replace_search(
+    YuStorageSession *session, uint64_t expected_revision,
+    const uint8_t *replacement, size_t length, uint8_t all,
+    YuStorageCommandResult *output);
 /* 拷出当前查询的全部结果行，按文档顺序，互不重叠。两遍协议，两个缓冲区一起，
  * 与 yu_storage_session_outline_items 同形。没有搜索时两个长度都是 0。
  *

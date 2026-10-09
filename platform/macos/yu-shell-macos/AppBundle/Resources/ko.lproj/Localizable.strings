@@ -2,6 +2,11 @@
 "Open" = "열기";
 "Show in Finder" = "Finder에서 보기";
 "Search" = "검색";
+"Replace" = "바꾸기";
+"Replace All" = "모두 바꾸기";
+"Replace with" = "바꿀 내용";
+"Find and Replace" = "찾기 및 바꾸기";
+"Literal, case-sensitive search in Markdown source" = "Markdown 소스에서 대소문자를 구분하여 문자열 검색";
 "Search Results" = "검색 결과";
 "Previous" = "이전";
 "Next" = "다음";

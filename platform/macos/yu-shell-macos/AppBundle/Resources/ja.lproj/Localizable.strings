@@ -2,6 +2,11 @@
 "Open" = "開く";
 "Show in Finder" = "Finderで表示";
 "Search" = "検索";
+"Replace" = "置換";
+"Replace All" = "すべて置換";
+"Replace with" = "置換後の文字列";
+"Find and Replace" = "検索と置換";
+"Literal, case-sensitive search in Markdown source" = "Markdownソース内の文字列を大文字と小文字を区別して検索";
 "Search Results" = "検索結果";
 "Previous" = "前へ";
 "Next" = "次へ";

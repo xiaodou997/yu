@@ -2,6 +2,11 @@
 "Open" = "Open";
 "Show in Finder" = "Show in Finder";
 "Search" = "Search";
+"Replace" = "Replace";
+"Replace All" = "Replace All";
+"Replace with" = "Replace with";
+"Find and Replace" = "Find and Replace";
+"Literal, case-sensitive search in Markdown source" = "Literal, case-sensitive search in Markdown source";
 "Search Results" = "Search Results";
 "Previous" = "Previous";
 "Next" = "Next";

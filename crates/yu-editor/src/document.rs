@@ -34,6 +34,7 @@ use yu_decoration::Bias;
 use yu_markdown::{BlockDecorations, BlockWidget, ImageSpan};
 
 mod image_edit;
+mod search_edit;
 mod spelling;
 pub use image_edit::ImageProperties;
 mod html_disclosure;

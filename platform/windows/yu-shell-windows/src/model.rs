@@ -197,6 +197,7 @@ pub struct ShellState {
     appearance: Appearance,
     sidebar: SidebarMode,
     search_visible: bool,
+    replace_visible: bool,
     metrics: WindowMetrics,
     document: DocumentSlot,
 }
@@ -209,6 +210,7 @@ impl ShellState {
             appearance: Appearance::Light,
             sidebar: SidebarMode::Files,
             search_visible: false,
+            replace_visible: false,
             metrics: WindowMetrics::default(),
             document: DocumentSlot::new_untitled(),
         }
@@ -255,6 +257,18 @@ impl ShellState {
 
     pub fn set_search_visible(&mut self, visible: bool) {
         self.search_visible = visible;
+    }
+
+    #[must_use]
+    pub const fn replace_visible(&self) -> bool {
+        self.replace_visible
+    }
+
+    pub fn set_replace_visible(&mut self, visible: bool) {
+        self.replace_visible = visible;
+        if visible {
+            self.search_visible = true;
+        }
     }
 
     pub fn toggle_sidebar(&mut self) {

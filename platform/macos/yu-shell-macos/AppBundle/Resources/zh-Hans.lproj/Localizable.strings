@@ -2,6 +2,11 @@
 "Open" = "打开";
 "Show in Finder" = "在 Finder 中显示";
 "Search" = "搜索";
+"Replace" = "替换";
+"Replace All" = "全部替换";
+"Replace with" = "替换为";
+"Find and Replace" = "查找与替换";
+"Literal, case-sensitive search in Markdown source" = "在 Markdown 源码中查找原文，区分大小写";
 "Search Results" = "搜索结果";
 "Previous" = "上一个";
 "Next" = "下一个";

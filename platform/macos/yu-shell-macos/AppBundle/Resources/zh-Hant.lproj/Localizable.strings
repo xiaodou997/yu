@@ -2,6 +2,11 @@
 "Open" = "開啟";
 "Show in Finder" = "在 Finder 中顯示";
 "Search" = "搜尋";
+"Replace" = "取代";
+"Replace All" = "全部取代";
+"Replace with" = "取代為";
+"Find and Replace" = "尋找與取代";
+"Literal, case-sensitive search in Markdown source" = "在 Markdown 原始碼中尋找原文，區分大小寫";
 "Search Results" = "搜尋結果";
 "Previous" = "上一個";
 "Next" = "下一個";

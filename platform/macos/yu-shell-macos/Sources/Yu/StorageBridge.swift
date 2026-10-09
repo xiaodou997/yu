@@ -1666,6 +1666,17 @@ final class StorageBridge {
         } == StorageStatus.ok
     }
 
+    func replaceSearch(with text: String, all: Bool) throws -> NativeCommandResult {
+        let expectedRevision = revision
+        let bytes = Array(text.utf8)
+        var result = YuStorageCommandResult()
+        let status = bytes.withUnsafeBufferPointer {
+            yu_storage_session_replace_search(handle, expectedRevision, $0.baseAddress, $0.count, all ? 1 : 0, &result)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
     /// 当前查询的全部结果行，按文档顺序。与大纲同一个两遍协议。
     var searchMatchesIfAvailable: [NativeSearchMatch]? {
         let revision = self.revision

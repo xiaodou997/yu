@@ -2136,10 +2136,44 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         precondition(panel.rowCountForSelfCheck == 0, "面板没有清空")
         precondition(panel.countTextForSelfCheck == L10n.tr("No matches"), panel.countTextForSelfCheck)
 
+        // Replacement goes through the same text-view/FFI path as the buttons.
+        // The native field's contents must never become a second source model.
+        let original = bridge.source
+        let replacementMatches = try rowsFor("标记")
+        let firstReplacement = try unwrapSelfCheck(replacementMatches.first)
+        textView.navigateToSearchMatch(firstReplacement)
+        let expectedOne = (original as NSString).replacingCharacters(in: firstReplacement.range, with: "羽🙂")
+        let replacedOne = try textView.replaceSearch(with: "羽🙂", all: false)
+        precondition(replacedOne && bridge.source == expectedOne, "Single replacement must preserve source outside the match")
+        precondition(textView.string == expectedOne, "Native projection did not refresh after replacement")
+        textView.performUndo()
+        precondition(bridge.source == original, "Single replacement undo must restore Markdown source")
+        precondition(bridge.selection.range == firstReplacement.range, "Undo must restore the selected match")
+
+        panel.setReplaceVisible(true)
+        let replacedAll = try textView.replaceSearch(with: "🪶Yu", all: true)
+        precondition(replacedAll, "Replace All did not edit")
+        precondition(bridge.source == original.replacingOccurrences(of: "标记", with: "🪶Yu"), "Replace All must edit canonical source literally")
+        textView.performUndo()
+        precondition(bridge.source == original, "One undo must restore all replacements")
+        textView.performRedo()
+        precondition(bridge.source == original.replacingOccurrences(of: "标记", with: "🪶Yu"), "Redo must replay the same replacement set")
+        textView.performUndo()
+        _ = try rowsFor("标记")
+        let deletedAll = try textView.replaceSearch(with: "", all: true)
+        precondition(deletedAll && bridge.source == original.replacingOccurrences(of: "标记", with: ""), "Empty replacement must delete matches")
+        textView.performUndo()
+        precondition(bridge.source == original, "Deletion undo must restore source")
+        _ = try rowsFor("")
+        let noOpRevision = bridge.revision
+        let noOp = try textView.replaceSearch(with: "unused", all: true)
+        precondition(!noOp && bridge.revision == noOpRevision, "Empty search must not dirty the document")
+        panel.setReplaceVisible(false)
+
         print(
             "Yu Search Panel self-check: matches=\(rows.count) "
                 + "labels=\(labels.count); stripping, navigation, wrap-around "
-                + "and re-scan passed"
+                + "re-scan, single/all/empty replacement and atomic undo/redo passed"
         )
         exit(EXIT_SUCCESS)
     } catch {

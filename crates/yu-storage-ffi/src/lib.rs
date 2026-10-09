@@ -9616,6 +9616,43 @@ pub unsafe extern "C" fn yu_storage_session_set_search_query(
     YU_STORAGE_OK
 }
 
+/// Replace an exact current search match, or all matches, as one undo step.
+/// Unlike changing a query, a replacement must reject a stale source revision.
+/// # Safety
+/// Session must be live, replacement readable for length, and output writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_replace_search(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    replacement: *const u8,
+    length: usize,
+    all: u8,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let text = match read_utf8(replacement, length) {
+        Ok(text) => text,
+        Err(status) => return status,
+    };
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .replace_search(text, all != 0)
+    {
+        Ok(result) => command_result_output(&session.session, result, output),
+        Err(error) => status_from_editor_error(error),
+    }
+}
+
 /// 拷出当前查询在这一版源码上的全部结果行，按文档顺序，互不重叠。
 ///
 /// **两遍协议，两个缓冲区一起**，与 `yu_storage_session_outline_items` 同形。
@@ -16826,6 +16863,111 @@ mod tests {
     /// 「匹配找得对不对」在 `yu-editor::search` 的用例里，「那一行剥干净没有」
     /// 在 `yu-editor` 的 `panel` 用例里；这里压的是 ABI 那一层：位置换算与
     /// 两个缓冲区的对齐。
+    #[test]
+    fn ffi_search_replace_rejects_stale_and_null_output_and_undoes_unicode() {
+        let path = std::env::temp_dir().join(format!("yu-search-replace-{}.md", temp_id()));
+        let source = "# 羽🙂\n\n羽🙂 羽🙂\n";
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let query = "羽🙂".as_bytes();
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, query.as_ptr(), query.len()) },
+            YU_STORAGE_OK
+        );
+        let replacement = "Yu🪶".as_bytes();
+        let mut output = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_search(
+                    raw,
+                    0,
+                    replacement.as_ptr(),
+                    replacement.len(),
+                    1,
+                    ptr::null_mut(),
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_search(
+                    raw,
+                    1,
+                    replacement.as_ptr(),
+                    replacement.len(),
+                    1,
+                    &mut output,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+        assert_eq!(
+            unsafe { yu_storage_session_set_selection_endpoints(raw, 0, 2, 5, 1) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_search(
+                    raw,
+                    0,
+                    replacement.as_ptr(),
+                    replacement.len(),
+                    0,
+                    &mut output,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            source.replacen("羽🙂", "Yu🪶", 1)
+        );
+        unsafe { &mut *raw }
+            .session
+            .execute(yu_editor::EditorCommand::Undo)
+            .expect("undo single");
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+        let revision = unsafe { &*raw }.session.revision().get();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_search(raw, revision, ptr::null(), 0, 1, &mut output)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            source.replace("羽🙂", "")
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_search(
+                    raw,
+                    revision,
+                    replacement.as_ptr(),
+                    replacement.len(),
+                    1,
+                    &mut output,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        unsafe { &mut *raw }
+            .session
+            .execute(yu_editor::EditorCommand::Undo)
+            .expect("undo all");
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+        assert_eq!(fs::read_to_string(&path).expect("disk unchanged"), source);
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[test]
     fn ffi_search_matches_carry_utf16_and_the_panel_line() {
         let id = temp_id();

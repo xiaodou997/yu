@@ -305,6 +305,50 @@ impl Strings {
     }
 
     #[must_use]
+    pub const fn replace(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Replace",
+            Locale::SimplifiedChinese => "替换",
+            Locale::TraditionalChinese => "取代",
+            Locale::Japanese => "置換",
+            Locale::Korean => "바꾸기",
+        }
+    }
+
+    #[must_use]
+    pub const fn replace_all(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Replace All",
+            Locale::SimplifiedChinese => "全部替换",
+            Locale::TraditionalChinese => "全部取代",
+            Locale::Japanese => "すべて置換",
+            Locale::Korean => "모두 바꾸기",
+        }
+    }
+
+    #[must_use]
+    pub const fn replace_with(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Replace with",
+            Locale::SimplifiedChinese => "替换为",
+            Locale::TraditionalChinese => "取代為",
+            Locale::Japanese => "置換後の文字列",
+            Locale::Korean => "바꿀 내용",
+        }
+    }
+
+    #[must_use]
+    pub const fn find_and_replace(self) -> &'static str {
+        match self.locale {
+            Locale::English => "Find and Replace",
+            Locale::SimplifiedChinese => "查找与替换",
+            Locale::TraditionalChinese => "尋找與取代",
+            Locale::Japanese => "検索と置換",
+            Locale::Korean => "찾기 및 바꾸기",
+        }
+    }
+
+    #[must_use]
     pub const fn editor_surface_pending(self) -> &'static str {
         match self.locale {
             Locale::English => "Editor surface — renderer connects in Windows group 3",

@@ -473,6 +473,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         searchPanel.onQueryChange = { [weak self] query in
             self?.applySearchQuery(query)
         }
+        searchPanel.onReplace = { [weak self] replacement, all in
+            self?.replaceFromSearch(replacement, all: all)
+        }
+        searchPanel.onLayoutChange = { [weak self] in
+            self?.view.needsLayout = true
+            self?.view.layoutSubtreeIfNeeded()
+            self?.scheduleVisualSubmit()
+        }
         searchPanel.onSelect = { [weak self] match in
             self?.textView.navigateToSearchMatch(match)
         }
@@ -696,6 +704,32 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         setSearchPanelHidden(false)
     }
 
+    @objc fileprivate func findAndReplaceFromMenu(_ sender: Any?) {
+        findFromMenu(sender)
+        searchPanel.setReplaceVisible(true)
+        view.window?.makeFirstResponder(searchPanel.query.isEmpty ? searchPanel.focusTarget : searchPanel.replacementFocusTarget)
+    }
+
+    private func replaceFromSearch(_ replacement: String, all: Bool) {
+        guard !bridge.composition.active else { return }
+        do {
+            let selection = bridge.selection.range
+            let hadCurrentMatch = (bridge.searchMatchesIfAvailable ?? []).contains { $0.range == selection }
+            let changed = try textView.replaceSearch(with: replacement, all: all)
+            refreshSearch(force: true)
+            if !all, let matches = bridge.searchMatchesIfAvailable, !matches.isEmpty {
+                let cursor = bridge.selection.range
+                let next = changed
+                    ? (matches.first { $0.range.location >= NSMaxRange(cursor) } ?? matches.first)
+                    : (hadCurrentMatch
+                        ? SearchResults.next(after: cursor, in: matches, forward: true)
+                        : (matches.first { $0.range.location >= cursor.location } ?? matches.first))
+                if let next { textView.navigateToSearchMatch(next) }
+            }
+            scheduleVisualSubmit()
+        } catch { show(error) }
+    }
+
     @objc fileprivate func findNextFromMenu(_ sender: Any?) {
         advanceSearch(forward: true)
     }
@@ -752,6 +786,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             scheduleVisualSubmit()
             focusDocument()
         } else {
+            // The field retains its text when closed; restore the matching state
+            // as well so reopening does not show a query with no live results.
+            applySearchQuery(searchPanel.query)
             refreshSearch(force: true)
             view.window?.makeFirstResponder(searchPanel.focusTarget)
         }
@@ -2596,6 +2633,53 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         _ = try await submit(force: true)
         print("Yu sidebar navigation self-check: native menu dispatch, repeated file/outline switching and first/last heading navigation passed")
 
+        // Exercise production find/replace actions in the real split accessory,
+        // including its height change and the live query after closing/reopening.
+        let replacementSource = bridge.source
+        let replacementQuery = try require(replacementSource.first(where: { $0.isLetter }).map(String.init), "Find/replace fixture needs a letter")
+        searchPanel.setQuery(replacementQuery)
+        searchPanel.setReplaceVisible(false)
+        findFromMenu(nil)
+        _ = try await submit(force: true)
+        let compactSearchHeight = searchPanel.view.bounds.height
+        findAndReplaceFromMenu(nil)
+        view.layoutSubtreeIfNeeded()
+        _ = try await submit(force: true)
+        try require(searchPanel.view.bounds.height >= compactSearchHeight + 30, "Replacement row did not expand the native accessory")
+        let replacementControl = try require(searchPanel.replacementFocusTarget as? NSControl, "Missing native replacement field")
+        let replacementEditor = try require(replacementControl.currentEditor(), "Replacement field is not editing")
+        try require(view.window?.firstResponder === replacementEditor, "Replacement shortcut did not focus its native field")
+        let replacementHits = try require(bridge.searchMatchesIfAvailable, "Missing search results")
+        let replacementFirst = try require(replacementHits.first, "Missing initial replacement match")
+        textView.navigateToSearchMatch(replacementFirst)
+        replaceFromSearch("Yu🪶", all: false)
+        try require(bridge.source == (replacementSource as NSString).replacingCharacters(in: replacementFirst.range, with: "Yu🪶"), "Real-window single replacement changed the wrong source range")
+        let replacedFrame = try await submit(force: true)
+        try require(replacedFrame?.submitted == true, "Replacement did not publish a new frame")
+        textView.performUndo()
+        try require(bridge.source == replacementSource, "Replacement undo did not restore source")
+        try setSourceMode(true)
+        replaceFromSearch("Yu🪶", all: true)
+        try require(bridge.source == replacementSource.replacingOccurrences(of: replacementQuery, with: "Yu🪶"), "Source mode Replace All changed the wrong content")
+        _ = try await submit(force: true)
+        textView.performUndo()
+        try require(bridge.source == replacementSource, "Replace All was not one undo operation")
+        try setSourceMode(false)
+        view.window?.makeFirstResponder(replacementControl)
+        searchPanel.setReplaceVisible(false)
+        let queryControl = try require(searchPanel.focusTarget as? NSControl, "Missing find field")
+        let queryEditor = try require(queryControl.currentEditor(), "Find field is not editing")
+        try require(view.window?.firstResponder === queryEditor, "Collapsing replacement did not return focus to Find")
+        setSearchPanelHidden(true)
+        findFromMenu(nil)
+        try require((bridge.searchMatchesIfAvailable ?? []).count == replacementHits.count, "Reopening Find did not restore the visible query")
+        setSearchPanelHidden(true)
+        _ = try await submit(force: true)
+        print("Yu find/replace real-window self-check: accessory expansion, field focus, single/all source edits, submitted frames, undo and retained query passed")
+        // The scripted edits were undone and checked against the fixture above.
+        // Do not leave unattended self-check shutdown blocked on Save/Discard.
+        closeAlertDecision = { _ in .alertSecondButtonReturn }
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
@@ -4102,6 +4186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         editMenu.addItem(.separator())
         let findItems: [(String, Selector, String, NSEvent.ModifierFlags)] = [
             (L10n.tr("Find"), #selector(DocumentViewController.findFromMenu(_:)), "f", [.command]),
+            (L10n.tr("Find and Replace"), #selector(DocumentViewController.findAndReplaceFromMenu(_:)), "f", [.command, .option]),
             (L10n.tr("Find Next"), #selector(DocumentViewController.findNextFromMenu(_:)), "g", [.command]),
             (
                 L10n.tr("Find Previous"),

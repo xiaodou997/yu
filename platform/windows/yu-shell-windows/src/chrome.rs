@@ -46,6 +46,11 @@ pub(crate) const ID_ROWS: u16 = 2005;
 pub(crate) const ID_SEARCH_PREVIOUS: u16 = 2006;
 pub(crate) const ID_SEARCH_CLOSE: u16 = 2007;
 pub(crate) const ID_SEARCH_NEXT: u16 = 2008;
+pub(crate) const ID_REPLACE_TOGGLE: u16 = 2201;
+pub(crate) const ID_REPLACEMENT: u16 = 2202;
+pub(crate) const ID_REPLACE_CURRENT: u16 = 2203;
+pub(crate) const ID_REPLACE_ALL: u16 = 2204;
+pub(crate) const ID_FIND_REPLACE: u16 = 2205;
 pub(crate) const ID_DOCUMENT_SCROLLBAR: u16 = 2009;
 pub(crate) const ID_MENU_FILE: u16 = 2101;
 pub(crate) const ID_MENU_EDIT: u16 = 2102;
@@ -543,6 +548,11 @@ pub(crate) struct Chrome {
     pub(crate) status: HWND,
     pub(crate) document_scrollbar: HWND,
     pub(crate) query: HWND,
+    pub(crate) replacement: HWND,
+    replace_toggle: HWND,
+    replace_current: HWND,
+    replace_all: HWND,
+    replacement_frame: HWND,
     pub(crate) list: HWND,
     pub(crate) menu_buttons: [HWND; 4],
     menu_background: HWND,
@@ -599,12 +609,17 @@ impl Chrome {
             .chain([
                 self.list,
                 self.query,
+                self.replace_toggle,
+                self.replacement,
+                self.replace_current,
+                self.replace_all,
                 self.search_previous,
                 self.search_next,
                 self.search_close,
             ])
-            .filter(|hwnd| {
-                unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*hwnd) }.as_bool()
+            .filter(|hwnd| unsafe {
+                windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(*hwnd).as_bool()
+                    && windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(*hwnd).as_bool()
             })
             .collect()
     }
@@ -689,6 +704,56 @@ impl Chrome {
         )?;
         if !unsafe { SetWindowSubclass(query, Some(query_subclass), 1, 0) }.as_bool() {
             return Err(error(windows::core::Error::from_win32()));
+        }
+        let replacement_frame = child(parent, w!("STATIC"), "", SS_OWNERDRAW.0, 2210, false)?;
+        let replacement = child(
+            parent,
+            w!("EDIT"),
+            "",
+            ES_AUTOHSCROLL as u32,
+            ID_REPLACEMENT,
+            true,
+        )?;
+        if !unsafe { SetWindowSubclass(replacement, Some(query_subclass), 1, 0) }.as_bool() {
+            return Err(error(windows::core::Error::from_win32()));
+        }
+        let replace_toggle = child(
+            parent,
+            w!("BUTTON"),
+            strings.replace(),
+            BS_OWNERDRAW as u32,
+            ID_REPLACE_TOGGLE,
+            true,
+        )?;
+        let replace_current = child(
+            parent,
+            w!("BUTTON"),
+            strings.replace(),
+            BS_OWNERDRAW as u32,
+            ID_REPLACE_CURRENT,
+            true,
+        )?;
+        let replace_all = child(
+            parent,
+            w!("BUTTON"),
+            strings.replace_all(),
+            BS_OWNERDRAW as u32,
+            ID_REPLACE_ALL,
+            true,
+        )?;
+        for button in [replace_toggle, replace_current, replace_all] {
+            if !unsafe { SetWindowSubclass(button, Some(tab_subclass), 1, 0) }.as_bool() {
+                return Err(error(windows::core::Error::from_win32()));
+            }
+        }
+        let replacement_cue = wide(strings.replace_with());
+        unsafe {
+            SendMessageW(
+                replacement,
+                EM_SETCUEBANNER,
+                WPARAM(1),
+                LPARAM(replacement_cue.as_ptr() as isize),
+            );
         }
         let list = child(
             parent,
@@ -832,6 +897,17 @@ impl Chrome {
             )
         }
         .map_err(error)?;
+        let replacement_label = wide(strings.replace_with());
+        unsafe {
+            accessibility.SetHwndPropStr(
+                replacement,
+                (-4i32) as u32,
+                0,
+                Name_Property_GUID,
+                PCWSTR(replacement_label.as_ptr()),
+            )
+        }
+        .map_err(error)?;
         Ok(Self {
             accessibility,
             canvas,
@@ -839,6 +915,11 @@ impl Chrome {
             status,
             document_scrollbar,
             query,
+            replacement,
+            replacement_frame,
+            replace_toggle,
+            replace_current,
+            replace_all,
             list,
             menu_buttons,
             menu_background,
@@ -880,6 +961,18 @@ impl Chrome {
     }
     pub(crate) fn query_text(&self) -> String {
         window_text(self.query)
+    }
+    pub(crate) fn replacement_text(&self) -> String {
+        window_text(self.replacement)
+    }
+    pub(crate) fn replacement_is_composing(&self) -> bool {
+        !unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetPropW(
+                self.replacement,
+                w!("YuSearchComposition"),
+            )
+        }
+        .is_invalid()
     }
     pub(crate) fn query_is_composing(&self) -> bool {
         !unsafe {
@@ -1024,6 +1117,7 @@ impl Chrome {
             state.metrics(),
             state.sidebar(),
             state.search_visible(),
+            state.replace_visible(),
             state.appearance(),
         )?;
         self.repaint();
@@ -1067,6 +1161,16 @@ impl Chrome {
                     search.matches().len()
                 )
             });
+        let can_replace = editor.search().is_some_and(|search| !search.is_empty())
+            && editor.composition().is_none();
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
+            if !can_replace && [self.replace_current, self.replace_all].contains(&GetFocus()) {
+                let _ = SetFocus(self.replacement);
+            }
+            let _ = EnableWindow(self.replace_current, can_replace);
+            let _ = EnableWindow(self.replace_all, can_replace);
+        }
         if self.search_caption_text != caption {
             self.search_caption_text = caption;
             let label = wide(&format!(
@@ -1093,6 +1197,7 @@ impl Chrome {
                 state.metrics(),
                 state.sidebar(),
                 visible,
+                state.replace_visible(),
                 state.appearance(),
             )?;
         }
@@ -1104,6 +1209,7 @@ impl Chrome {
         metrics: WindowMetrics,
         mode: SidebarMode,
         search_visible: bool,
+        replace_visible: bool,
         appearance: Appearance,
     ) -> Result<(), ShellError> {
         self.mode = mode;
@@ -1151,7 +1257,7 @@ impl Chrome {
         let status_h = metrics.px(24.0).min(height);
         let status_w = metrics.px(180.0).min(width);
         let header_h = menu_height(metrics);
-        let search_h = search_height(metrics, search_visible);
+        let search_h = search_height(metrics, search_visible, replace_visible);
         let scrollbar_w = metrics.px(12.0).min(width);
         let scrollbar_gap = metrics.px(4.0);
         let sidebar_w = sidebar_width(metrics, mode);
@@ -1271,15 +1377,77 @@ impl Chrome {
                 },
             );
             let search_w = (width - sidebar_w).max(1);
-            let search_left = sidebar_w + padding;
+            let toggle_w = metrics.px(72.0);
+            let search_left = sidebar_w + padding + toggle_w + metrics.px(8.0);
             let gap = metrics.px(8.0);
             let button_w = metrics.px(28.0);
             let close_w = metrics.px(60.0);
             let count_w = metrics.px(56.0);
             let query_w =
-                (search_w - padding * 2 - gap * 4 - count_w - button_w * 2 - close_w).max(1);
+                (search_w - padding * 2 - gap * 5 - toggle_w - count_w - button_w * 2 - close_w)
+                    .max(1);
             let top = header_h + metrics.px(12.0);
             let control_h = metrics.px(32.0);
+            let _ = MoveWindow(
+                self.replace_toggle,
+                sidebar_w + padding,
+                top,
+                toggle_w,
+                control_h,
+                true,
+            );
+            let replacement_top = top + metrics.px(40.0);
+            let replace_w = metrics.px(90.0);
+            let all_w = metrics.px(116.0);
+            let replacement_left = sidebar_w + padding;
+            let replacement_w = (search_w - padding * 2 - gap * 2 - replace_w - all_w).max(1);
+            let _ = MoveWindow(
+                self.replacement_frame,
+                replacement_left,
+                replacement_top,
+                replacement_w,
+                control_h,
+                true,
+            );
+            let _ = MoveWindow(
+                self.replacement,
+                replacement_left + metrics.px(10.0),
+                replacement_top + metrics.px(6.0),
+                (replacement_w - metrics.px(20.0)).max(1),
+                metrics.px(20.0),
+                true,
+            );
+            let _ = MoveWindow(
+                self.replace_current,
+                replacement_left + replacement_w + gap,
+                replacement_top,
+                replace_w,
+                control_h,
+                true,
+            );
+            let _ = MoveWindow(
+                self.replace_all,
+                replacement_left + replacement_w + gap * 2 + replace_w,
+                replacement_top,
+                all_w,
+                control_h,
+                true,
+            );
+            for hwnd in [
+                self.replacement_frame,
+                self.replacement,
+                self.replace_current,
+                self.replace_all,
+            ] {
+                let _ = ShowWindow(
+                    hwnd,
+                    if search_visible && replace_visible {
+                        SW_SHOW
+                    } else {
+                        SW_HIDE
+                    },
+                );
+            }
             let _ = MoveWindow(
                 self.search_background,
                 sidebar_w,
@@ -1310,6 +1478,7 @@ impl Chrome {
             for hwnd in [
                 self.search_background,
                 self.query_frame,
+                self.replace_toggle,
                 self.query,
                 self.search_close,
                 self.search_caption,
@@ -1331,7 +1500,7 @@ impl Chrome {
         Ok(())
     }
 
-    fn controls(&self) -> [HWND; 20] {
+    fn controls(&self) -> [HWND; 25] {
         [
             self.canvas,
             self.background,
@@ -1346,6 +1515,11 @@ impl Chrome {
             self.caption,
             self.query,
             self.list,
+            self.replacement,
+            self.replacement_frame,
+            self.replace_toggle,
+            self.replace_current,
+            self.replace_all,
             self.empty,
             self.query_frame,
             self.search_background,
@@ -1358,6 +1532,7 @@ impl Chrome {
     pub(crate) fn clear_accessibility_annotations(&self) {
         for hwnd in [
             self.query,
+            self.replacement,
             self.list,
             self.caption,
             self.empty,
@@ -1383,10 +1558,10 @@ impl Chrome {
         }
     }
     pub(crate) fn control_color(&self, dc: HDC, hwnd: HWND) -> Option<LRESULT> {
-        if hwnd != self.query && hwnd != self.list {
+        if hwnd != self.query && hwnd != self.replacement && hwnd != self.list {
             return None;
         }
-        let (color, brush) = if hwnd == self.query {
+        let (color, brush) = if hwnd == self.query || hwnd == self.replacement {
             (self.palette.input_color, self.palette.input.0)
         } else {
             (self.palette.background_color, self.palette.background.0)
@@ -1417,6 +1592,10 @@ impl Chrome {
                     self.search_caption,
                     self.query_frame,
                     self.search_previous,
+                    self.replacement_frame,
+                    self.replace_toggle,
+                    self.replace_current,
+                    self.replace_all,
                     self.search_next,
                     self.search_close,
                 ]
@@ -1462,7 +1641,16 @@ impl Chrome {
                 };
                 FillRect(item.hDC, &line, self.palette.border.0);
                 String::new()
-            } else if [self.search_close, self.search_previous, self.search_next].contains(&hwnd) {
+            } else if [
+                self.search_close,
+                self.search_previous,
+                self.search_next,
+                self.replace_toggle,
+                self.replace_current,
+                self.replace_all,
+            ]
+            .contains(&hwnd)
+            {
                 let brush = if pointer_inside(hwnd) || item.itemState.0 & ODS_SELECTED.0 != 0 {
                     self.palette.hover.0
                 } else {
@@ -1470,7 +1658,12 @@ impl Chrome {
                 };
                 round_fill(item.hDC, &rect, px(6), brush);
                 flags |= DT_CENTER;
-                if hwnd == self.search_close {
+                if !windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool() {
+                    text_color = self.palette.muted;
+                }
+                if [self.replace_toggle, self.replace_current, self.replace_all].contains(&hwnd) {
+                    window_text(hwnd)
+                } else if hwnd == self.search_close {
                     search_done(self.locale).into()
                 } else if hwnd == self.search_next {
                     "↓".into()
@@ -1526,7 +1719,7 @@ impl Chrome {
                 text_color = self.palette.muted;
                 flags = DT_WORDBREAK | DT_NOPREFIX;
                 self.empty_text.clone()
-            } else if hwnd == self.query_frame {
+            } else if hwnd == self.query_frame || hwnd == self.replacement_frame {
                 round_fill(item.hDC, &rect, px(6), self.palette.input.0);
                 let region = CreateRoundRectRgn(
                     rect.left,
@@ -1613,10 +1806,10 @@ fn search_done(locale: Locale) -> &'static str {
     }
 }
 
-pub(crate) fn search_height(metrics: WindowMetrics, visible: bool) -> i32 {
+pub(crate) fn search_height(metrics: WindowMetrics, visible: bool, replacement: bool) -> i32 {
     if visible {
         metrics
-            .px(56.0)
+            .px(if replacement { 96.0 } else { 56.0 })
             .min((metrics.height_px() as i32).max(1) / 3)
     } else {
         0
@@ -1918,6 +2111,7 @@ mod tests {
                 WindowMetrics::new(1200, 800, 96),
                 SidebarMode::Files,
                 false,
+                false,
                 Appearance::Light,
             )
             .expect("96 DPI");
@@ -1929,6 +2123,7 @@ mod tests {
             .layout(
                 WindowMetrics::new(2400, 1600, 192),
                 SidebarMode::Files,
+                true,
                 true,
                 Appearance::Dark,
             )
@@ -1945,6 +2140,7 @@ mod tests {
             .layout(
                 WindowMetrics::new(1200, 800, 96),
                 SidebarMode::Outline,
+                false,
                 false,
                 Appearance::Light,
             )

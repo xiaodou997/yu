@@ -101,9 +101,10 @@ use crate::accessibility::{
 };
 use crate::chrome::{
     CODE_COPY_FEEDBACK_MS, CODE_COPY_FEEDBACK_TIMER_ID, Chrome, CodeBlockControls, ID_FILES,
-    ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY, ID_ROWS,
-    ID_SEARCH, ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height,
-    search_height, sidebar_width,
+    ID_FIND_REPLACE, ID_MENU_EDIT, ID_MENU_FILE, ID_MENU_HELP, ID_MENU_VIEW, ID_OUTLINE, ID_QUERY,
+    ID_REPLACE_ALL, ID_REPLACE_CURRENT, ID_REPLACE_TOGGLE, ID_REPLACEMENT, ID_ROWS, ID_SEARCH,
+    ID_SEARCH_CLOSE, ID_SEARCH_NEXT, ID_SEARCH_PREVIOUS, PanelAction, menu_height, search_height,
+    sidebar_width,
 };
 use crate::image_interaction::{
     ID_IMAGE_MORE, ID_IMAGE_REPLACE, ID_IMAGE_SIZE, ID_IMAGE_SOURCE, ImageInspector,
@@ -2099,7 +2100,11 @@ impl AppWindow {
                 left: viewport_rect.left,
                 right: viewport_rect.right,
                 top: menu_height(metrics)
-                    + search_height(metrics, self.state.search_visible())
+                    + search_height(
+                        metrics,
+                        self.state.search_visible(),
+                        self.state.replace_visible(),
+                    )
                     + metrics.px(4.0),
                 bottom: viewport_rect.bottom,
             };
@@ -2670,6 +2675,11 @@ impl AppWindow {
             append_string(edit.0, ID_EDIT_REDO, strings.redo())?;
             AppendMenuW(edit.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
             append_string(edit.0, ID_SEARCH, &format!("{}\tCtrl+F", strings.search()))?;
+            append_string(
+                edit.0,
+                ID_FIND_REPLACE,
+                &format!("{}\tCtrl+H", strings.find_and_replace()),
+            )?;
             append_popup(root.0, edit.0, strings.edit())?;
             std::mem::forget(edit);
 
@@ -2801,7 +2811,11 @@ impl AppWindow {
             .min(metrics.px(spec.column_width))
             .max(1);
         let surface_x = sidebar_w + (available_w - surface_w) / 2;
-        let find_h = search_height(metrics, self.state.search_visible());
+        let find_h = search_height(
+            metrics,
+            self.state.search_visible(),
+            self.state.replace_visible(),
+        );
         let surface_y = menu_height(metrics)
             + find_h
             + metrics
@@ -2825,6 +2839,7 @@ impl AppWindow {
                 self.state.metrics(),
                 self.state.sidebar(),
                 self.state.search_visible(),
+                self.state.replace_visible(),
                 self.state.appearance(),
             )
         {
@@ -3004,8 +3019,8 @@ impl AppWindow {
                     let _ = SetFocus(self.surface);
                 }
             }
-            ID_SEARCH => {
-                self.handle_chrome_command(ID_SEARCH, 0)?;
+            ID_SEARCH | ID_FIND_REPLACE => {
+                self.handle_chrome_command(command, 0)?;
             }
             _ => {}
         }
@@ -3046,6 +3061,28 @@ impl AppWindow {
                     }
                 }
             }
+            ID_REPLACE_TOGGLE | ID_FIND_REPLACE => {
+                let visible = command == ID_FIND_REPLACE || !self.state.replace_visible();
+                self.state.set_replace_visible(visible);
+                self.update_layout();
+                self.render_current()?;
+                if let Some(tsf) = self.tsf.as_ref() {
+                    tsf.notify_layout_change();
+                }
+                if let Some(chrome) = self.chrome.as_ref() {
+                    unsafe {
+                        let _ = SetFocus(if visible && !chrome.query_text().is_empty() {
+                            chrome.replacement
+                        } else {
+                            chrome.query
+                        });
+                    }
+                }
+            }
+            ID_REPLACE_CURRENT | ID_REPLACE_ALL => {
+                self.replace_search(command == ID_REPLACE_ALL)?;
+            }
+            ID_REPLACEMENT if notification == EN_CHANGE as u16 => {}
             ID_QUERY if notification == EN_CHANGE as u16 => {
                 self.render_current()?;
             }
@@ -3060,6 +3097,72 @@ impl AppWindow {
                 self.activate_panel_row(notification == LBN_DBLCLK as u16)?;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn replace_search(&mut self, all: bool) -> Result<(), ShellError> {
+        if !self.state.search_visible()
+            || !self.state.replace_visible()
+            || self.state.document().session().composition().is_some()
+            || self.chrome.as_ref().is_some_and(|chrome| {
+                chrome.query_is_composing() || chrome.replacement_is_composing()
+            })
+        {
+            return Ok(());
+        }
+        self.refresh_chrome();
+        let Some(replacement) = self.chrome.as_ref().map(Chrome::replacement_text) else {
+            return Ok(());
+        };
+        let before = self.input_projection()?;
+        let before_selection = self.state.document().session().selection();
+        let had_current = self
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .search()
+            .is_some_and(|search| search.current(before_selection.ordered_range()).is_some());
+        let result = self
+            .state
+            .document_mut()
+            .session_mut()
+            .document_mut()
+            .editor_mut()
+            .replace_search(&replacement, all)
+            .map_err(|error| ShellError::Platform(error.to_string()))?;
+        self.refresh_chrome();
+        self.render_current()?;
+        self.notify_tsf_after_command(before.end_acp(), before_selection, result.changed())?;
+        if !all {
+            let selection = self.state.document().session().selection().ordered_range();
+            let action = self
+                .state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .and_then(|search| {
+                    search
+                        .matches()
+                        .iter()
+                        .find(|hit| {
+                            if result.changed() {
+                                hit.start() >= selection.end()
+                            } else if had_current {
+                                hit.start() > selection.start()
+                            } else {
+                                hit.start() >= selection.start()
+                            }
+                        })
+                        .or_else(|| search.matches().first())
+                        .copied()
+                        .map(PanelAction::Select)
+                });
+            self.activate_panel_action(action, false)?;
         }
         Ok(())
     }
@@ -3529,6 +3632,11 @@ fn create_accelerators() -> Result<HACCEL, ShellError> {
             key: b'F' as u16,
             cmd: ID_SEARCH,
         },
+        ACCEL {
+            fVirt: FCONTROL | FVIRTKEY,
+            key: b'H' as u16,
+            cmd: ID_FIND_REPLACE,
+        },
     ];
     unsafe { CreateAcceleratorTableW(&entries) }.map_err(platform_error)
 }
@@ -3592,17 +3700,27 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                 }
                 WM_KEYDOWN
                     if app.chrome.as_ref().is_some_and(|chrome| {
-                        message.hwnd == chrome.query || message.hwnd == chrome.list
+                        message.hwnd == chrome.query
+                            || message.hwnd == chrome.replacement
+                            || message.hwnd == chrome.list
                     }) && message.wParam.0 == VK_RETURN.0 as usize
                         && !app.chrome.as_ref().is_some_and(|chrome| {
-                            message.hwnd == chrome.query && chrome.query_is_composing()
+                            (message.hwnd == chrome.query && chrome.query_is_composing())
+                                || (message.hwnd == chrome.replacement
+                                    && chrome.replacement_is_composing())
                         }) =>
                 {
                     let search = app
                         .chrome
                         .as_ref()
                         .is_some_and(|chrome| message.hwnd == chrome.query);
-                    let result = if search {
+                    let replacement = app
+                        .chrome
+                        .as_ref()
+                        .is_some_and(|chrome| message.hwnd == chrome.replacement);
+                    let result = if replacement {
+                        app.replace_search(false)
+                    } else if search {
                         app.advance_search(unsafe { GetKeyState(VK_SHIFT.0 as i32) } >= 0)
                     } else {
                         app.activate_panel_row(true)
@@ -3637,7 +3755,9 @@ fn message_loop(hwnd: HWND, accelerator: HACCEL) {
                             == windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0
                                 as usize
                         && !app.chrome.as_ref().is_some_and(|chrome| {
-                            message.hwnd == chrome.query && chrome.query_is_composing()
+                            (message.hwnd == chrome.query && chrome.query_is_composing())
+                                || (message.hwnd == chrome.replacement
+                                    && chrome.replacement_is_composing())
                         })
                         && !app
                             .image_inspector
@@ -3716,7 +3836,10 @@ unsafe extern "system" fn window_proc(
                 let notification = (wparam.0 >> 16) as u16;
                 let result = if lparam.0 != 0 && is_inspector_control(command) {
                     app.handle_image_inspector_command(command, notification)
-                } else if lparam.0 != 0 && (ID_FILES..=ID_SEARCH_NEXT).contains(&command) {
+                } else if lparam.0 != 0
+                    && ((ID_FILES..=ID_SEARCH_NEXT).contains(&command)
+                        || (ID_REPLACE_TOGGLE..=ID_REPLACE_ALL).contains(&command))
+                {
                     app.handle_chrome_command(command, notification)
                 } else {
                     app.handle_command(command)
@@ -5665,6 +5788,102 @@ mod tests {
         assert!(!app.state.search_visible());
         assert_eq!(app.state.document().session().revision(), revision);
         assert_eq!(app.state.document().session().snapshot().as_str(), source);
+
+        // The replacement accessory must use source transactions and native
+        // focus/IME routing without taking over undo inside either edit field.
+        app.handle_command(ID_FIND_REPLACE).expect("open replace");
+        assert!(app.state.search_visible() && app.state.replace_visible());
+        let replacement = app.chrome.as_ref().expect("chrome").replacement;
+        assert_eq!(unsafe { GetFocus() }, replacement);
+        set_window_text(query, "中文😀");
+        set_window_text(replacement, "羽🪶");
+        assert_eq!(
+            app.state.document().session().revision(),
+            revision,
+            "editing replacement must not edit the document"
+        );
+        let first = app
+            .state
+            .document()
+            .session()
+            .document()
+            .editor()
+            .search()
+            .expect("query")
+            .matches()[0];
+        app.activate_panel_action(Some(PanelAction::Select(first)), false)
+            .expect("select exact match");
+        app.handle_chrome_command(ID_REPLACE_CURRENT, 0)
+            .expect("replace current");
+        assert_eq!(
+            app.state.document().session().snapshot().as_str(),
+            source.replacen("中文😀", "羽🪶", 1)
+        );
+        app.execute_input_command(EditorCommand::Undo)
+            .expect("undo replacement");
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
+        app.handle_chrome_command(ID_REPLACE_ALL, 0)
+            .expect("replace all");
+        assert_eq!(
+            app.state.document().session().snapshot().as_str(),
+            source.replace("中文😀", "羽🪶")
+        );
+        app.execute_input_command(EditorCommand::Undo)
+            .expect("single undo for all");
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
+        set_window_text(replacement, "");
+        app.handle_chrome_command(ID_REPLACE_ALL, 0)
+            .expect("delete all");
+        assert_eq!(
+            app.state.document().session().snapshot().as_str(),
+            source.replace("中文😀", "")
+        );
+        app.execute_input_command(EditorCommand::Undo)
+            .expect("undo deletions");
+        assert_eq!(app.state.document().session().snapshot().as_str(), source);
+        unsafe {
+            SendMessageW(
+                replacement,
+                windows::Win32::UI::WindowsAndMessaging::WM_IME_STARTCOMPOSITION,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        let composition_revision = app.state.document().session().revision();
+        app.handle_chrome_command(ID_REPLACE_ALL, 0)
+            .expect("IME replacement guard");
+        assert_eq!(
+            app.state.document().session().revision(),
+            composition_revision
+        );
+        unsafe {
+            SendMessageW(
+                replacement,
+                windows::Win32::UI::WindowsAndMessaging::WM_IME_ENDCOMPOSITION,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        app.handle_chrome_command(ID_REPLACE_TOGGLE, 0)
+            .expect("collapse replace");
+        assert!(!app.state.replace_visible());
+        assert_eq!(unsafe { GetFocus() }, query);
+        app.handle_chrome_command(ID_SEARCH_CLOSE, 0)
+            .expect("close find");
+        app.handle_chrome_command(ID_SEARCH, 0)
+            .expect("reopen retained query");
+        assert_eq!(
+            app.state
+                .document()
+                .session()
+                .document()
+                .editor()
+                .search()
+                .expect("restored query")
+                .matches()
+                .len(),
+            2
+        );
         drop(window);
     }
 }
