@@ -24,6 +24,8 @@ mod image_interaction;
 #[cfg(target_os = "windows")]
 mod native;
 #[cfg(target_os = "windows")]
+mod quick_open;
+#[cfg(target_os = "windows")]
 mod resources;
 #[cfg(target_os = "windows")]
 mod tsf;

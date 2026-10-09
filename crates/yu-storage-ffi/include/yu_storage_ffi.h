@@ -231,6 +231,17 @@ enum {
 #define YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK UINT64_MAX
 
 typedef struct YuStorageSession YuStorageSession;
+typedef struct YuStorageWorkspaceIndex YuStorageWorkspaceIndex;
+/* Metadata-only background scan. Destroy cancels without blocking the UI.
+ * Query returns RENDER_BUSY while loading; otherwise a stable UTF-8 JSON
+ * snapshot {root, total, truncated, skipped, files:[{path,relative}]}.
+ * Query/resolve use length-then-copy; handles are confined to one UI thread. */
+int32_t yu_storage_workspace_start(const uint8_t *root, size_t length, YuStorageWorkspaceIndex **output);
+void yu_storage_workspace_destroy(YuStorageWorkspaceIndex *handle);
+int32_t yu_storage_workspace_query(YuStorageWorkspaceIndex *handle,
+    const uint8_t *query, size_t length, uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_workspace_resolve(const YuStorageWorkspaceIndex *handle,
+    const uint8_t *path, size_t length, uint8_t *output, size_t capacity, size_t *written);
 typedef struct YuStorageHtmlExport YuStorageHtmlExport;
 
 /* Whole-document export; task owns an immutable snapshot and independent helper.

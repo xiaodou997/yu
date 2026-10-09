@@ -1,3 +1,17 @@
+"Quick Open" = "クイックオープン";
+"Quick Open…" = "クイックオープン…";
+"Open Folder…" = "フォルダを開く…";
+"Search file names or paths" = "ファイル名またはパスを検索";
+"Workspace Files" = "ワークスペースのファイル";
+"Refresh Files" = "ファイルを更新";
+"Use Document Folder" = "文書のフォルダを使用";
+"Scanning folder…" = "フォルダを検索中…";
+"Folder unavailable. Choose another folder or refresh." = "フォルダを利用できません。再選択または更新してください。";
+"No matching files" = "一致するファイルがありません";
+"%d files shown · %d indexed" = "%d 件表示 · %d 件索引済み";
+"Partial index; choose a smaller folder" = "一部のみ索引済み：小さいフォルダを選択";
+"File unavailable. Refresh the file list." = "ファイルを利用できません。一覧を更新してください。";
+"Choose a folder to browse local Markdown files." = "ローカルの Markdown ファイルを表示するフォルダを選択してください。";
 "Files" = "ファイル";
 "Open" = "開く";
 "Show in Finder" = "Finderで表示";

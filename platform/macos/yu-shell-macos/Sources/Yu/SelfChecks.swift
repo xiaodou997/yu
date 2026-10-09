@@ -2170,6 +2170,34 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         precondition(!noOp && bridge.revision == noOpRevision, "Empty search must not dirty the document")
         panel.setReplaceVisible(false)
 
+        // The workspace bridge owns a separate background index; querying it
+        // cannot alter this document's source, revision, or undo history.
+        let workspace = fileManager.temporaryDirectory.appendingPathComponent("yu-workspace-ffi-\(UUID().uuidString)")
+        try fileManager.createDirectory(at: workspace.appendingPathComponent("notes"), withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("notes/羽🙂.md")
+        try Data([0xff, 0xfe]).write(to: file)
+        try Data().write(to: workspace.appendingPathComponent("README.md"))
+        let workspaceIndex = try NativeWorkspaceIndex(root: workspace)
+        let sourceBeforeIndex = bridge.source
+        let revisionBeforeIndex = bridge.revision
+        var indexed: NativeWorkspaceIndex.Snapshot?
+        let deadline = Date().addingTimeInterval(5)
+        while indexed == nil && Date() < deadline {
+            indexed = try workspaceIndex.query("")
+            if indexed == nil { Thread.sleep(forTimeInterval: 0.005) }
+        }
+        precondition(indexed?.total == 2, "Metadata index must include unreadable-as-UTF8 document files without reading contents")
+        let hits = try unwrapSelfCheck(try workspaceIndex.query("notes 羽🙂"))
+        precondition(hits.files.count == 1 && hits.files[0].relative == "notes/羽🙂.md", "Native workspace query lost Unicode or path ranking")
+        let resolved = try workspaceIndex.resolve(hits.files[0].path)
+        precondition(resolved == file.resolvingSymlinksInPath(), "Selected workspace file must resolve inside the chosen root")
+        try fileManager.removeItem(at: file)
+        do { _ = try workspaceIndex.resolve(hits.files[0].path); preconditionFailure("Deleted file must not remain openable") }
+        catch { /* Expected stale-path rejection. */ }
+        precondition(bridge.revision == revisionBeforeIndex && bridge.source == sourceBeforeIndex, "Workspace browsing changed the document")
+        print("Yu workspace FFI self-check: async scan, two-pass JSON, Unicode paths, metadata-only scan and stale-path rejection passed")
+
         print(
             "Yu Search Panel self-check: matches=\(rows.count) "
                 + "labels=\(labels.count); stripping, navigation, wrap-around "

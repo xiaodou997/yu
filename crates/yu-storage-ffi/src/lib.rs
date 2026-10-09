@@ -9,6 +9,136 @@
 //! second source. The AppKit host consumes only owned snapshots and explicit
 //! result structs; its TextKit mirror is disposable and never canonical.
 
+/// UI-thread-owned workspace scan and immutable index, separate from documents.
+pub struct YuStorageWorkspaceIndex {
+    scan: Option<yu_storage::WorkspaceScan>,
+    index: Option<yu_storage::WorkspaceIndex>,
+}
+
+/// Start a cancellable metadata scan without blocking the caller.
+/// # Safety
+/// Root bytes must be readable and output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_workspace_start(
+    root: *const u8,
+    length: usize,
+    output: *mut *mut YuStorageWorkspaceIndex,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe {
+        *output = ptr::null_mut();
+    }
+    let root = match read_utf8(root, length) {
+        Ok(root) if !root.is_empty() => root,
+        _ => return YU_STORAGE_INVALID_PATH,
+    };
+    let scan = match yu_storage::WorkspaceScan::start(PathBuf::from(root)) {
+        Ok(scan) => scan,
+        Err(_) => return YU_STORAGE_IO_ERROR,
+    };
+    unsafe {
+        *output = Box::into_raw(Box::new(YuStorageWorkspaceIndex {
+            scan: Some(scan),
+            index: None,
+        }));
+    }
+    YU_STORAGE_OK
+}
+
+/// # Safety
+/// Handle is null or a live handle returned by start; destroy exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_workspace_destroy(handle: *mut YuStorageWorkspaceIndex) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+/// Query the stable file index. Busy means the worker has not completed.
+/// # Safety
+/// Handle/query must be readable; written and output (for capacity) writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_workspace_query(
+    handle: *mut YuStorageWorkspaceIndex,
+    query: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe {
+        *written = 0;
+    }
+    if length > 4096 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    let query = match read_utf8(query, length) {
+        Ok(query) => query,
+        Err(status) => return status,
+    };
+    if handle.index.is_none() {
+        let Some(scan) = handle.scan.as_ref() else {
+            return YU_STORAGE_IO_ERROR;
+        };
+        let Some(result) = scan.poll() else {
+            return YU_STORAGE_RENDER_BUSY;
+        };
+        handle.scan = None;
+        match result {
+            Ok(index) => handle.index = Some(index),
+            Err(_) => return YU_STORAGE_IO_ERROR,
+        }
+    }
+    let index = handle.index.as_ref().expect("completed scan");
+    let files: Vec<_> = index
+        .search(query, 100)
+        .iter()
+        .map(|file| serde_json::json!({"path": file.path, "relative": file.relative}))
+        .collect();
+    let value = serde_json::json!({"root": index.root, "total": index.files.len(), "truncated": index.truncated, "skipped": index.skipped, "files": files}).to_string();
+    write_bytes(value.as_bytes(), output, capacity, written)
+}
+
+/// Resolve a still-existing file inside the scanned root before opening it.
+/// # Safety
+/// Live handle/path readable; written and output (for capacity) writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_workspace_resolve(
+    handle: *const YuStorageWorkspaceIndex,
+    path: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let Some(index) = handle.index.as_ref() else {
+        return YU_STORAGE_INVALID_STATE;
+    };
+    let path = match read_utf8(path, length) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let path = match index.resolve(std::path::Path::new(path)) {
+        Ok(path) => path,
+        Err(_) => return YU_STORAGE_INVALID_PATH,
+    };
+    let Some(path) = path.to_str() else {
+        return YU_STORAGE_INVALID_UTF8;
+    };
+    write_bytes(path.as_bytes(), output, capacity, written)
+}
+
 use std::ffi::c_void;
 use std::io;
 use std::path::PathBuf;

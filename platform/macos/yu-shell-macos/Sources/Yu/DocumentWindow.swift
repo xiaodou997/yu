@@ -70,6 +70,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     private let outlinePanel = OutlinePanel()
     private var outlineRevision: UInt64?
     private let searchPanel = SearchPanel()
+    private var quickOpenPanel: QuickOpenPanel?
     /// 结果列表是照哪一版画的：Revision 或查询任一变化都要重画。查询本身不
     /// 推进 Revision，所以两者都要记。
     private var searchRevision: UInt64?
@@ -1264,13 +1265,42 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         _ = chooseSaveDestination()
     }
 
+    @objc fileprivate func quickOpenFromMenu(_ sender: Any?) {
+        guard !bridge.composition.active, let window = view.window, window.attachedSheet == nil else { return }
+        do {
+            let root = try SandboxDocumentAccess.shared.accessibleURL(filePanel.directoryURL)
+            guard try SandboxDocumentAccess.shared.ensureDirectoryAccess(root, writing: false,
+                message: L10n.tr("Choose a folder to browse local Markdown files.")) else { return }
+            let picker = QuickOpenPanel(root: root)
+            quickOpenPanel = picker
+            picker.begin(on: window) { [weak self] url in
+                guard let self else { return }
+                self.quickOpenPanel = nil
+                if let url { self.onOpenDocument?(url) }
+                else { self.focusDocument() }
+            }
+        } catch { show(error) }
+    }
+
+    @objc fileprivate func refreshFilesFromMenu(_ sender: Any?) {
+        filePanel.setDirectory(filePanel.directoryURL)
+    }
+
+    @objc fileprivate func useDocumentFolderFromMenu(_ sender: Any?) {
+        guard !persistence.isUntitled else { return }
+        filePanel.setDirectory(documentURL.deletingLastPathComponent())
+        sidebarTabs.selectedSegment = 0
+        sidebarHidden = false
+        updateSidebarVisibility()
+    }
+
     @objc fileprivate func chooseFilePanelFolderFromMenu(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.title = L10n.tr("Choose File Sidebar Folder")
+        panel.title = L10n.tr("Open Folder…")
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.directoryURL = persistence.isUntitled ? nil : documentURL.deletingLastPathComponent()
+        panel.directoryURL = filePanel.directoryURL
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try SandboxDocumentAccess.shared.rememberSelection(url)
@@ -2679,6 +2709,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         // The scripted edits were undone and checked against the fixture above.
         // Do not leave unattended self-check shutdown blocked on Save/Discard.
         closeAlertDecision = { _ in .alertSecondButtonReturn }
+
+        let workspaceSource = bridge.source
+        let workspaceRevision = bridge.revision
+        try await QuickOpenPanel.runWindowSelfCheck(on: try require(view.window, "Missing quick-open owner"))
+        try require(bridge.source == workspaceSource && bridge.revision == workspaceRevision, "Quick open browsing mutated the active document")
 
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
@@ -4098,11 +4133,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
-        let chooseFolder = NSMenuItem(title: L10n.tr("Choose File Sidebar Folder…"),
-            action: #selector(DocumentViewController.chooseFilePanelFolderFromMenu(_:)), keyEquivalent: "")
+        let chooseFolder = NSMenuItem(title: L10n.tr("Open Folder…"),
+            action: #selector(DocumentViewController.chooseFilePanelFolderFromMenu(_:)), keyEquivalent: "o")
+        chooseFolder.keyEquivalentModifierMask = [.command, .option]
         chooseFolder.target = controller
         chooseFolder.isEnabled = controller != nil
         fileMenu.addItem(chooseFolder)
+        let quickOpen = NSMenuItem(title: L10n.tr("Quick Open…"), action: #selector(DocumentViewController.quickOpenFromMenu(_:)), keyEquivalent: "o")
+        quickOpen.keyEquivalentModifierMask = [.command, .shift]
+        quickOpen.target = controller
+        quickOpen.isEnabled = controller != nil
+        fileMenu.addItem(quickOpen)
+        let refreshFiles = NSMenuItem(title: L10n.tr("Refresh Files"), action: #selector(DocumentViewController.refreshFilesFromMenu(_:)), keyEquivalent: "")
+        refreshFiles.target = controller
+        fileMenu.addItem(refreshFiles)
+        let documentFolder = NSMenuItem(title: L10n.tr("Use Document Folder"), action: #selector(DocumentViewController.useDocumentFolderFromMenu(_:)), keyEquivalent: "")
+        documentFolder.target = controller
+        fileMenu.addItem(documentFolder)
         let exportHTML = NSMenuItem(title: L10n.tr("Export HTML…"), action: #selector(DocumentViewController.exportHTMLFromMenu(_:)), keyEquivalent: "")
         exportHTML.target = controller
         exportHTML.isEnabled = controller != nil

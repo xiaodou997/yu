@@ -1,3 +1,17 @@
+"Quick Open" = "快速開啟";
+"Quick Open…" = "快速開啟…";
+"Open Folder…" = "開啟資料夾…";
+"Search file names or paths" = "搜尋檔名或路徑";
+"Workspace Files" = "工作區檔案";
+"Refresh Files" = "重新整理檔案";
+"Use Document Folder" = "使用文件所在資料夾";
+"Scanning folder…" = "正在掃描資料夾…";
+"Folder unavailable. Choose another folder or refresh." = "資料夾無法使用，請重新選擇或整理。";
+"No matching files" = "沒有符合的檔案";
+"%d files shown · %d indexed" = "顯示 %d 個檔案 · 已索引 %d 個";
+"Partial index; choose a smaller folder" = "索引不完整；請選擇較小的資料夾";
+"File unavailable. Refresh the file list." = "檔案無法使用，請重新整理清單。";
+"Choose a folder to browse local Markdown files." = "請選擇資料夾以瀏覽本機 Markdown 檔案。";
 "Files" = "檔案";
 "Open" = "開啟";
 "Show in Finder" = "在 Finder 中顯示";

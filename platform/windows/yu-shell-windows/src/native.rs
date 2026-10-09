@@ -127,6 +127,10 @@ const ID_FILE_OPEN: u16 = 1002;
 const ID_FILE_SAVE: u16 = 1003;
 const ID_FILE_SAVE_AS: u16 = 1004;
 const ID_FILE_EXIT: u16 = 1005;
+const ID_FILE_FOLDER: u16 = 1006;
+const ID_FILE_QUICK: u16 = 1007;
+const ID_FILE_REFRESH: u16 = 1008;
+const ID_FILE_DOCUMENT_FOLDER: u16 = 1009;
 const ID_EDIT_UNDO: u16 = 1101;
 const ID_EDIT_REDO: u16 = 1102;
 const ID_VIEW_SIDEBAR: u16 = 1201;
@@ -2662,6 +2666,23 @@ impl AppWindow {
             let file = Menu(CreatePopupMenu().map_err(platform_error)?);
             append_string(file.0, ID_FILE_NEW, strings.new_document())?;
             append_string(file.0, ID_FILE_OPEN, strings.open())?;
+            use crate::locale::WorkspaceText as Text;
+            append_string(
+                file.0,
+                ID_FILE_FOLDER,
+                &format!("{}\tCtrl+Alt+O", strings.workspace(Text::OpenFolder)),
+            )?;
+            append_string(
+                file.0,
+                ID_FILE_QUICK,
+                &format!("{}\tCtrl+Shift+O", strings.workspace(Text::QuickOpen)),
+            )?;
+            append_string(file.0, ID_FILE_REFRESH, strings.workspace(Text::Refresh))?;
+            append_string(
+                file.0,
+                ID_FILE_DOCUMENT_FOLDER,
+                strings.workspace(Text::DocumentFolder),
+            )?;
             AppendMenuW(file.0, MF_SEPARATOR, 0, PCWSTR::null()).map_err(platform_error)?;
             append_string(file.0, ID_FILE_SAVE, strings.save())?;
             append_string(file.0, ID_FILE_SAVE_AS, strings.save_as())?;
@@ -2949,6 +2970,54 @@ impl AppWindow {
                     let _ = SetFocus(targets[next]);
                 }
             }
+            ID_FILE_FOLDER => {
+                if let Some(root) = open_folder_dialog(self.hwnd)? {
+                    self.state
+                        .set_workspace_root(root)
+                        .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    if let Some(chrome) = self.chrome.as_mut() {
+                        chrome.invalidate_content();
+                    }
+                    self.update_layout();
+                }
+            }
+            ID_FILE_QUICK => {
+                if self.state.document().session().composition().is_some()
+                    || self.chrome.as_ref().is_some_and(|chrome| {
+                        chrome.query_is_composing() || chrome.replacement_is_composing()
+                    })
+                {
+                    return Ok(());
+                }
+                if !self.state.has_workspace() && self.state.document().is_untitled() {
+                    let Some(root) = open_folder_dialog(self.hwnd)? else {
+                        return Ok(());
+                    };
+                    self.state
+                        .set_workspace_root(root)
+                        .map_err(|error| ShellError::Platform(error.to_string()))?;
+                    if let Some(chrome) = self.chrome.as_mut() {
+                        chrome.invalidate_content();
+                    }
+                    self.update_layout();
+                }
+                if let Some(path) = crate::quick_open::show(
+                    self.hwnd,
+                    &self.state.workspace_root(),
+                    self.state.locale(),
+                )? {
+                    self.activate_panel_action(Some(PanelAction::File(path)), true)?;
+                }
+            }
+            ID_FILE_REFRESH | ID_FILE_DOCUMENT_FOLDER => {
+                if command == ID_FILE_DOCUMENT_FOLDER {
+                    self.state.use_document_folder();
+                }
+                if let Some(chrome) = self.chrome.as_mut() {
+                    chrome.invalidate_content();
+                }
+                self.update_layout();
+            }
             ID_FILE_NEW => {
                 if self.confirm_replace_current()? {
                     self.state.new_document();
@@ -3218,8 +3287,18 @@ impl AppWindow {
         let before_selection = self.state.document().session().selection();
         let mut document_changed = false;
         match action {
+            Some(PanelAction::Directory(path)) => {
+                self.state
+                    .browse_directory(path)
+                    .map_err(|error| ShellError::Platform(error.to_string()))?;
+                if let Some(chrome) = self.chrome.as_mut() {
+                    chrome.invalidate_content();
+                }
+                self.refresh_chrome();
+                return Ok(());
+            }
             Some(PanelAction::File(path)) => {
-                if path != self.state.document().session().path() {
+                if !self.state.document().matches_path(&path) {
                     let candidate = DocumentSlot::open(path)?;
                     if !self.confirm_replace_current()? {
                         return Ok(());
@@ -3601,6 +3680,16 @@ fn create_accelerators() -> Result<HACCEL, ShellError> {
             fVirt: FCONTROL | FVIRTKEY,
             key: b'O' as u16,
             cmd: ID_FILE_OPEN,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FSHIFT | FVIRTKEY,
+            key: b'O' as u16,
+            cmd: ID_FILE_QUICK,
+        },
+        ACCEL {
+            fVirt: FCONTROL | FALT | FVIRTKEY,
+            key: b'O' as u16,
+            cmd: ID_FILE_FOLDER,
         },
         ACCEL {
             fVirt: FCONTROL | FVIRTKEY,
@@ -4422,6 +4511,20 @@ unsafe fn append_popup(root: HMENU, popup: HMENU, text: &str) -> Result<(), Shel
     let text = wide(text);
     unsafe { AppendMenuW(root, MF_POPUP, popup.0 as usize, PCWSTR(text.as_ptr())) }
         .map_err(platform_error)
+}
+
+fn open_folder_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {
+    let dialog: IFileOpenDialog =
+        unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(platform_error)?;
+    unsafe {
+        let options = dialog.GetOptions().map_err(platform_error)?
+            | FOS_FORCEFILESYSTEM
+            | FOS_PATHMUSTEXIST
+            | windows::Win32::UI::Shell::FOS_PICKFOLDERS;
+        dialog.SetOptions(options).map_err(platform_error)?;
+    }
+    show_file_dialog(owner, &dialog)
 }
 
 fn open_file_dialog(owner: HWND) -> Result<Option<PathBuf>, ShellError> {

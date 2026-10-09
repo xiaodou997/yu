@@ -137,6 +137,7 @@ impl Drop for Brush {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PanelAction {
+    Directory(PathBuf),
     File(PathBuf),
     Select(TextRange),
 }
@@ -998,6 +999,8 @@ impl Chrome {
         let path = state.document().session().path().to_owned();
         let revision = state.document().session().revision();
         let key = (path.clone(), revision, mode);
+        let file_directory = state.file_directory();
+        let workspace_root = state.workspace_root();
         // File lists do not depend on source edits; refresh on navigation or path changes.
         if self.cache.as_ref().is_some_and(|old| {
             old == &key || (mode == SidebarMode::Files && old.0 == path && old.2 == mode)
@@ -1015,14 +1018,13 @@ impl Chrome {
             .editor_mut();
         let (rows, caption, empty_text) = match mode {
             SidebarMode::Files => {
-                let rows = if state.document().is_untitled() {
+                let rows = if state.document().is_untitled() && !state.has_workspace() {
                     Vec::new()
                 } else {
-                    directory_rows(&path)?
+                    directory_rows(&file_directory, &workspace_root)?
                 };
-                let folder = path
-                    .parent()
-                    .and_then(|parent| parent.file_name())
+                let folder = file_directory
+                    .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or(document_name);
                 (rows, folder, panel_hint(locale, 0).into())
@@ -1978,39 +1980,63 @@ fn window_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&units[..length])
 }
 
-fn directory_rows(path: &std::path::Path) -> Result<Vec<Row>, ShellError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
+fn directory_rows(
+    directory: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<Vec<Row>, ShellError> {
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(parent).map_err(error)? {
-        let entry = entry.map_err(error)?;
-        if entry.file_type().map_err(error)?.is_file()
-            && entry.path().extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-            })
+    for entry in std::fs::read_dir(directory).map_err(error)?.take(10_000) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() || (kind.is_file() && yu_storage::WorkspaceIndex::supports(&entry.path()))
         {
-            paths.push(entry.path());
+            paths.push((!kind.is_dir(), entry.path()));
         }
     }
-    paths.sort_by_key(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
+    paths.sort_by_key(|(file, path)| {
+        (
+            *file,
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_lowercase()),
+        )
     });
-    Ok(paths
-        .into_iter()
-        .map(|path| Row {
-            label: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            identity: path.to_string_lossy().into_owned(),
+    let mut rows = Vec::new();
+    if directory != root
+        && let Some(parent) = directory.parent()
+        && parent.starts_with(root)
+    {
+        rows.push(Row {
+            label: "..".into(),
+            identity: parent.to_string_lossy().into_owned(),
             indent: 0,
-            action: PanelAction::File(path),
-        })
-        .collect())
+            action: PanelAction::Directory(parent.to_owned()),
+        });
+    }
+    rows.extend(paths.into_iter().map(|(file, path)| Row {
+        label: format!(
+            "{}{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            if file { "" } else { "/" }
+        ),
+        identity: path.to_string_lossy().into_owned(),
+        indent: 0,
+        action: if file {
+            PanelAction::File(path)
+        } else {
+            PanelAction::Directory(path)
+        },
+    }));
+    Ok(rows)
 }
 
 fn panel_hint(locale: Locale, kind: usize) -> &'static str {

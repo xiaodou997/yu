@@ -1,3 +1,17 @@
+"Quick Open" = "Quick Open";
+"Quick Open…" = "Quick Open…";
+"Open Folder…" = "Open Folder…";
+"Search file names or paths" = "Search file names or paths";
+"Workspace Files" = "Workspace Files";
+"Refresh Files" = "Refresh Files";
+"Use Document Folder" = "Use Document Folder";
+"Scanning folder…" = "Scanning folder…";
+"Folder unavailable. Choose another folder or refresh." = "Folder unavailable. Choose another folder or refresh.";
+"No matching files" = "No matching files";
+"%d files shown · %d indexed" = "%d files shown · %d indexed";
+"Partial index; choose a smaller folder" = "Partial index; choose a smaller folder";
+"File unavailable. Refresh the file list." = "File unavailable. Refresh the file list.";
+"Choose a folder to browse local Markdown files." = "Choose a folder to browse local Markdown files.";
 "Files" = "Files";
 "Open" = "Open";
 "Show in Finder" = "Show in Finder";

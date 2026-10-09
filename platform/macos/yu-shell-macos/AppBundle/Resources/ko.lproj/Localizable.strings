@@ -1,3 +1,17 @@
+"Quick Open" = "빠른 열기";
+"Quick Open…" = "빠른 열기…";
+"Open Folder…" = "폴더 열기…";
+"Search file names or paths" = "파일 이름 또는 경로 검색";
+"Workspace Files" = "작업 공간 파일";
+"Refresh Files" = "파일 새로 고침";
+"Use Document Folder" = "문서 폴더 사용";
+"Scanning folder…" = "폴더 검색 중…";
+"Folder unavailable. Choose another folder or refresh." = "폴더를 사용할 수 없습니다. 다시 선택하거나 새로 고치세요.";
+"No matching files" = "일치하는 파일 없음";
+"%d files shown · %d indexed" = "%d개 표시 · %d개 색인됨";
+"Partial index; choose a smaller folder" = "일부만 색인됨: 더 작은 폴더를 선택하세요";
+"File unavailable. Refresh the file list." = "파일을 사용할 수 없습니다. 목록을 새로 고치세요.";
+"Choose a folder to browse local Markdown files." = "로컬 Markdown 파일을 탐색할 폴더를 선택하세요.";
 "Files" = "파일";
 "Open" = "열기";
 "Show in Finder" = "Finder에서 보기";

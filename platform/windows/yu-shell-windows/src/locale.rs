@@ -55,11 +55,103 @@ impl Locale {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum WorkspaceText {
+    OpenFolder,
+    QuickOpen,
+    Refresh,
+    DocumentFolder,
+    Filter,
+    Files,
+    Scanning,
+    NoMatches,
+    Partial,
+    Unavailable,
+    FileUnavailable,
+    Open,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Strings {
     locale: Locale,
 }
 
 impl Strings {
+    pub fn workspace(self, text: WorkspaceText) -> &'static str {
+        let values = match self.locale {
+            Locale::English => [
+                "Open Folder…",
+                "Quick Open…",
+                "Refresh Files",
+                "Use Document Folder",
+                "Search file names or paths",
+                "Workspace Files",
+                "Scanning folder…",
+                "No matching files",
+                "Partial index; choose a smaller folder",
+                "Folder unavailable. Choose another folder or refresh.",
+                "File unavailable. Refresh the file list.",
+                "Open",
+            ],
+            Locale::SimplifiedChinese => [
+                "打开文件夹…",
+                "快速打开…",
+                "刷新文件",
+                "使用文档所在文件夹",
+                "搜索文件名或路径",
+                "工作区文件",
+                "正在扫描文件夹…",
+                "没有匹配的文件",
+                "索引不完整；请选择更小的文件夹",
+                "文件夹不可用，请重新选择或刷新。",
+                "文件不可用，请刷新文件列表。",
+                "打开",
+            ],
+            Locale::TraditionalChinese => [
+                "開啟資料夾…",
+                "快速開啟…",
+                "重新整理檔案",
+                "使用文件所在資料夾",
+                "搜尋檔名或路徑",
+                "工作區檔案",
+                "正在掃描資料夾…",
+                "沒有符合的檔案",
+                "索引不完整；請選擇較小的資料夾",
+                "資料夾無法使用，請重新選擇或整理。",
+                "檔案無法使用，請重新整理清單。",
+                "開啟",
+            ],
+            Locale::Japanese => [
+                "フォルダを開く…",
+                "クイックオープン…",
+                "ファイルを更新",
+                "文書のフォルダを使用",
+                "ファイル名またはパスを検索",
+                "ワークスペースのファイル",
+                "フォルダを検索中…",
+                "一致するファイルがありません",
+                "一部のみ索引済み：小さいフォルダを選択",
+                "フォルダを利用できません。再選択または更新してください。",
+                "ファイルを利用できません。一覧を更新してください。",
+                "開く",
+            ],
+            Locale::Korean => [
+                "폴더 열기…",
+                "빠른 열기…",
+                "파일 새로 고침",
+                "문서 폴더 사용",
+                "파일 이름 또는 경로 검색",
+                "작업 공간 파일",
+                "폴더 검색 중…",
+                "일치하는 파일 없음",
+                "일부만 색인됨: 더 작은 폴더를 선택하세요",
+                "폴더를 사용할 수 없습니다. 다시 선택하거나 새로 고치세요.",
+                "파일을 사용할 수 없습니다. 목록을 새로 고치세요.",
+                "열기",
+            ],
+        };
+        values[text as usize]
+    }
+
     #[must_use]
     pub const fn app_name(self) -> &'static str {
         "Yu"

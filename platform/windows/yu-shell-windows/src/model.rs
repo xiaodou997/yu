@@ -136,6 +136,18 @@ impl DocumentSlot {
         self.untitled
     }
 
+    /// Quick-open canonical paths and native dialog paths may use different
+    /// Windows prefixes. Re-selecting the same file must not reload dirty text.
+    pub fn matches_path(&self, path: &Path) -> bool {
+        !self.untitled
+            && (self.session.path() == path
+                || path
+                    .canonicalize()
+                    .ok()
+                    .zip(self.session.path().canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b))
+    }
+
     #[must_use]
     pub fn display_name(&self, strings: Strings) -> &str {
         if self.untitled {
@@ -198,6 +210,8 @@ pub struct ShellState {
     sidebar: SidebarMode,
     search_visible: bool,
     replace_visible: bool,
+    workspace_root: Option<PathBuf>,
+    file_directory: Option<PathBuf>,
     metrics: WindowMetrics,
     document: DocumentSlot,
 }
@@ -211,6 +225,8 @@ impl ShellState {
             sidebar: SidebarMode::Files,
             search_visible: false,
             replace_visible: false,
+            workspace_root: None,
+            file_directory: None,
             metrics: WindowMetrics::default(),
             document: DocumentSlot::new_untitled(),
         }
@@ -269,6 +285,58 @@ impl ShellState {
         if visible {
             self.search_visible = true;
         }
+    }
+
+    /// Folder navigation never replaces or edits the current document.
+    pub fn set_workspace_root(&mut self, root: PathBuf) -> std::io::Result<()> {
+        let root = root.canonicalize()?;
+        if !root.is_dir() {
+            return Err(std::io::ErrorKind::NotADirectory.into());
+        }
+        self.file_directory = Some(root.clone());
+        self.workspace_root = Some(root);
+        self.sidebar = SidebarMode::Files;
+        Ok(())
+    }
+
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace_root
+            .clone()
+            .unwrap_or_else(|| self.file_directory())
+    }
+
+    pub fn has_workspace(&self) -> bool {
+        self.workspace_root.is_some()
+    }
+
+    pub fn file_directory(&self) -> PathBuf {
+        self.file_directory
+            .clone()
+            .or_else(|| {
+                (!self.document.is_untitled())
+                    .then(|| self.document.session().path().parent().map(Path::to_owned))
+                    .flatten()
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn browse_directory(&mut self, directory: PathBuf) -> std::io::Result<()> {
+        let directory = directory.canonicalize()?;
+        let root = self.workspace_root().canonicalize()?;
+        if !directory.is_dir() || !directory.starts_with(&root) {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        // The first descent pins the implicit document folder as workspace root.
+        self.workspace_root = Some(root);
+        self.file_directory = Some(directory);
+        Ok(())
+    }
+
+    pub fn use_document_folder(&mut self) {
+        self.workspace_root = None;
+        self.file_directory = None;
+        self.sidebar = SidebarMode::Files;
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -336,6 +404,53 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("yu-shell-windows-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn folder_navigation_preserves_dirty_document_and_workspace_survives_file_switch() {
+        let root = temp_path("workspace");
+        fs::create_dir_all(root.join("notes")).expect("folder");
+        let mut state = ShellState::new(Locale::English);
+        state
+            .document_mut()
+            .session_mut()
+            .execute(yu_editor::EditorCommand::insert_text("未保存🙂"))
+            .expect("edit");
+        let identity = state.document().identity();
+        let revision = state.document().session().revision();
+        state.set_workspace_root(root.clone()).expect("root");
+        state.browse_directory(root.join("notes")).expect("descend");
+        assert_eq!(state.workspace_root(), root.canonicalize().expect("root"));
+        assert_eq!(state.document().identity(), identity);
+        assert_eq!(state.document().session().revision(), revision);
+        assert_eq!(state.document().session().snapshot().as_str(), "未保存🙂");
+        assert!(state.document().session().is_dirty());
+        assert!(
+            state
+                .browse_directory(root.parent().expect("parent").to_owned())
+                .is_err()
+        );
+        state.new_document();
+        assert!(state.has_workspace());
+        state.use_document_folder();
+        assert!(!state.has_workspace());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn canonical_quick_open_path_keeps_the_current_document_identity() {
+        let path = temp_path("identity.md");
+        fs::write(&path, "# saved").expect("fixture");
+        let mut document = DocumentSlot::open(&path).expect("open");
+        document
+            .session_mut()
+            .execute(yu_editor::EditorCommand::insert_text("dirty"))
+            .expect("edit");
+        assert!(document.matches_path(&path.canonicalize().expect("canonical")));
+        assert!(document.session().is_dirty());
+        assert!(!DocumentSlot::new_untitled().matches_path(Path::new("Untitled.md")));
+        assert!(!document.matches_path(&path.with_extension("missing")));
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

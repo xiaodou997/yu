@@ -34,6 +34,7 @@ final class FilePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate 
         outline.target = self
         outline.doubleAction = #selector(openSelected(_:))
         outline.setAccessibilityLabel(L10n.tr("Files"))
+        view.toolTip = directory.path
         let menu = NSMenu()
         menu.addItem(withTitle: L10n.tr("Open"), action: #selector(openSelected(_:)), keyEquivalent: "").target = self
         menu.addItem(withTitle: L10n.tr("Show in Finder"), action: #selector(revealSelected(_:)), keyEquivalent: "").target = self
@@ -46,6 +47,7 @@ final class FilePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate 
     }
     func setDirectory(_ url: URL) {
         root = Item(url)
+        view.toolTip = url.path
         outline.reloadData()
     }
     private func children(_ item: Item) -> [Item] {
